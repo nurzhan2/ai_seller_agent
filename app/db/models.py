@@ -1,0 +1,247 @@
+"""SQLAlchemy 2.x models.
+
+The one that matters most is `DialogState`: it is the persistent form of
+`app.pricing.concessions.DialogConcessionState`. Without it the ratchet and
+the concession ladder live only in process memory, so a restart would let
+the agent re-quote a price *above* one it already promised — the exact leak
+app/pricing/quote_gate.py exists to prevent.
+"""
+
+from __future__ import annotations
+
+import enum
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Optional
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum as SAEnum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Direction(str, enum.Enum):
+    incoming = "incoming"      # from the client
+    outgoing = "outgoing"      # from us (agent or operator)
+
+
+class SendStatus(str, enum.Enum):
+    pending = "pending"
+    sent = "sent"
+    dry_run = "dry_run"        # composed but deliberately not delivered
+    failed = "failed"
+    rejected = "rejected"      # operator declined it in moderation
+
+
+class Author(str, enum.Enum):
+    client = "client"
+    agent = "agent"
+    operator = "operator"
+
+
+class ChatState(str, enum.Enum):
+    new = "new"
+    qualifying = "qualifying"
+    quoted = "quoted"
+    lead_captured = "lead_captured"
+    escalated = "escalated"
+    closed = "closed"
+
+
+class Chat(Base):
+    __tablename__ = "chats"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    item_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    # Resolved via ItemZoneMap — which listing the client came from decides
+    # which zone we talk about.
+    zone_id: Mapped[Optional[str]] = mapped_column(String(64))
+    buyer_name: Mapped[Optional[str]] = mapped_column(String(255))
+    state: Mapped[ChatState] = mapped_column(
+        SAEnum(ChatState, name="chat_state"), default=ChatState.new
+    )
+    # Operator took the wheel; the agent stays silent until this clears.
+    is_human_takeover: Mapped[bool] = mapped_column(Boolean, default=False)
+    ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    agent_reply_count: Mapped[int] = mapped_column(Integer, default=0)
+    takeover_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_msg_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    messages: Mapped[list["Message"]] = relationship(back_populates="chat")
+    dialog_state: Mapped[Optional["DialogState"]] = relationship(
+        back_populates="chat", uselist=False
+    )
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    __table_args__ = (
+        # Idempotency backstop: Redis drops duplicate webhooks, but a unique
+        # index means a Redis flush cannot produce doubled messages.
+        UniqueConstraint("avito_message_id", name="uq_messages_avito_message_id"),
+        Index("ix_messages_chat_created", "chat_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("chats.chat_id", ondelete="CASCADE"), index=True
+    )
+    direction: Mapped[Direction] = mapped_column(SAEnum(Direction, name="direction"))
+    author: Mapped[Author] = mapped_column(
+        SAEnum(Author, name="author"), default=Author.client
+    )
+    text: Mapped[Optional[str]] = mapped_column(Text)
+    image_ids: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String))
+    avito_message_id: Mapped[Optional[str]] = mapped_column(String(128))
+    status: Mapped[SendStatus] = mapped_column(
+        SAEnum(SendStatus, name="send_status"), default=SendStatus.pending
+    )
+    # {"provider": ..., "model": ..., "input_tokens": ..., "output_tokens": ...,
+    #  "cost_rub": ..., "cached_input_tokens": ...}
+    llm_meta: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    chat: Mapped["Chat"] = relationship(back_populates="messages")
+
+
+class DialogState(Base):
+    """Persistent DialogConcessionState — see module docstring."""
+
+    __tablename__ = "dialog_states"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("chats.chat_id", ondelete="CASCADE"), unique=True, index=True
+    )
+    base_price_quoted: Mapped[bool] = mapped_column(Boolean, default=False)
+    used_tiers: Mapped[Optional[list[int]]] = mapped_column(ARRAY(Integer), default=list)
+    skipped_tiers: Mapped[Optional[list[int]]] = mapped_column(ARRAY(Integer), default=list)
+    # Numeric, never float — the whole pricing stack is Decimal end to end.
+    floor_reached: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    client_constraints: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
+    concessions_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    chat: Mapped["Chat"] = relationship(back_populates="dialog_state")
+
+    def to_runtime(self):
+        """Rehydrate into the frozen dataclass the concession engine uses."""
+        from app.pricing.concessions import DialogConcessionState
+
+        return DialogConcessionState(
+            base_price_quoted=self.base_price_quoted,
+            used_tiers=frozenset(self.used_tiers or ()),
+            floor_reached=self.floor_reached,
+        )
+
+
+class ItemZoneMap(Base):
+    """Which Avito listing corresponds to which zone.
+
+    The audit found this mapping is genuinely incomplete on the client's
+    side: bath «Гараж» has at least two separate listings, bath «Рыцарская»
+    has none, and no dome listing was found at all (question 12.2). Worse,
+    the client confirmed (prompt 11, part 3) that baths in particular SHARE
+    ad slots — one listing, several possible baths behind it.
+
+    `zone_id` is set when the listing maps to exactly one zone. `category`
+    is set instead when only the zone *category* is known (a bath ad, but
+    which of the three baths is ambiguous from the ad alone) — the agent
+    then asks one disambiguating question naming just the zones in that
+    category, per app.agent.listing_context.build_listing_hint. A row with
+    neither set, or no row at all, means "ask the client / fall back to the
+    site link" — never a guess.
+    """
+
+    __tablename__ = "item_zone_map"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    item_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    zone_id: Mapped[Optional[str]] = mapped_column(String(64))
+    category: Mapped[Optional[str]] = mapped_column(String(32))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class ConcessionLog(Base):
+    """One row per concession decision — granting AND denying (rule R12).
+
+    Columns mirror concessions.yaml → logging.fields, plus the two fields
+    added in prompt 3.2 so the operator can tell whose rule produced the
+    discount and what the loss was measured against.
+    """
+
+    __tablename__ = "concession_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    dialog_id: Mapped[str] = mapped_column(String(128), index=True)
+    zone: Mapped[Optional[str]] = mapped_column(String(64))
+    tier: Mapped[Optional[int]] = mapped_column(Integer)
+    trigger: Mapped[Optional[str]] = mapped_column(String(255))
+    base_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    final_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    revenue_delta: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    revenue_delta_basis: Mapped[Optional[str]] = mapped_column(String(32))
+    exchange_given: Mapped[Optional[str]] = mapped_column(String(64))
+    allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    denial_reason: Mapped[Optional[str]] = mapped_column(Text)
+    # True when the grant rested on a threshold WE set provisionally rather
+    # than one the client confirmed (question 13.4).
+    provisional_policy: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255))
+    phone: Mapped[Optional[str]] = mapped_column(String(64))
+    zone_id: Mapped[Optional[str]] = mapped_column(String(64))
+    date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    guests: Mapped[Optional[int]] = mapped_column(Integer)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class OperatorAction(Base):
+    """Audit trail for the Telegram controls (prompt 6 uses this)."""
+
+    __tablename__ = "operator_actions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

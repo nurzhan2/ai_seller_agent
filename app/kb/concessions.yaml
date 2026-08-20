@@ -1,0 +1,239 @@
+# Политика уступок. Заказчик подтвердил: цены и минимальное время — не жёсткие,
+# а торгуемые, НО только это подтверждено явно: минимум 3 часа можно снизить до 2,
+# а выходной тариф бани 3500₽ можно снизить до 2500₽ — и оба смягчения только
+# при сопротивлении клиента, только для бани, только в выходные (см. вводную
+# часть промта №2). Для остальных зон/дней подтверждения нет — value: null.
+#
+# Ценовая уступка — ПОСЛЕДНЯЯ ступень дожима, не первая: сначала все non_price
+# варианты (тир 1-4), и только если ни один не сработал — тир 5-6.
+
+policy:
+  never_open_with_concession: true    # первая названная цена — всегда базовая
+  max_concessions_per_dialog: 2
+  max_concessions_per_day: 5
+  require_exchange: true              # уступка всегда в обмен на что-то
+
+  # ВНИМАНИЕ — структурный конфликт в исходной политике, требует ответа (13.5).
+  # Правило R4 требует исчерпать все 4 неценовые ступени до первой ценовой,
+  # но max_concessions_per_dialog = 2. При буквальном чтении (лимит считает
+  # ЛЮБЫЕ выданные ступени) ступени 5 и 6 недостижимы никогда — ладдер
+  # обрывается на второй неценовой ступени, а ценовые правила становятся
+  # мёртвым кодом.
+  # Принято рабочее допущение: лимит считает только ЦЕНОВЫЕ уступки, потому
+  # что неценовое предложение (перенести на будни, взять зону меньше) не
+  # уменьшает выручку — revenue_delta там равен нулю.
+  # Если заказчик имел в виду буквальный лимит на любые предложения —
+  # поменять на false, и тогда ценовые ступени отключатся полностью.
+  limits_count_only_price_tiers: true
+
+  # Сколько РЕАЛЬНЫХ неценовых попыток агент делает, прежде чем открыть
+  # ценовые ступени. Четыре встречных предложения подряд перед скидкой — это
+  # диалог, из которого человек уходит. После этого числа выданных неценовых
+  # ступеней ценовые открываются, даже если формально остались неиспользованные
+  # неценовые ступени.
+  max_non_price_attempts_before_price: 2
+
+  # applicability — третье состояние ступени помимо used: skipped.
+  #   blocked_by_constraints — ограничения клиента, при которых ступень
+  #     бессмысленна (их выставляет оркестратор по наблюдениям модели,
+  #     как и триггеры);
+  #   requires — именованные предикаты, вычисляемые движком по данным
+  #     базы знаний и базовому расчёту (реализованы в concessions.py).
+  # Неприменимая ступень помечается skipped и НЕ блокирует переход дальше —
+  # иначе лестница вставала бы навсегда (клиент сказал «нужна суббота» →
+  # ступень 1 никогда не попадёт в used → ценовые ступени недостижимы).
+  ladder:
+    - tier: 1
+      id: shift_to_weekday
+      type: non_price
+      description: "Предложить перенести на Пн-Чт, где тариф ниже легально"
+      applicability:
+        blocked_by_constraints: [weekend_only, date_fixed]
+        requires: [day_type_is_weekend]
+
+    - tier: 2
+      id: smaller_zone
+      type: non_price
+      description: "Предложить зону меньше или дешевле под то же количество гостей"
+      applicability:
+        blocked_by_constraints: [zone_fixed]
+        requires: [cheaper_zone_exists]
+
+    - tier: 3
+      id: day_package
+      type: non_price
+      description: "Пересчитать пакетом «весь день», если так выгоднее"
+      applicability:
+        blocked_by_constraints: [hours_fixed]
+        requires: [day_package_beneficial]
+
+    - tier: 4
+      id: apply_promo
+      type: non_price
+      description: "Применить действующую акцию (5+1, скидка ДР) — только в зонах, где она официально разрешена (promos.yaml, без disputed_zones)"
+      applicability:
+        blocked_by_constraints: []
+        requires: [unused_promo_exists]
+
+    - tier: 5
+      id: reduce_min_hours
+      type: price
+      description: "Снизить минимальное время аренды ниже официального минимума (3 часа)"
+      applicability:
+        blocked_by_constraints: []
+        requires: [hours_below_policy_minimum]
+      floor:
+        value: null
+        disputed:
+          variants: []
+          sources: []
+          question_id: "13.1"
+          note: "Общий пол по минимальному времени для всех зон/дней не подтверждён."
+      confirmed_overrides:
+        # 1.3: баня — минимум 3 часа озвучиваем всегда, 2 часа возможны при
+        # низкой загрузке. День недели заказчик не ограничивал.
+        - scope: {zone_category: bath}
+          floor: {min_hours: {value: 2}}
+          source: "client_answers (1.3)"
+        # 4.2: гриль-домик — та же логика, «если у нас просадка».
+        - scope: {zone_category: grill}
+          floor: {min_hours: {value: 2}}
+          source: "client_answers (4.2)"
+        # баня, будни: не подтверждено — floor остаётся null (см. выше)
+        # гриль-домик, купол, шатёр, домик, юрта: не подтверждено ни для будней, ни для выходных
+
+    - tier: 6
+      id: reduce_hourly_rate
+      type: price
+      description: "Снизить почасовую ставку ниже официального выходного тарифа"
+      applicability:
+        blocked_by_constraints: []
+        requires: [hourly_booking]
+      floor:
+        value: null
+        disputed:
+          variants: []
+          sources: []
+          question_id: "13.2"
+          note: "Общий пол по ставке для всех зон/дней не подтверждён."
+      confirmed_overrides:
+        - scope: {zone_category: bath, day_type: weekend}
+          floor: {weekend_per_hour: {value: 2500}}
+          source: "Ответ заказчика во вводной части промта №2"
+        # баня, будни (база 2500): нижнего порога скидки не подтверждено
+        # гриль-домик, купол, шатёр, домик, юрта: не подтверждено ни для будней, ни для выходных
+
+    - tier: 7
+      id: reduce_daily_rate
+      type: price
+      description: "Снизить суточную ставку для суточных зон (домик): анкор 15000, пол 9500"
+      applicability:
+        blocked_by_constraints: []
+        requires: [daily_booking]
+      floor:
+        value: null
+        disputed:
+          variants: []
+          sources: []
+          question_id: "13.2"
+          note: "Общий пол по суточной ставке для всех зон не подтверждён."
+      confirmed_overrides:
+        # 2.1: самая крупная уступка в проекте — дельта до 5500 ₽.
+        # Обязана логироваться и попадать в дневную сводку отдельной строкой.
+        - scope: {zone_category: house}
+          floor: {per_day: {value: 9500}}
+          anchor: {per_day: {value: 15000}}
+          source: "client_answers (2.1) — комментарий Максима"
+
+  # Уступка разблокируется, только если сработал ХОТЯ БЫ ОДИН триггер
+  triggers:
+    - id: price_objection
+      description: >
+        Клиент явно возразил по цене: «дорого», «у других дешевле»,
+        «не укладываемся в бюджет»
+    - id: hours_objection
+      description: "Клиент прямо сказал, что 3 часа ему много или не нужно"
+    - id: going_silent
+      description: "Клиент не отвечает более 2 часов после озвученной цены"
+    - id: soft_decline
+      description: "«Спасибо, подумаем», «пока не готовы»"
+
+  # И только если выполнены ВСЕ условия
+  conditions:
+    # Заказчик описал условие скидки как ЗАГРУЗКУ, а не как близость даты:
+    # «если за 2 дня всё свободно — сдаём за 9 500; если за два дня одна
+    # банька осталась — сдаём за 15 тыс.». Это принципиально другое условие:
+    # «дата близко» и «дата близко И свободно» расходятся ровно в том случае,
+    # который приносит деньги. Одна свободная зона из десяти скидку НЕ даёт.
+    max_occupancy_ratio:
+      # ПРЕДВАРИТЕЛЬНОЕ значение — наше, не заказчика. Он сказал «всё
+      # свободно» и «нет наплыва», числа не назвал. Половина — консервативный
+      # дефолт; каждая уступка по нему помечается provisional_policy: true.
+      value: 0.5
+      provisional: true
+      question_id: "14.5"
+      note: "Занято меньше половины зон на эту дату. Ждём подтверждения заказчика."
+    # days_until_date больше НЕ условие выдачи скидки: заказчик привязал её к
+    # загрузке. Поле оставлено справочным для логов и отчётов.
+    days_until_date_is_informational: true
+    slot_confirmed_free: true
+    not_holiday: true
+    not_already_booked_at_base: true
+
+  # В обмен на что уступаем
+  exchange_options:
+    - book_today
+    - prepay_immediately
+    - shift_to_weekday
+    - larger_booking
+
+  # Формулировка обмена для каждого допустимого варианта. Подставляется в
+  # шаблон вместо {exchange_clause}, поэтому текст обмена всегда согласован
+  # со списком exchange_options и не может разойтись с ним.
+  exchange_clauses:
+    book_today: "если бронируем сегодня"
+    prepay_immediately: "если внесёте предоплату сегодня"
+    shift_to_weekday: "если вам подходит будний день"
+    larger_booking: "если возьмёте на большее время"
+
+  # Готовые формулировки. Модель НЕ генерирует условия и цифры — она получает
+  # собранный из этих шаблонов текст и может поправить только обрамление.
+  #
+  # Инвариант R11 проверяется СТРУКТУРНО, а не поиском слова «если»:
+  #   - exchange непустой и входит в exchange_options;
+  #   - для exchange есть формулировка в exchange_clauses;
+  #   - в тексте обязателен плейсхолдер {exchange_clause}.
+  # Проверка живёт в валидаторе pydantic (loader.py), то есть падает при
+  # загрузке базы знаний, а не в рантайме на живом клиенте.
+  offer_templates:
+    shift_to_weekday:
+      text: "Могу предложить перенести на будний день, с понедельника по четверг — там тариф ниже. Забронирую сразу, {exchange_clause}."
+      exchange: shift_to_weekday
+    smaller_zone:
+      text: "Под вашу компанию хорошо подойдёт зона поменьше, выйдет дешевле. Зафиксирую её за вами, {exchange_clause}."
+      exchange: book_today
+    day_package:
+      text: "На это время выгоднее взять пакет на весь день — по нему выходит дешевле, чем по часам. Оформлю по пакету, {exchange_clause}."
+      exchange: book_today
+    apply_promo:
+      text: "Могу применить действующую акцию — так вы получите больше времени за ту же сумму. Закреплю акцию за бронью, {exchange_clause}."
+      exchange: prepay_immediately
+    reduce_min_hours:
+      text: "Обычно бронируем от {base_min_hours} часов, но могу оформить {new_min_hours}, {exchange_clause}."
+      exchange: book_today
+    reduce_hourly_rate:
+      text: "Могу зафиксировать {new_rate} ₽ в час вместо {base_rate} ₽, {exchange_clause}."
+      exchange: prepay_immediately
+    reduce_daily_rate:
+      text: "Могу отдать домик за {new_rate} ₽ вместо {base_rate} ₽, {exchange_clause}."
+      exchange: book_today
+
+  logging:
+    log_every_concession: true
+    fields: [dialog_id, zone, tier, trigger, base_price, final_price, revenue_delta, exchange_given]
+    alert_if_concession_rate_above:
+      value: null
+      disputed:
+        variants: [0.3]
+        sources: ["черновой порог из промта №2, не подтверждён заказчиком отдельно"]
+        question_id: "13.3"

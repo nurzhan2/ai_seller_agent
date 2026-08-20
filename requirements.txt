@@ -1,0 +1,19 @@
+pydantic>=2.9
+pydantic-settings>=2.5
+PyYAML>=6.0
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.27
+tenacity>=9.0
+redis>=5.1
+SQLAlchemy>=2.0
+alembic>=1.14
+asyncpg>=0.30
+Pillow>=11.0
+# Оба LLM-провайдера (промт №12) идут через этот SDK: DeepSeek отдаёт
+# Anthropic-совместимые ответы на своём base_url — см.
+# app/agent/providers/deepseek_provider.py.
+anthropic>=0.125
+# Операторский Telegram-бот, запускается фоновой задачей в lifespan
+# приложения (app/main.py, промт №13).
+aiogram>=3.30

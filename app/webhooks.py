@@ -1,0 +1,107 @@
+"""Приём вебхуков Авито.
+
+ЗАЩИТА — СЕКРЕТ В ПУТИ, А НЕ ПОДПИСЬ. Это осознанное решение, не недоделка.
+Авито присылает заголовок `x-avito-messenger-signature`, но алгоритм подписи
+не опубликован. Правдоподобно угаданная проверка подписи опаснее её
+отсутствия: неверный путь падает громко, а неверная проверка подписи МОЛЧА
+ПРИНИМАЕТ подделки. Поэтому вебхук регистрируется по адресу
+`/webhook/avito/{AVITO_WEBHOOK_SECRET}`, секрет сравнивается через
+`secrets.compare_digest`, а любой другой путь отдаёт 404.
+
+Не «чините» это, добавив угаданный HMAC. Если Авито опубликует алгоритм —
+добавьте проверку подписи ВТОРЫМ слоем, не убирая секретный путь.
+Подробности — в app/channels/avito_endpoints.py.
+
+Две другие важные характеристики:
+  * отвечаем мгновенно — таймаут колбэка у Авито порядка двух секунд, поэтому
+    подтверждаем сразу, а работу делаем в фоне;
+  * обрабатываем каждое сообщение один раз — ретраи и at-least-once доставка
+    нормальны, а дубль входящего означает, что агент дважды ответит на один
+    вопрос.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets as secrets_mod
+from typing import Any, Awaitable, Callable, Optional
+
+from fastapi import APIRouter, BackgroundTasks, Request, Response, status
+
+from app.channels.avito_payloads import extract_message_id
+from app.config import get_settings
+
+logger = logging.getLogger("parmangal.webhook")
+
+router = APIRouter()
+
+SEEN_KEY = "avito:seen_message:{message_id}"
+WEBHOOK_PATH_TEMPLATE = "/webhook/avito/{secret}"
+
+# Проставляются фабрикой приложения; инъекция нужна, чтобы тестам не требовался Redis.
+_redis: Any = None
+_handler: Optional[Callable[[dict], Awaitable[None]]] = None
+
+
+def configure(redis: Any = None, handler: Optional[Callable[[dict], Awaitable[None]]] = None) -> None:
+    global _redis, _handler
+    _redis = redis
+    _handler = handler
+
+
+def webhook_path(secret: str) -> str:
+    return WEBHOOK_PATH_TEMPLATE.format(secret=secret)
+
+
+def secret_matches(candidate: str) -> bool:
+    """Сравнение постоянного времени — обычное `==` даёт таймингову утечку,
+    по которой секрет можно подобрать посимвольно."""
+    expected = get_settings().avito_webhook_secret.get_secret_value()
+    if not expected:
+        return False
+    return secrets_mod.compare_digest(candidate, expected)
+
+
+async def is_duplicate(message_id: Optional[str], redis: Any) -> bool:
+    """True, если это сообщение уже видели.
+
+    Атомарность даёт SET NX: два воркера, получившие один и тот же ретрай,
+    состязаются на одной операции, и выигрывает ровно один.
+    """
+    if message_id is None or redis is None:
+        return False
+    settings = get_settings()
+    key = SEEN_KEY.format(message_id=message_id)
+    was_set = await redis.set(key, "1", nx=True, ex=settings.webhook_idempotency_ttl_seconds)
+    return not bool(was_set)
+
+
+@router.post("/webhook/avito/{secret}", status_code=status.HTTP_200_OK)
+async def avito_webhook(
+    secret: str,
+    request: Request,
+    background: BackgroundTasks,
+) -> Response:
+    if not secret_matches(secret):
+        # Именно 404, а не 403: сканирующему не сообщаем, что такой маршрут
+        # вообще существует.
+        logger.warning("webhook rejected: bad secret in path")
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        logger.warning("webhook body is not json")
+        return Response(status_code=status.HTTP_200_OK)
+
+    message_id = extract_message_id(payload)
+    if await is_duplicate(message_id, _redis):
+        logger.info("webhook duplicate dropped", extra={"message_id": message_id})
+        return Response(status_code=status.HTTP_200_OK)
+
+    if _handler is not None:
+        background.add_task(_handler, payload)
+
+    # Всегда 200 и всегда сразу. Медленный ответ означает ретрай со стороны
+    # Авито и повторную обработку того же сообщения.
+    return Response(status_code=status.HTTP_200_OK)

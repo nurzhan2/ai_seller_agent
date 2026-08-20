@@ -1,0 +1,24 @@
+# Конфигурация Railway. HTTPS, домен и роутинг даёт платформа — здесь только
+# как собрать образ и как его запускать. Параллельно docker-compose.prod.yml
+# остаётся вариантом для VPS (там же — Caddy и резервное копирование), эти
+# два пути не пересекаются и не должны синхронизироваться построчно.
+#
+# Подробный пошаговый гайд — docs/RAILWAY_SETUP.md.
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Миграции — часть каждого старта, а не отдельный ручной шаг: схема и код
+# не должны расходиться после деплоя. $PORT — Railway задаёт его сам, не
+# захардкожен нигде специально ради этого.
+startCommand = "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+# Не бесконечно: контейнер, который падает по кругу (например, из-за
+# невалидной базы знаний при старте — см. app/main.py lifespan), должен
+# в какой-то момент остаться упавшим и позвать на помощь, а не жечь часы
+# биллинга на перезапуски.
+restartPolicyMaxRetries = 5

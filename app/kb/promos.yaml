@@ -1,0 +1,66 @@
+# Акции — декларативно. Числовой эффект ставок для «Рыцарской» спеццены и
+# пакетов «весь день» задан в catalog.yaml на уровне конкретной зоны;
+# здесь описан МЕХАНИЗМ применения акции (кому положена, при каких условиях,
+# сочетается ли с другими).
+
+promos:
+  - id: sixth_hour_free
+    name: "6-й час в подарок"
+    type: free_hour
+    # 1.1: акция ДЕЙСТВУЕТ на бани — практика менеджеров оказалась верной,
+    # а запрет в прайсе устаревшим.
+    applies_to_zones: [bath_russian, bath_garage, bath_knight, dome_bags, dome_blue_chairs, dome_chairs, grill_house, tent]
+    applies_to_modes: [hourly]
+    conditions:
+      min_paid_hours: 5
+    # 7.1: подарочный час даётся ОДИН раз, при 10+ часах не повторяется.
+    repeatable: {value: false, resolved_from: "client_answers (7.1)"}
+    stackable: false
+    mutually_exclusive_with: [birthday_discount_10]
+
+  - id: birthday_discount_10
+    name: "Скидка 10% на день рождения"
+    type: percent_discount
+    percent: {value: 10}
+    # 1.2: скидка ДЕЙСТВУЕТ на бани. С «6-м часом в подарок» не суммируется —
+    # гость выбирает что-то одно.
+    applies_to_zones: [bath_russian, bath_garage, bath_knight, grill_house, tent, dome_bags, dome_blue_chairs, dome_chairs]
+    applies_to_modes: [hourly, package]
+    conditions: {}
+    stackable: false
+    mutually_exclusive_with: [sixth_hour_free]
+    resolved_from: "client_answers (1.2)"
+
+  # Акция «Спеццена Рыцарской 1500₽/час» УДАЛЕНА: заказчик её отменил
+  # (ответы 1.4, 1.5). Вместе с ней ушёл неоднозначный calculation_mode —
+  # самый сложный краевой случай проекта.
+
+  - id: day_package_dome
+    name: "Купол — «весь день» за 5 000₽"
+    type: day_package
+    price: {value: 5000}
+    applies_to_zones: [dome_bags, dome_blue_chairs, dome_chairs]
+    window: {from: "10:00", to: "22:00"}
+    days: [mon, tue, wed, thu]
+    usable_in_parts: {value: false, resolved_from: "client_answers (3.2)"}
+    stackable: false
+
+  - id: day_package_grill
+    name: "Гриль-домик — «весь день» за 7 000₽"
+    type: day_package
+    price: {value: 7000}
+    applies_to_zones: [grill_house]
+    window: {from: "10:00", to: "22:00"}
+    days: [mon, tue, wed, thu]
+    usable_in_parts: {value: false, resolved_from: "client_answers (3.2)"}
+    stackable: false
+
+  - id: day_package_tent
+    name: "Шатёр — «весь день» за 7 500₽ (Пн-Чт, до 30 чел.)"
+    type: day_package
+    price: {value: 7500}
+    applies_to_zones: [tent]
+    window: {from: "10:00", to: "22:00"}
+    days: [mon, tue, wed, thu]
+    usable_in_parts: {value: false}
+    stackable: false

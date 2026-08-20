@@ -1,0 +1,55 @@
+# Секреты — никогда в git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Фотографии зон — не коммитятся, в репозиторий уходят только image_id в
+# catalog.yaml после загрузки в Авито (app/media/photo_import.py).
+media/
+
+# Локальные БД (SQLite и т.п.), если где-то заведутся в разработке
+*.db
+
+# Оригиналы реальных переписок ДО обезличивания (scripts/anonymize_dialogs.py)
+# — содержат телефоны и имена клиентов, третьих лиц. В репозиторий уходят
+# только обезличенные docs/analysis/dialogs.json и docs/source/real_dialogs.md.
+*_raw.md
+*_raw.json
+
+# Рабочие файлы промтов и необработанные исходники в корне — то, чем нас
+# направляли по ходу проекта (промт №N-файлы) и дублирующиеся сырые копии
+# исходников, уже оформленные под docs/source/. Не часть продукта, дублируют
+# либо чувствительное (real_dialogs.md с телефонами), либо переписку с нами.
+/prompt_*.md
+/prompts_*.md
+/real_dialogs.md
+/official_pricing.md
+/вопросы.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Локальное состояние импорта фото — своё на каждой машине, где запускали скрипт
+app/kb/.photos_manifest.json
+
+# Дампы и логи
+*.log
+dumps/
+*.sql.gz
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

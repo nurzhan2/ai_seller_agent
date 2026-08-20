@@ -1,0 +1,370 @@
+"""Тесты транспортного слоя адаптера Авито.
+
+Пути берутся из `avito_endpoints` (проверенный OpenAPI-спек), а не хардкодятся
+в тестах: если спек уточнят, тесты продолжат проверять поведение, а не строки.
+
+Реальных ключей нигде нет — фикстура собирает одноразовый Settings.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+import respx
+
+from app.channels import avito_endpoints as ep
+from app.channels import avito_payloads as pl
+from app.channels.avito import (
+    AvitoAuth,
+    AvitoClient,
+    SpecNotVerifiedError,
+    _is_retryable,
+    truncate_for_avito,
+)
+from app.config import Settings
+from app.webhooks import is_duplicate
+
+# asyncio_mode=auto in pytest.ini handles the async tests; a module-level
+# marker would also (wrongly) tag the synchronous ones.
+
+WEBHOOK_SECRET = "x" * 40
+
+
+# --------------------------------------------------------------------------
+# Fakes
+# --------------------------------------------------------------------------
+
+class FakeRedis:
+    """Enough of redis-py's async surface for these tests."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = ex
+        return True
+
+    async def ttl(self, key):
+        return self.ttls.get(key, -1)
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+        self.ttls.pop(key, None)
+
+
+@pytest.fixture
+def settings():
+    return Settings(
+        avito_client_id="test_id",
+        avito_client_secret="test_secret",
+        avito_user_id="777",
+        avito_webhook_secret=WEBHOOK_SECRET,
+        dry_run=False,
+        avito_max_retries=3,
+        database_url="postgresql+asyncpg://x/y",
+    )
+
+
+def _url(spec: tuple[str, str], **kwargs) -> str:
+    return ep.BASE_URL + spec[1].format(**kwargs)
+
+
+def token_url() -> str:
+    return _url(ep.TOKEN)
+
+
+def messages_url(user_id="777", chat_id="c1") -> str:
+    return _url(ep.GET_MESSAGES, user_id=user_id, chat_id=chat_id)
+
+
+def send_url(user_id="777", chat_id="c1") -> str:
+    return _url(ep.SEND_MESSAGE, user_id=user_id, chat_id=chat_id)
+
+
+# --------------------------------------------------------------------------
+# Спек и его особенности
+# --------------------------------------------------------------------------
+
+def test_spec_is_marked_verified():
+    assert ep.SPEC_VERIFIED is True
+
+
+def test_get_messages_path_keeps_trailing_slash():
+    """Без завершающего слеша этот эндпоинт отдаёт 404."""
+    assert ep.GET_MESSAGES[1].endswith("/messages/")
+
+
+def test_upload_field_name_has_brackets():
+    assert ep.UPLOAD_IMAGES_FIELD == "uploadfile[]"
+
+
+def test_signature_algorithm_is_still_unknown():
+    """Если кто-то «починит» это, добавив угаданный HMAC, тест должен
+    привлечь внимание к комментарию в avito_endpoints.py."""
+    assert ep.WEBHOOK_SIGNATURE_ALGORITHM_KNOWN is False
+
+
+async def test_client_refuses_to_call_when_spec_flag_is_off(settings, monkeypatch):
+    """Страховка: если константы когда-нибудь снова станут непроверенными,
+    исходящие запросы должны блокироваться, а не идти наугад."""
+    monkeypatch.setattr(ep, "SPEC_VERIFIED", False)
+    client = AvitoClient(settings=settings)
+    with pytest.raises(SpecNotVerifiedError):
+        await client.list_chats()
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------
+# Token lifecycle
+# --------------------------------------------------------------------------
+
+@respx.mock
+async def test_token_is_fetched_and_cached_in_redis(settings):
+    redis = FakeRedis()
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+    )
+    auth = AvitoAuth(settings, redis=redis)
+
+    assert await auth.get_token() == "tok-1"
+    # TTL is expires_in minus the safety margin, so no request straddles expiry.
+    assert redis.ttls["avito:access_token"] == 3600 - settings.token_expiry_safety_margin_seconds
+
+
+@respx.mock
+async def test_token_is_not_refetched_while_valid(settings):
+    route = respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+    )
+    auth = AvitoAuth(settings, redis=FakeRedis())
+    await auth.get_token()
+    await auth.get_token()
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_401_triggers_refresh_and_retry(settings):
+    """The behaviour that keeps a rotated token from dropping a message."""
+    tokens = iter(["stale", "fresh"])
+    respx.post(token_url()).mock(
+        side_effect=lambda req: httpx.Response(
+            200, json={"access_token": next(tokens), "expires_in": 3600}
+        )
+    )
+
+    calls: list[str] = []
+
+    def messages_handler(request):
+        calls.append(request.headers["Authorization"])
+        if len(calls) == 1:
+            return httpx.Response(401, json={"error": "expired"})
+        return httpx.Response(200, json={"messages": []})
+
+    respx.get(messages_url()).mock(side_effect=messages_handler)
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    result = await client.get_messages("c1")
+
+    assert result == {"messages": []}
+    assert calls == ["Bearer stale", "Bearer fresh"]
+    await client.aclose()
+
+
+@respx.mock
+async def test_token_never_appears_in_logs(settings, caplog):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "super-secret", "expires_in": 3600})
+    )
+    with caplog.at_level("DEBUG"):
+        await AvitoAuth(settings, redis=FakeRedis()).get_token()
+
+    blob = "\n".join(r.getMessage() + str(getattr(r, "__dict__", "")) for r in caplog.records)
+    assert "super-secret" not in blob
+    assert "test_secret" not in blob
+
+
+# --------------------------------------------------------------------------
+# Retries
+# --------------------------------------------------------------------------
+
+def test_retry_predicate_covers_5xx_and_transport_only():
+    request = httpx.Request("GET", "https://api.avito.ru/x")
+
+    assert _is_retryable(httpx.ConnectTimeout("t", request=request))
+    assert _is_retryable(httpx.ConnectError("boom", request=request))
+    assert _is_retryable(
+        httpx.HTTPStatusError("500", request=request, response=httpx.Response(500, request=request))
+    )
+    # A 4xx is our bug — retrying only multiplies it.
+    assert not _is_retryable(
+        httpx.HTTPStatusError("400", request=request, response=httpx.Response(400, request=request))
+    )
+    assert not _is_retryable(
+        httpx.HTTPStatusError("404", request=request, response=httpx.Response(404, request=request))
+    )
+    assert not _is_retryable(ValueError("unrelated"))
+
+
+@respx.mock
+async def test_retries_on_500_then_succeeds(settings):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+    )
+    responses = [httpx.Response(500), httpx.Response(500), httpx.Response(200, json={"ok": True})]
+    route = respx.get(messages_url()).mock(side_effect=responses)
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    assert await client.get_messages("c1") == {"ok": True}
+    assert route.call_count == 3
+    await client.aclose()
+
+
+@respx.mock
+async def test_gives_up_after_max_retries(settings):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+    )
+    route = respx.get(messages_url()).mock(return_value=httpx.Response(503))
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_messages("c1")
+    assert route.call_count == settings.avito_max_retries
+    await client.aclose()
+
+
+@respx.mock
+async def test_does_not_retry_4xx(settings):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+    )
+    route = respx.get(messages_url()).mock(return_value=httpx.Response(400))
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.get_messages("c1")
+    assert route.call_count == 1
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------
+# DRY_RUN
+# --------------------------------------------------------------------------
+
+@respx.mock
+async def test_dry_run_does_not_send_message():
+    """The safety property this whole mode exists for."""
+    settings = Settings(
+        avito_client_id="i", avito_client_secret="s", avito_user_id="777", dry_run=True
+    )
+    route = respx.post(send_url()).mock(return_value=httpx.Response(200, json={"id": "m1"}))
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    result = await client.send_message("c1", "текст клиенту")
+
+    assert result["dry_run"] is True
+    assert route.call_count == 0, "в DRY_RUN сообщение не должно уходить в Авито"
+    await client.aclose()
+
+
+@respx.mock
+async def test_dry_run_does_not_send_image():
+    settings = Settings(
+        avito_client_id="i", avito_client_secret="s", avito_user_id="777", dry_run=True
+    )
+    url = _url(ep.SEND_IMAGE, user_id="777", chat_id="c1")
+    route = respx.post(url).mock(return_value=httpx.Response(200, json={}))
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    assert (await client.send_image("c1", "img-1"))["dry_run"] is True
+    assert route.call_count == 0
+    await client.aclose()
+
+
+@respx.mock
+async def test_dry_run_off_actually_sends(settings):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+    )
+    route = respx.post(send_url()).mock(return_value=httpx.Response(200, json={"id": "m1"}))
+
+    client = AvitoClient(settings=settings, auth=AvitoAuth(settings, redis=FakeRedis()))
+    assert await client.send_message("c1", "привет") == {"id": "m1"}
+    assert route.call_count == 1
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------
+# Webhook idempotency
+# --------------------------------------------------------------------------
+
+async def test_duplicate_message_id_is_dropped():
+    redis = FakeRedis()
+    assert await is_duplicate("m-1", redis) is False   # first delivery
+    assert await is_duplicate("m-1", redis) is True    # Avito retried
+
+
+async def test_distinct_message_ids_both_pass():
+    redis = FakeRedis()
+    assert await is_duplicate("m-1", redis) is False
+    assert await is_duplicate("m-2", redis) is False
+
+
+async def test_missing_message_id_is_not_treated_as_duplicate():
+    """Undeduplicable is not the same as duplicate — the DB unique
+    constraint is the backstop."""
+    assert await is_duplicate(None, FakeRedis()) is False
+
+
+async def test_idempotency_key_carries_a_ttl():
+    redis = FakeRedis()
+    await is_duplicate("m-1", redis)
+    key = "avito:seen_message:m-1"
+    assert redis.ttls[key] == Settings().webhook_idempotency_ttl_seconds
+
+
+def test_message_id_extraction_tolerates_envelope_shapes():
+    assert pl.extract_message_id({"payload": {"value": {"id": "a"}}}) == "a"
+    assert pl.extract_message_id({"payload": {"id": "b"}}) == "b"
+    assert pl.extract_message_id({"id": 42}) == "42"
+    assert pl.extract_message_id({"nothing": "here"}) is None
+
+
+def test_chat_id_extraction_tolerates_envelope_shapes():
+    assert pl.extract_chat_id({"payload": {"value": {"chat_id": "c"}}}) == "c"
+    assert pl.extract_chat_id({"payload": {"value": {"chatId": "c2"}}}) == "c2"
+    assert pl.extract_chat_id({"junk": 1}) is None
+
+
+# --------------------------------------------------------------------------
+# Settings hygiene
+# --------------------------------------------------------------------------
+
+def test_dry_run_defaults_to_true():
+    """It must take a deliberate act to start writing to real clients."""
+    assert Settings().dry_run is True
+
+
+def test_secrets_are_not_stringified_by_accident():
+    s = Settings(avito_client_secret="hunter2", anthropic_api_key="sk-ant-xyz")
+    assert "hunter2" not in str(s)
+    assert "hunter2" not in repr(s)
+    assert "sk-ant-xyz" not in repr(s)
+
+
+def test_missing_credentials_fail_loudly():
+    with pytest.raises(RuntimeError, match="AVITO_CLIENT_ID"):
+        Settings(avito_client_id="", avito_client_secret="").require_avito_credentials()
+
+
+def test_allowed_users_accepts_comma_separated_env_value():
+    assert Settings(telegram_allowed_users="111,222").telegram_allowed_users == [111, 222]
+    assert Settings(telegram_allowed_users="").telegram_allowed_users == []

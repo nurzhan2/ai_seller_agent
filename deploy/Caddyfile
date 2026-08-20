@@ -1,0 +1,22 @@
+# Вебхук Авито требует HTTPS — Caddy сам выпускает и продлевает Let's Encrypt.
+# Замените домен на реальный.
+
+parmangal.example.ru {
+	encode gzip
+
+	# Админка и метрики наружу не выставляются: только вебхук и healthcheck.
+	@internal path /admin* /metrics
+	respond @internal 404
+
+	reverse_proxy app:8000 {
+		health_uri /health
+		health_interval 30s
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 20mb
+			roll_keep 7
+		}
+	}
+}
