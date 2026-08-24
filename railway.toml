@@ -14,8 +14,11 @@ dockerfilePath = "Dockerfile"
 # не должны расходиться после деплоя. $PORT — Railway задаёт его сам, не
 # захардкожен нигде специально ради этого.
 startCommand = "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
-healthcheckTimeout = 300
+# Временно отключено — контейнер должен оставаться живым для захода через
+# Railway Console, даже если /health отвечает degraded. Вернуть перед тем,
+# как снова полагаться на автоматический рестарт по healthcheck.
+# healthcheckPath = "/health"
+# healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 # Не бесконечно: контейнер, который падает по кругу (например, из-за
 # невалидной базы знаний при старте — см. app/main.py lifespan), должен
