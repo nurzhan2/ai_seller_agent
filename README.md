@@ -33,7 +33,7 @@ scripts/          replay.py (--provider), compare_providers.py,
                   unpack_google_drive_photos.py, anonymize_dialogs.py
 railway.toml      сборка на Railway (см. docs/RAILWAY_SETUP.md)
 entrypoint.sh     точка входа контейнера: alembic upgrade head, потом uvicorn
-tests/            543 теста
+tests/            544 теста
 questions_for_client.md   вопросы заказчику (секции 1-15)
 ```
 

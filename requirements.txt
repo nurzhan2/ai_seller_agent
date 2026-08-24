@@ -9,6 +9,10 @@ redis>=5.1
 SQLAlchemy>=2.0
 alembic>=1.14
 asyncpg>=0.30
+# /metrics (app/metrics.py) — упущен из requirements.txt при первой сборке:
+# локально стоял в окружении, поэтому 543 теста были зелёными, а в чистом
+# контейнере на Railway импорт падал ModuleNotFoundError ещё на старте.
+prometheus_client>=0.20
 Pillow>=11.0
 # Оба LLM-провайдера (промт №12) идут через этот SDK: DeepSeek отдаёт
 # Anthropic-совместимые ответы на своём base_url — см.

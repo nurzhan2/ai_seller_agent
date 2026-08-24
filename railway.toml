@@ -20,11 +20,8 @@ dockerfilePath = "Dockerfile"
 # /bin/sh) — его шелл гарантирован спецификацией контейнера, а не тем, как
 # Railway решит вызвать команду. Миграция (alembic upgrade head) и запуск
 # uvicorn с $PORT теперь оба внутри entrypoint.sh — см. его комментарии.
-# Временно отключено — контейнер должен оставаться живым для захода через
-# Railway Console, даже если /health отвечает degraded. Вернуть перед тем,
-# как снова полагаться на автоматический рестарт по healthcheck.
-# healthcheckPath = "/health"
-# healthcheckTimeout = 300
+healthcheckPath = "/health"
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 # Не бесконечно: контейнер, который падает по кругу (например, из-за
 # невалидной базы знаний при старте — см. app/main.py lifespan), должен
