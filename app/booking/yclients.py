@@ -70,12 +70,28 @@ class YClientsProvider:
         }
 
     async def _request(self, spec: tuple[str, str], path: str, **kwargs) -> Optional[dict]:
-        """Возвращает data из конверта или None при любом сбое."""
+        """Возвращает data из конверта или None при любом сбое.
+
+        Интеграция подключается филиалом вручную в личном кабинете YCLIENTS —
+        пока филиал не нажал «Подключить», формально верные токены всё равно
+        получат отказ в доступе (типично 401/403). Это состояние ловится
+        отдельно и пишется в лог понятной строкой, а не общим «request
+        failed»: дежурный должен сразу понимать, что чинить нужно не код, а
+        подключение интеграции у заказчика.
+        """
         ep.assert_spec_verified()
         method = spec[0]
         client = self._client or httpx.AsyncClient(base_url=ep.BASE_URL, timeout=self._timeout)
         try:
             response = await client.request(method, path, headers=self._headers(), **kwargs)
+            if response.status_code in ep.INTEGRATION_NOT_CONNECTED_STATUSES:
+                logger.warning(
+                    "yclients: интеграция не подключена филиалом (или токены отозваны) — "
+                    "status=%s. Это не ошибка кода: филиал должен нажать «Подключить» "
+                    "в личном кабинете YCLIENTS.",
+                    response.status_code,
+                )
+                return None
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # noqa: BLE001
@@ -88,7 +104,10 @@ class YClientsProvider:
                 await client.aclose()
 
         if isinstance(payload, dict) and payload.get("success") is False:
-            logger.warning("yclients returned success=false")
+            logger.warning(
+                "yclients returned success=false: %s",
+                (payload.get("meta") or {}).get("message") or payload.get("meta"),
+            )
             return None
         return payload.get("data") if isinstance(payload, dict) else None
 

@@ -588,6 +588,86 @@ def test_r12_log_records_provisional_and_basis(kb, bath_quote, caplog):
 
 
 # ==========================================================================
+# R13 — регламент отложенных касаний (Максим): ценовые ступени не раньше
+# третьего касания, кроме случая явного возражения по цене.
+# ==========================================================================
+
+def test_r13_price_tier_denied_below_min_touches(kb, bath_quote):
+    d = decide(
+        req(
+            bath_quote, already_used_tiers=ALL_NON_PRICE, touch_count=1,
+            observed_triggers=("going_silent",),
+        ),
+        kb,
+    )
+    assert not d.allowed
+    assert "R13" in d.denial_reason
+
+
+def test_r13_price_tier_denied_at_two_touches(kb, bath_quote):
+    d = decide(
+        req(
+            bath_quote, already_used_tiers=ALL_NON_PRICE, touch_count=2,
+            observed_triggers=("soft_decline",),
+        ),
+        kb,
+    )
+    assert not d.allowed
+    assert "R13" in d.denial_reason
+
+
+def test_r13_price_tier_allowed_at_three_touches(kb, bath_quote):
+    d = decide(
+        req(
+            bath_quote, already_used_tiers=ALL_NON_PRICE, touch_count=3,
+            observed_triggers=("going_silent",),
+        ),
+        kb,
+    )
+    assert d.allowed
+
+
+def test_r13_price_objection_bypasses_touch_requirement_entirely(kb, bath_quote):
+    """«Скидка разрешена ТОЛЬКО на третьем касании ЛИБО после жалобы на
+    цену» — жалоба обходит порог, а не складывается с ним."""
+    d = decide(
+        req(
+            bath_quote, already_used_tiers=ALL_NON_PRICE, touch_count=0,
+            observed_triggers=("price_objection",),
+        ),
+        kb,
+    )
+    assert d.allowed
+
+
+def test_r13_does_not_gate_non_price_tiers(kb, bath_quote):
+    """Регламент — про ценовые ступени. Неценовые (перенести на будни,
+    зона поменьше) не должны ждать никаких касаний."""
+    d = decide(
+        req(bath_quote, touch_count=0, observed_triggers=("going_silent",)),
+        kb,
+    )
+    assert d.allowed
+    assert d.kind == "non_price"
+
+
+def test_r13_missing_condition_does_not_gate_anything(kb, bath_quote):
+    """Если min_touches_before_price вообще не задан в политике — правило
+    не должно ничего блокировать (совместимость на случай, если условие
+    когда-нибудь уберут из concessions.yaml)."""
+    raw = copy.deepcopy(_raw())
+    del raw["concessions"]["policy"]["conditions"]["min_touches_before_price"]
+    kb_no_gate = KnowledgeBase.model_validate(raw)
+    q = quote(PriceRequest("bath_russian", SAT, NOON, 3, 6), kb_no_gate)
+    d = decide(
+        req(q, already_used_tiers=ALL_NON_PRICE, touch_count=0,
+            observed_triggers=("going_silent",)),
+        kb_no_gate,
+    )
+    assert d.allowed
+
+
+# ==========================================================================
 # revenue_delta accounting
 # ==========================================================================
 

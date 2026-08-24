@@ -108,6 +108,12 @@ def test_system_prompt_contains_hard_prohibitions(kb):
         assert fragment in text, fragment
 
 
+def test_system_prompt_names_the_assistant(kb):
+    text = build_system_prompt(kb)[0]["text"]
+    assert "Иришка" in text
+    assert "представься" in text.lower()
+
+
 def test_catalog_block_has_no_prices(kb):
     """Цены живут только в движке — в справочнике их быть не должно,
     иначе модель начнёт называть их без вызова инструмента."""
@@ -414,6 +420,19 @@ def test_cost_estimate_is_decimal_and_positive():
     cost = estimate_cost_rub("claude-sonnet-5", 10_000, 1_000)
     assert isinstance(cost, Decimal)
     assert cost > 0
+
+
+async def test_booking_provider_reaches_the_default_executor(kb):
+    """AgentLoop(booking_provider=...) должен доходить до ToolExecutor через
+    дефолтную executor_factory — иначе check_availability не сможет
+    воспользоваться реальным YClientsProvider, даже когда он подключён
+    (промт про YCLIENTS)."""
+    sentinel_provider = object()
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("ок")])])
+    agent = AgentLoop(client, kb, booking_provider=sentinel_provider)
+
+    executor = agent.executor_factory("d1", None)
+    assert executor.booking_provider is sentinel_provider
 
 
 def test_unknown_model_costs_zero_rather_than_crashing():

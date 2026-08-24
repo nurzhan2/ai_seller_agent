@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import redis.asyncio as redis_asyncio
@@ -15,14 +16,16 @@ from sqlalchemy import text
 from app import webhooks
 from app.admin import routes as admin_routes
 from app.channels import avito_endpoints as ep
-from app.config import get_settings
-from app.db.session import get_engine
-from app.kb.loader import load_catalog
+from app.config import Settings, get_settings
+from app.db.session import get_engine, get_sessionmaker
+from app.kb.loader import KnowledgeBase, load_catalog
 from app.logging_setup import configure_logging
 from app.metrics import dry_run_gauge, render_metrics
 from app.ops.bot import OpsService
 from app.ops.handlers import build_dispatcher
+from app.ops.notifications import DialogCard, dialog_keyboard, render_dialog_card
 from app.ops.state import InMemoryOpsStore
+from app.ops.touch_scheduler import SqlAlchemyTouchStore, run_scheduler_pass
 
 logger = logging.getLogger("parmangal")
 
@@ -44,6 +47,80 @@ async def supervised_bot_polling(dispatcher: Any, bot: Any) -> None:
         raise
     except Exception:
         logger.exception("telegram operator bot: polling crashed")
+
+
+def build_touch_sender(
+    settings: Settings,
+    ops_service: OpsService,
+    ops_bot: Any,
+    avito_client: Any,
+):
+    """Собирает функцию отправки одного касания.
+
+    DRY_RUN: касание уходит через тот же путь модерации, что и обычные
+    ответы агента — очередь на одобрение (`OpsService.queue_reply`) плюс
+    карточка оператору в Telegram, если бот настроен. Без бота (нет
+    TELEGRAM_BOT_TOKEN) касание всё равно встаёт в очередь — просто
+    оператор не увидит уведомление сам, придётся смотреть /admin/dialogs.
+
+    Не DRY_RUN: прямая отправка через AvitoClient — тот сам ещё раз
+    проверяет DRY_RUN на своей стороне (защита от рассинхрона настроек),
+    так что двойного отправления при гонке настроек не будет.
+    """
+
+    async def send(chat_id: str, text_: str) -> None:
+        if settings.dry_run:
+            await ops_service.queue_reply(chat_id, text_)
+            if ops_bot is not None and settings.telegram_ops_chat_id:
+                card = DialogCard(
+                    chat_id=chat_id,
+                    item_title=None,
+                    buyer_name=None,
+                    client_text="(автоматическое напоминание — клиент долго не отвечает)",
+                    agent_text=text_,
+                    dry_run=True,
+                )
+                await ops_bot.send_message(
+                    chat_id=settings.telegram_ops_chat_id,
+                    text=render_dialog_card(card),
+                    reply_markup=dialog_keyboard(chat_id, dry_run=True, taken_over=False),
+                )
+        else:
+            await avito_client.send_message(chat_id, text_)
+
+    return send
+
+
+async def supervised_touch_scheduler(
+    store: SqlAlchemyTouchStore,
+    kb: KnowledgeBase,
+    send: Any,
+    *,
+    delay_minutes: int,
+    max_count: int,
+    interval_seconds: int,
+    now_fn: Any = lambda: datetime.now(timezone.utc),
+) -> None:
+    """Периодический проход воркера отложенных касаний.
+
+    Один сбой прохода (временная недоступность БД/Авито) не должен
+    останавливать все последующие — та же логика изоляции, что и у
+    `supervised_bot_polling`. `now_fn` — реальное время по умолчанию;
+    параметризовано ради теста устойчивости к сбою, который иначе зависел бы
+    от того, идёт ли прогон тестов внутри рабочего окна 9:00–23:00."""
+    templates = kb.concessions.policy.touch_templates
+    window = kb.catalog.constants.working_window
+    while True:
+        try:
+            await run_scheduler_pass(
+                store, templates, window, send, now_fn(),
+                delay_minutes=delay_minutes, max_count=max_count,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("touch scheduler: pass failed")
+        await asyncio.sleep(interval_seconds)
 
 
 @asynccontextmanager
@@ -84,18 +161,52 @@ async def lifespan(app: FastAPI):
     # проверяется тестами app/webhooks.py уже сейчас.
     webhooks.configure(redis=redis_client, handler=None)
 
+    # YCLIENTS — спек подтверждён заказчиком (не наша догадка), см.
+    # app/booking/yclients_endpoints.py. Каталог услуг у заказчика ещё
+    # пустой (get_services() честно вернёт []). Маппинг зона→услуга —
+    # SqlAlchemyZoneMapping поверх таблицы ZoneServiceMap, с кешем в памяти
+    # (см. докстринг класса): правки в БД теперь доезжают до живого
+    # провайдера, а не теряются в отдельном процессе. app.state.zone_mapping
+    # — тот же объект, который уже читает /admin/catalog.
+    from app.booking.mapping import SqlAlchemyZoneMapping
+    from app.booking.yclients import YClientsProvider
+
+    zone_mapping = SqlAlchemyZoneMapping(get_sessionmaker())
+    try:
+        await zone_mapping.load()
+    except Exception:
+        # БД временно недоступна на старте — не должно ронять весь процесс
+        # (/health и так честно покажет database: error). Кеш остаётся
+        # пустым — get_availability на любую зону вернёт unknown, безопасное
+        # вырождение, а не крах старта; следующий рестарт подхватит данные.
+        logger.exception("zone mapping: initial load failed, starting with an empty cache")
+    app.state.zone_mapping = zone_mapping
+
+    booking_provider = YClientsProvider(
+        partner_token=settings.yclients_partner_token.get_secret_value(),
+        user_token=settings.yclients_user_token.get_secret_value(),
+        company_id=settings.yclients_company_id,
+        mapping=zone_mapping,
+        redis=redis_client,
+    )
+    app.state.booking_provider = booking_provider
+
     # Телеграм-бот оператора — фоновая asyncio-задача в этом же процессе, а
     # не отдельный сервис Railway (второй контейнер — лишние деньги, промт
     # №13, 3.5). InMemoryOpsStore: состояние модерации (кто что одобрил,
     # какие чаты у оператора) не переживает перезапуск процесса — известное
     # ограничение, БД-реализация OpsStore не входит в этот промт.
+    # ops_service заводится всегда (не только при наличии токена бота) — он
+    # же нужен воркеру отложенных касаний ниже для очереди на одобрение в
+    # DRY_RUN, независимо от того, есть ли кому её показать в Telegram.
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    app.state.ops_service = ops_service
+
     bot_task: asyncio.Task | None = None
     ops_bot = None
     if settings.telegram_bot_token.get_secret_value():
         from aiogram import Bot
 
-        ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
-        app.state.ops_service = ops_service
         ops_bot = Bot(token=settings.telegram_bot_token.get_secret_value())
         dispatcher = build_dispatcher(ops_service)
         bot_task = asyncio.create_task(supervised_bot_polling(dispatcher, ops_bot))
@@ -106,8 +217,31 @@ async def lifespan(app: FastAPI):
             "модерация ответов недоступна"
         )
 
+    # Воркер отложенных касаний (регламент скидок) — фоновой задачей в этом
+    # же процессе, состояние в БД (DialogState.touch_*), а не в памяти:
+    # рестарт контейнера не теряет запланированные касания, следующий проход
+    # воркера сам подхватит просроченные (промт «отложенные сообщения»).
+    from app.channels.avito import AvitoClient
+
+    touch_avito_client = AvitoClient(settings=settings, redis=redis_client)
+    touch_store = SqlAlchemyTouchStore(get_sessionmaker())
+    touch_sender = build_touch_sender(settings, ops_service, ops_bot, touch_avito_client)
+    touch_task = asyncio.create_task(
+        supervised_touch_scheduler(
+            touch_store, app.state.kb, touch_sender,
+            delay_minutes=settings.touch_reminder_delay_minutes,
+            max_count=settings.touch_max_count,
+            interval_seconds=settings.touch_scheduler_interval_seconds,
+        )
+    )
+    logger.info("touch scheduler: started")
+
     yield
 
+    touch_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await touch_task
+    await touch_avito_client.aclose()
     if bot_task is not None:
         bot_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

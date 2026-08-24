@@ -29,6 +29,9 @@ Rules implemented (R1-R12):
     R11 require_exchange -> the offer text always carries a condition,
         checked structurally at KB load time (loader.py)
     R12 every decision, allowing or denying, is logged
+    R13 price tiers require touch_count >= min_touches_before_price, unless
+        the price_objection trigger fired (Максим's discount protocol —
+        3 touches, or an immediate objection, never both required)
 """
 
 from __future__ import annotations
@@ -58,6 +61,11 @@ class DialogConcessionState:
     used_tiers: frozenset[int] = frozenset()
     # R9 ratchet: the lowest total already promised in this dialog.
     floor_reached: Optional[Money] = None
+    # R13: how many touches have actually been SENT in this dialog (the
+    # first price quote counts as touch 1; touches 2-3 come from the
+    # scheduler — app.agent.touch_tracking). Not a timestamp: the gate below
+    # cares about count, scheduling is a separate concern.
+    touch_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -96,6 +104,11 @@ class ConcessionRequest:
     client_constraints: frozenset[str] = frozenset()
     base_price_quoted: bool = True
     floor_reached: Optional[Money] = None
+    # R13 — регламент скидок: сколько раз мы уже касались клиента (первая
+    # названная цена = касание 1). Ценовые ступени открываются не раньше
+    # policy.conditions.min_touches_before_price, если не сработал
+    # price_objection.
+    touch_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -420,6 +433,23 @@ def decide(req: ConcessionRequest, kb: KnowledgeBase) -> ConcessionDecision:
             tier=candidate.tier,
             skipped=tuple(skipped),
         )
+
+    # R13 — регламент скидок (Максим): ценовая ступень доступна не раньше
+    # третьего касания, кроме случая, когда клиент явно возразил по цене —
+    # тогда скидка разрешена сразу же, без ожидания. Формулировка регламента
+    # буквально: «Скидка разрешена ТОЛЬКО на третьем касании либо после
+    # жалобы на цену» — «либо» здесь читается как обход порога, а не как
+    # дополнительное условие сверху него.
+    min_touches = policy.conditions.get("min_touches_before_price")
+    if min_touches is not None and "price_objection" not in req.observed_triggers:
+        if req.touch_count < min_touches:
+            return _deny(
+                req,
+                f"R13: ценовые ступени открываются с {min_touches}-го касания "
+                f"(сейчас {req.touch_count}) или сразу при возражении по цене",
+                tier=candidate.tier,
+                skipped=tuple(skipped),
+            )
 
     # R7 — ЗАГРУЗКА, а не близость даты.
     #

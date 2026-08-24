@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     # Access token is refreshed this many seconds before it actually expires.
     token_expiry_safety_margin_seconds: int = 60
 
+    # --- Отложенные касания (регламент скидок Максима) -------------------
+    # Молчание клиента после названной цены — через столько минут ставится
+    # второе касание (мягкое напоминание), потом третье (прямой вопрос).
+    touch_reminder_delay_minutes: int = 30
+    # Как часто фоновый воркер проверяет диалоги с истёкшим таймером.
+    touch_scheduler_interval_seconds: int = 60
+    # Максимум напоминаний на диалог — дальше молчим, а не долбим клиента.
+    touch_max_count: int = 3
+
     @field_validator("telegram_allowed_users", mode="before")
     @classmethod
     def _split_user_ids(cls, value: object) -> object:

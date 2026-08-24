@@ -19,6 +19,7 @@ from datetime import date as DateType, datetime, time as TimeType
 from decimal import Decimal
 from typing import Any, Optional
 
+from app.config import get_settings
 from app.kb.loader import KnowledgeBase
 from app.pricing.concessions import (
     ConcessionRequest,
@@ -409,10 +410,17 @@ class ToolExecutor:
         self.last_booking_date = date_value
 
         if final.status == "ok":
+            # Регламент Максима: «первое касание — называем цену». Считается
+            # только один раз за диалог — пересчёт той же или другой зоны
+            # позже НЕ новый первый контакт, поэтому touch_count не сбрасывается
+            # обратно, если он уже вырос (например, воркер успел отправить
+            # второе касание раньше нового calculate_price).
+            new_touch_count = self.state.touch_count if self.state.touch_count > 0 else 1
             self.state = DialogConcessionState(
                 base_price_quoted=True,
                 used_tiers=self.state.used_tiers,
                 floor_reached=self.state.floor_reached,
+                touch_count=new_touch_count,
             )
         return quote_to_dict(final)
 
@@ -425,10 +433,23 @@ class ToolExecutor:
                 "instruction": "Сначала посчитай цену через calculate_price.",
             }
 
+        observed_triggers = tuple(args.get("observed_triggers") or ())
+        touch_max_count = get_settings().touch_max_count
+        if "price_objection" in observed_triggers and self.state.touch_count < touch_max_count:
+            # Регламент Максима: жалоба на цену эскалирует диалог до предела
+            # сама по себе — запланированное «вы где-то затерялись?» позже
+            # уже не нужно, разговор о цене идёт живьём прямо сейчас.
+            self.state = DialogConcessionState(
+                base_price_quoted=self.state.base_price_quoted,
+                used_tiers=self.state.used_tiers,
+                floor_reached=self.state.floor_reached,
+                touch_count=touch_max_count,
+            )
+
         request = ConcessionRequest(
             dialog_id=self.dialog_id,
             quote=self.last_quote,
-            observed_triggers=tuple(args.get("observed_triggers") or ()),
+            observed_triggers=observed_triggers,
             client_constraints=frozenset(args.get("client_constraints") or ()),
             days_until_date=self._days_until(),
             slot_confirmed_free=self._slot_known_free(),
@@ -436,6 +457,7 @@ class ToolExecutor:
             concessions_today=0,
             base_price_quoted=self.state.base_price_quoted,
             floor_reached=self.state.floor_reached,
+            touch_count=self.state.touch_count,
             booking_date=self.last_booking_date or DateType.today(),
         )
         decision = decide(request, self.kb)
@@ -460,6 +482,7 @@ class ToolExecutor:
             base_price_quoted=self.state.base_price_quoted,
             used_tiers=frozenset(used),
             floor_reached=new_floor,
+            touch_count=self.state.touch_count,
         )
         if decision.new_quote is not None:
             self.last_quote = decision.new_quote

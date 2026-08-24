@@ -27,6 +27,10 @@ media/
 /real_dialogs.md
 /official_pricing.md
 /вопросы.pdf
+# Осколок раннего черновика app/channels/avito_endpoints.py (Phase 4, до
+# верификации спека) — остался под неправильным именем, содержание устарело
+# и противоречит текущему (SPEC_VERIFIED = True) файлу.
+app/channels/.py
 
 # Python
 __pycache__/

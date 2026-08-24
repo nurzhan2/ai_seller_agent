@@ -333,6 +333,10 @@ class ConcessionPolicy(BaseModel):
     exchange_options: list[str]
     exchange_clauses: dict[str, str]
     offer_templates: dict[str, OfferTemplate]
+    # Регламент отложенных касаний (Максим) — второе (soft) и третье
+    # (direct) касание, дословно. Модель их не переписывает — см.
+    # app.ops.touch_scheduler.
+    touch_templates: dict[str, str] = Field(default_factory=dict)
     logging: dict[str, Any]
 
     model_config = ConfigDict(extra="forbid")
@@ -356,6 +360,14 @@ class ConcessionPolicy(BaseModel):
         missing = {t.id for t in self.ladder} - set(self.offer_templates)
         if missing:
             raise ValueError(f"ladder tiers without an offer_template: {sorted(missing)}")
+        return self
+
+    @model_validator(mode="after")
+    def _touch_templates_are_complete(self) -> "ConcessionPolicy":
+        required = {"soft", "direct"}
+        missing = required - set(self.touch_templates)
+        if missing:
+            raise ValueError(f"touch_templates missing required keys: {sorted(missing)}")
         return self
 
     @model_validator(mode="after")

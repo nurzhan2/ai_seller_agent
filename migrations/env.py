@@ -21,7 +21,23 @@ if config.config_file_name is not None:
 from app.config import get_settings  # noqa: E402
 from app.db.models import Base  # noqa: E402
 
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# ZoneServiceMap живёт в app/booking/mapping.py, не в app/db/models.py —
+# без этого импорта её таблица никогда не регистрируется на Base.metadata,
+# и autogenerate её просто не видит: воспроизведено на пустой базе — первый
+# прогон `alembic revision --autogenerate` без этой строки создал таблицы
+# для всего, КРОМЕ zone_service_map. app/db/models.py сам не может
+# импортировать этот модуль обратно — app/booking/mapping.py уже
+# импортирует Base оттуда, это был бы циклический импорт; поэтому
+# регистрация нужна именно здесь, в единственном месте, которому требуется
+# ПОЛНАЯ metadata.
+import app.booking.mapping  # noqa: E402,F401
+
+# Та же нормализация, что и в app/db/session.py: Railway отдаёт postgres://
+# и может дописать sslmode=require, которого asyncpg не понимает как часть
+# DSN. Без этого `alembic upgrade head` (railway.toml startCommand) падал бы
+# на первом же подключении — раньше, чем само приложение успело бы стартовать.
+_DB_URL, _CONNECT_ARGS = get_settings().normalized_database_url()
+config.set_main_option("sqlalchemy.url", _DB_URL)
 
 target_metadata = Base.metadata
 
@@ -72,6 +88,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=_CONNECT_ARGS,
     )
 
     async with connectable.connect() as connection:

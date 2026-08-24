@@ -117,6 +117,7 @@ class AgentLoop:
         executor_factory: Any = None,
         dialog_model: str = MAIN_MODEL,
         classifier_model: str = CLASSIFIER_MODEL,
+        booking_provider: Any = None,       # BookingProvider — YClientsProvider или None
     ):
         # `client` принимает три формы ради обратной совместимости с уже
         # написанными тестами и харнессом: готовый LLMProvider, «сырой»
@@ -129,7 +130,7 @@ class AgentLoop:
         self.dialog_model = dialog_model
         self.classifier_model = classifier_model
         self.executor_factory = executor_factory or (
-            lambda dialog_id, state: ToolExecutor(kb, dialog_id, state)
+            lambda dialog_id, state: ToolExecutor(kb, dialog_id, state, booking_provider=booking_provider)
         )
 
     # -- классификация -----------------------------------------------------

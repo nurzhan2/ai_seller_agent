@@ -173,6 +173,13 @@ policy:
       provisional: true
       question_id: "14.5"
       note: "Занято меньше половины зон на эту дату. Ждём подтверждения заказчика."
+    # Регламент Максима (скидки): ценовые ступени доступны не раньше
+    # ТРЕТЬЕГО касания клиента — либо сразу, если сработал триггер
+    # price_objection (жалоба на цену). Число подтверждено заказчиком
+    # напрямую, не наш черновой порог — в отличие от max_occupancy_ratio
+    # выше, здесь нет provisional/question_id.
+    min_touches_before_price: 3
+
     # days_until_date больше НЕ условие выдачи скидки: заказчик привязал её к
     # загрузке. Поле оставлено справочным для логов и отчётов.
     days_until_date_is_informational: true
@@ -227,6 +234,13 @@ policy:
     reduce_daily_rate:
       text: "Могу отдать домик за {new_rate} ₽ вместо {base_rate} ₽, {exchange_clause}."
       exchange: book_today
+
+  # Регламент отложенных касаний (Максим) — второе и третье касание,
+  # ДОСЛОВНО как он их написал. Модель их не переписывает, см.
+  # app.ops.touch_scheduler и app.agent.touch_tracking.
+  touch_templates:
+    soft: "Вы где-то затерялись? Может быть, вам что-то ещё подсказать?"
+    direct: "Будете бронировать или нет?"
 
   logging:
     log_every_concession: true

@@ -142,6 +142,20 @@ class DialogState(Base):
     floor_reached: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     client_constraints: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
     concessions_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # --- Отложенные касания (регламент скидок Максима) --------------------
+    # В БД, не в памяти процесса — переживает рестарт контейнера. Один и тот
+    # же движок для 30-минутного напоминания и для min_touches в скидках:
+    # touch_count растёт только когда касание РЕАЛЬНО отправлено (первое —
+    # когда назвали цену, второе и третье — воркером), а не когда оно
+    # запланировано.
+    touch_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # NULL означает «таймер не тикает» — либо касаний ещё не было, либо
+    # клиент только что ответил (см. app.agent.touch_tracking.reset_timer_on_reply),
+    # либо лимит touch_max_count уже исчерпан.
+    next_touch_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -156,6 +170,7 @@ class DialogState(Base):
             base_price_quoted=self.base_price_quoted,
             used_tiers=frozenset(self.used_tiers or ()),
             floor_reached=self.floor_reached,
+            touch_count=self.touch_count,
         )
 
 

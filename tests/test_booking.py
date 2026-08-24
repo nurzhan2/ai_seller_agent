@@ -69,21 +69,27 @@ def times_url(company="1", staff="20", day=DAY) -> str:
 
 
 # --------------------------------------------------------------------------
-# Спек не подтверждён
+# Спек подтверждён заказчиком (ключи получены, факты сверены — не наша
+# догадка). Флаг переключился с False на True — три теста ниже раньше
+# проверяли поведение ПО УМОЛЧАНИЮ при неподтверждённом спеке; сейчас это
+# больше не дефолт, поэтому unverified-поведение тестируется через явный
+# monkeypatch обратно на False, а не через реальное состояние модуля.
 # --------------------------------------------------------------------------
 
-def test_spec_is_marked_unverified():
-    assert ep.SPEC_VERIFIED is False
+def test_spec_is_marked_verified():
+    assert ep.SPEC_VERIFIED is True
 
 
-async def test_unverified_spec_yields_unknown_not_free(mapping):
+async def test_unverified_spec_yields_unknown_not_free(mapping, monkeypatch):
+    monkeypatch.setattr(ep, "SPEC_VERIFIED", False)
     provider = YClientsProvider(mapping=mapping)
     result = await provider.check_availability("bath_russian", DAY, time(14, 0))
     assert result.status is AvailabilityStatus.UNKNOWN
     assert not result.is_known
 
 
-async def test_unverified_spec_blocks_booking(mapping):
+async def test_unverified_spec_blocks_booking(mapping, monkeypatch):
+    monkeypatch.setattr(ep, "SPEC_VERIFIED", False)
     provider = YClientsProvider(mapping=mapping)
     result = await provider.create_booking(
         BookingRequest("bath_russian", DAY, time(14, 0), occupied_hours=3, guests=6)
@@ -138,6 +144,29 @@ async def test_success_false_envelope_becomes_unknown(mapping, verified):
     )
     provider = YClientsProvider(mapping=mapping, company_id="1")
     assert (await provider.get_free_slots("bath_russian", DAY)).status is AvailabilityStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("status", ep.INTEGRATION_NOT_CONNECTED_STATUSES)
+@respx.mock
+async def test_integration_not_connected_becomes_unknown(mapping, verified, status):
+    """Токены валидны по формату, но филиал не нажал «Подключить» в
+    личном кабинете YCLIENTS — деградирует так же, как любой другой сбой."""
+    respx.get(times_url()).mock(return_value=httpx.Response(status))
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    result = await provider.get_free_slots("bath_russian", DAY)
+    assert result.status is AvailabilityStatus.UNKNOWN
+
+
+@respx.mock
+async def test_integration_not_connected_logs_a_distinct_message(mapping, verified, caplog):
+    """Дежурный должен сразу понимать по логу, что чинить нужно подключение
+    интеграции у заказчика, а не искать баг в коде."""
+    respx.get(times_url()).mock(return_value=httpx.Response(403))
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    with caplog.at_level("WARNING", logger="parmangal.yclients"):
+        await provider.get_free_slots("bath_russian", DAY)
+    assert "не подключена филиалом" in caplog.text
+    assert "request failed" not in caplog.text
 
 
 # --------------------------------------------------------------------------

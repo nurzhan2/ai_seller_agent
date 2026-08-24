@@ -17,3 +17,8 @@ anthropic>=0.125
 # Операторский Telegram-бот, запускается фоновой задачей в lifespan
 # приложения (app/main.py, промт №13).
 aiogram>=3.30
+# Только для тестов SqlAlchemyZoneMapping (tests/test_zone_mapping.py) —
+# in-memory SQLite вместо поднятого Postgres. Тесты pytest/respx в этом
+# файле намеренно не перечислены (они уже были нужны раньше и не были
+# добавлены здесь — не расширяю тот пробел мимо того, что сам же завёл).
+aiosqlite>=0.20
