@@ -13,8 +13,18 @@ config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# disable_existing_loggers=False — НЕ косметика. По умолчанию fileConfig
+# ОТКЛЮЧАЕТ все логгеры, которых нет в alembic.ini, то есть всё дерево
+# «parmangal.*» целиком: после прогона миграции в том же процессе приложение
+# перестаёт писать логи вообще, молча. Поймано тестами: alembic, вызванный
+# из tests/test_dialog_store_sql.py, гасил логгер, и проверки логирования в
+# tests/test_main.py падали на пустом caplog — при том, что по отдельности
+# оба файла проходили. В проде сейчас не стреляет только потому, что
+# entrypoint.sh запускает alembic отдельным процессом, который успевает
+# завершиться до старта uvicorn; полагаться на это не стоит.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Models and connection URL come from the application, so migrations and
 # runtime can never drift apart or point at different databases.

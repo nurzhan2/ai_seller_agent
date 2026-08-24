@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from app import webhooks
 from app.admin import routes as admin_routes
+from app.agent.debounce import human_delay
 from app.channels import avito_endpoints as ep
 from app.config import Settings, get_settings
 from app.db.session import get_engine, get_sessionmaker
@@ -154,12 +155,9 @@ async def lifespan(app: FastAPI):
     # проверено (промт №13, 3.4).
     redis_client = redis_asyncio.from_url(settings.redis_url, decode_responses=True)
     app.state.redis = redis_client
-    # handler=None: вебхук принимает и дедуплицирует сообщения Авито по-
-    # настоящему, но не запускает по ним AgentLoop — полная цепочка
-    # «сообщение → агент → ответ клиенту» ещё не собрана в один вызов
-    # (отдельная задача, не в этом промте). Дедуп при этом рабочий и
-    # проверяется тестами app/webhooks.py уже сейчас.
-    webhooks.configure(redis=redis_client, handler=None)
+    # Сам обработчик подключается ниже, после того как собраны все его части
+    # (провайдер модели, операторский контур, клиент Авито) — см.
+    # webhooks.configure(...) в конце этой функции.
 
     # YCLIENTS — спек подтверждён заказчиком (не наша догадка), см.
     # app/booking/yclients_endpoints.py. Каталог услуг у заказчика ещё
@@ -223,9 +221,12 @@ async def lifespan(app: FastAPI):
     # воркера сам подхватит просроченные (промт «отложенные сообщения»).
     from app.channels.avito import AvitoClient
 
-    touch_avito_client = AvitoClient(settings=settings, redis=redis_client)
+    # Один клиент Авито на процесс: и воркеру касаний, и конвейеру входящих.
+    # Два отдельных означали бы два пула соединений и два независимых кеша
+    # access-токена — второй обновлял бы токен, не зная про первый.
+    avito_client = AvitoClient(settings=settings, redis=redis_client)
     touch_store = SqlAlchemyTouchStore(get_sessionmaker())
-    touch_sender = build_touch_sender(settings, ops_service, ops_bot, touch_avito_client)
+    touch_sender = build_touch_sender(settings, ops_service, ops_bot, avito_client)
     touch_task = asyncio.create_task(
         supervised_touch_scheduler(
             touch_store, app.state.kb, touch_sender,
@@ -236,12 +237,45 @@ async def lifespan(app: FastAPI):
     )
     logger.info("touch scheduler: started")
 
+    # Конвейер обработки входящих — последнее звено: вебхук → агент → ответ.
+    # Собирается здесь, а не в webhooks.py, потому что ему нужны ВСЕ части
+    # выше сразу (провайдер модели, операторский контур, клиент Авито, БД),
+    # а вебхук обязан оставаться тонким: принял, дедуплицировал, ответил 200.
+    from app.agent.loop import AgentLoop
+    from app.agent.providers.factory import build_provider, resolve_models
+    from app.dialog_store import SqlAlchemyDialogStore
+    from app.pipeline import MessagePipeline
+
+    dialog_model, classifier_model = resolve_models(settings)
+    agent_loop = AgentLoop(
+        client=build_provider(settings),
+        kb=app.state.kb,
+        dialog_model=dialog_model,
+        classifier_model=classifier_model,
+        booking_provider=booking_provider,
+    )
+    pipeline = MessagePipeline(
+        store=SqlAlchemyDialogStore(get_sessionmaker()),
+        agent_loop=agent_loop,
+        ops_service=ops_service,
+        settings=settings,
+        avito_client=avito_client,
+        ops_bot=ops_bot,
+        # Пауза «как живой человек» перед реальной отправкой — не в DRY_RUN,
+        # там ответ и так ждёт кнопки оператора (см. MessagePipeline.delay_fn).
+        delay_fn=human_delay,
+    )
+    app.state.pipeline = pipeline
+
+    webhooks.configure(redis=redis_client, handler=pipeline.handle_message)
+    logger.info("incoming pipeline: wired to the Avito webhook")
+
     yield
 
     touch_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await touch_task
-    await touch_avito_client.aclose()
+    await avito_client.aclose()
     if bot_task is not None:
         bot_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

@@ -14,6 +14,7 @@ Postgres (например, обычный прогон `pytest` без подн
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -153,3 +154,43 @@ def test_upgrade_after_downgrade_is_idempotent(alembic_config):
 
     tables = _table_names(TEST_DATABASE_URL)
     assert EXPECTED_TABLES <= tables
+
+
+def test_running_a_migration_does_not_disable_application_logging(alembic_config):
+    """Регрессия: `fileConfig()` в migrations/env.py по умолчанию ОТКЛЮЧАЕТ
+    все логгеры, которых нет в alembic.ini — то есть всё дерево «parmangal.*».
+    Прогон миграции в том же процессе гасил логирование приложения молча,
+    навсегда и целиком. Поймано косвенно (падали проверки логов в
+    tests/test_main.py после того, как рядом появился ещё один файл,
+    гоняющий alembic), поэтому здесь — прямая проверка, не зависящая от
+    порядка файлов в прогоне.
+
+    Свой handler, а не caplog: `fileConfig` заодно заменяет handler'ы
+    корневого логгера, снося тот, который ставит caplog, — поэтому caplog
+    после миграции слеп независимо от того, исправлен баг или нет, и
+    проверять им тут нечего.
+    """
+    logger = logging.getLogger("parmangal.migrations_probe")
+    logger.setLevel(logging.ERROR)
+
+    command.upgrade(alembic_config, "head")
+
+    assert not logger.disabled, (
+        "migrations/env.py погасил логгер приложения — "
+        "fileConfig нужен с disable_existing_loggers=False"
+    )
+
+    captured: list[str] = []
+
+    class _Probe(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Probe()
+    logger.addHandler(handler)
+    try:
+        logger.error("после миграции логи обязаны работать")
+    finally:
+        logger.removeHandler(handler)
+
+    assert captured == ["после миграции логи обязаны работать"]

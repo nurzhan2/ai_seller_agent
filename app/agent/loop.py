@@ -87,6 +87,15 @@ class TurnResult:
     # вместо результата. Метрика для сравнения провайдеров (промт №12,
     # Часть 4: «доля ходов, где инструмент вызван корректно с первой попытки»).
     tool_call_errors: int = 0
+    # `DialogConcessionState` ПОСЛЕ хода — то, что накопил ToolExecutor:
+    # floor_reached (храповик), used_tiers, base_price_quoted, touch_count.
+    # Без этого поля конвейер (app/pipeline.py) не может сохранить храповик
+    # в БД, а несохранённый храповик — это ровно та утечка, ради которой
+    # существует app/pricing/quote_gate.py: после перезапуска процесса агент
+    # назовёт цену ВЫШЕ уже обещанной. None означает «ход не дошёл до
+    # исполнителя инструментов» (спам, просьба позвать человека) — состояние
+    # не изменилось, перезаписывать в БД нечего.
+    concession_state: Any = None
 
 
 def estimate_cost_rub(model: str, input_tokens: int, output_tokens: int) -> Decimal:
@@ -269,6 +278,7 @@ class AgentLoop:
                 hit_iteration_limit=hit_limit,
                 llm_meta=llm_meta,
                 tool_call_errors=tool_call_errors,
+                concession_state=getattr(executor, "state", None),
             )
 
         return TurnResult(
@@ -282,6 +292,7 @@ class AgentLoop:
             hit_iteration_limit=hit_limit,
             llm_meta=llm_meta,
             tool_call_errors=tool_call_errors,
+            concession_state=getattr(executor, "state", None),
         )
 
 
