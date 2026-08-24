@@ -117,6 +117,20 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
    В ответе должен быть URL с вашим доменом и путём `/webhook/avito/...`.
    Если списка нет или URL другой — регистрация не прошла, см. пункт 8.
 
+### Какие скрипты работают из Console, а какие нет
+
+Папка `scripts/` есть в образе, но `docs/` и `media/` в него не копируются
+(`.dockerignore`) — они нужны только при разработке. Поэтому:
+
+| скрипт | из Console |
+|---|---|
+| `scripts.register_webhook` | да — основной сценарий, ради которого Console и нужен |
+| `scripts.export_listings` | да, каталог для `--out` создаёт сам |
+| `scripts.rotate_avito_keys` | да (`--check` — только проверка, ничего не меняет) |
+| `scripts.import_photos` | технически да, но папку с фото сначала надо куда-то положить, а файловая система контейнера пропадает при редеплое |
+| `scripts.replay`, `scripts.compare_providers` | нет — нужен `docs/analysis/dialogs.json`, запускать локально |
+| `scripts.anonymize_dialogs`, `scripts.unpack_google_drive_photos` | нет — инструменты разработки, работают с `docs/` и `media/` |
+
 ## 7. Проверка живости
 
 - `GET /health` на публичном домене → `{"status": "ok", ...}`. `"degraded"`
