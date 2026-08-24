@@ -15,13 +15,16 @@ WORKDIR /app
 COPY --chown=appuser:appuser app ./app
 COPY --chown=appuser:appuser alembic.ini ./
 COPY --chown=appuser:appuser migrations ./migrations
+COPY --chown=appuser:appuser entrypoint.sh ./
+# chmod, пока ещё root — appuser ниже уже не сможет.
+RUN chmod +x ./entrypoint.sh
 
 USER appuser
 EXPOSE 8000
 
-# Форма shell (не exec) — иначе $PORT не подставится. Railway всегда задаёт
-# PORT и ждёт, что процесс слушает именно его; :-8000 — запасной порт для
-# обычного `docker run` без Railway. Для Railway этот CMD переопределяется
-# startCommand из railway.toml (там же миграции перед стартом) — здесь он
-# остаётся корректным дефолтом для прямого docker run/docker-compose.
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# ENTRYPOINT (не CMD, не startCommand в railway.toml) — единственное место,
+# где решается, как стартует контейнер что на Railway, что в обычном
+# docker run/docker-compose. entrypoint.sh сам делает alembic upgrade head
+# и exec uvicorn с $PORT — см. комментарии в самом файле, почему это
+# надёжнее, чем полагаться на то, как Railway решит выполнить startCommand.
+ENTRYPOINT ["./entrypoint.sh"]
