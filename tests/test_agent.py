@@ -266,6 +266,39 @@ async def test_denied_concession_tells_model_not_to_mention_discount(kb):
     assert "Скидку не предлагай" in result["instruction"]
 
 
+async def test_concessions_today_provider_feeds_the_daily_limit(kb):
+    """R10 был мёртв: concessions_today был захардкожен в 0 внутри
+    ToolExecutor, поэтому max_concessions_per_day (5 в concessions.yaml)
+    не срабатывал никогда, сколько бы уступок ни выдали за день."""
+    async def provider():
+        return 5
+
+    ex = ToolExecutor(kb, "d1", concessions_today_provider=provider)
+    await ex.run(
+        "calculate_price",
+        {"zone_id": "bath_russian", "date": "2026-07-18", "start_time": "14:00", "hours": 3, "guests": 6},
+    )
+
+    result = await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+
+    assert result["allowed"] is False
+    assert ex.concession_events[-1].decision.daily_limit_exhausted is True
+
+
+async def test_without_a_provider_the_daily_limit_stays_at_zero(kb):
+    """Харнесс и старые тесты не передают concessions_today_provider —
+    безопасное вырождение в 0, а не падение."""
+    ex = ToolExecutor(kb, "d1")
+    await ex.run(
+        "calculate_price",
+        {"zone_id": "bath_russian", "date": "2026-07-18", "start_time": "14:00", "hours": 3, "guests": 6},
+    )
+
+    await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+
+    assert ex.concession_events[-1].decision.daily_limit_exhausted is False
+
+
 # --------------------------------------------------------------------------
 # Прочие инструменты
 # --------------------------------------------------------------------------

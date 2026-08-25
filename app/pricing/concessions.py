@@ -131,6 +131,12 @@ class ConcessionDecision:
     # кнопкой в Telegram, а не движок. Временный режим — исчезнет, как только
     # каталог YCLIENTS заполнится и occupancy_ratio начнёт приходить.
     requires_operator_approval: bool = False
+    # True — именно дневной лимит уступок (R10, max_concessions_per_day),
+    # а не лимит на диалог. Структурный флаг, а не разбор текста
+    # denial_reason: конвейеру (app/pipeline.py) нужно уведомить оператора
+    # об исчерпании лимита, и парсить русскую строку ради этого — значит
+    # молча сломаться при следующей правке формулировки.
+    daily_limit_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,6 +213,7 @@ def _log(req: ConcessionRequest, decision: ConcessionDecision) -> None:
             "exchange_given": decision.exchange_required or None,
             "allowed": decision.allowed,
             "requires_operator_approval": decision.requires_operator_approval,
+            "daily_limit_exhausted": decision.daily_limit_exhausted,
             "occupancy_ratio": req.occupancy_ratio,
             "denial_reason": decision.denial_reason,
             "skipped_tiers": list(decision.skipped_tiers),
@@ -216,13 +223,15 @@ def _log(req: ConcessionRequest, decision: ConcessionDecision) -> None:
 
 
 def _deny(req: ConcessionRequest, reason: str, tier: Optional[int] = None,
-          question_ids: tuple[str, ...] = (), skipped: tuple[int, ...] = ()) -> ConcessionDecision:
+          question_ids: tuple[str, ...] = (), skipped: tuple[int, ...] = (),
+          daily_limit_exhausted: bool = False) -> ConcessionDecision:
     decision = ConcessionDecision(
         allowed=False,
         tier=tier,
         denial_reason=reason,
         blocking_question_ids=question_ids,
         skipped_tiers=skipped,
+        daily_limit_exhausted=daily_limit_exhausted,
     )
     _log(req, decision)
     return decision
@@ -402,7 +411,11 @@ def decide(req: ConcessionRequest, kb: KnowledgeBase) -> ConcessionDecision:
     if len(counted) >= policy.max_concessions_per_dialog:
         return _deny(req, f"R10: исчерпан лимит уступок за диалог ({policy.max_concessions_per_dialog})")
     if req.concessions_today >= policy.max_concessions_per_day:
-        return _deny(req, f"R10: исчерпан дневной лимит уступок ({policy.max_concessions_per_day})")
+        return _deny(
+            req,
+            f"R10: исчерпан дневной лимит уступок ({policy.max_concessions_per_day})",
+            daily_limit_exhausted=True,
+        )
 
     # R6 — conditions that gate every tier. Holiday status is DERIVED here,
     # never taken from the caller.

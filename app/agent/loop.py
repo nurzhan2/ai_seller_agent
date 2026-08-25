@@ -131,6 +131,7 @@ class AgentLoop:
         dialog_model: str = MAIN_MODEL,
         classifier_model: str = CLASSIFIER_MODEL,
         booking_provider: Any = None,       # BookingProvider — YClientsProvider или None
+        concessions_today_provider: Any = None,   # async () -> int, R10 дневной лимит
     ):
         # `client` принимает три формы ради обратной совместимости с уже
         # написанными тестами и харнессом: готовый LLMProvider, «сырой»
@@ -146,6 +147,7 @@ class AgentLoop:
             lambda dialog_id, state, concessions_blocked=False: ToolExecutor(
                 kb, dialog_id, state, booking_provider=booking_provider,
                 concessions_blocked=concessions_blocked,
+                concessions_today_provider=concessions_today_provider,
             )
         )
 

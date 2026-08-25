@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
 from app.agent.listing_context import ItemZoneRow
@@ -24,6 +24,15 @@ from app.db.models import Author, Direction, SendStatus
 from app.pricing.concessions import ConcessionEvent, DialogConcessionState
 
 logger = logging.getLogger("parmangal.dialog_store")
+
+# «Сегодня» для дневного лимита уступок (R10) считается по Москве — там
+# работает комплекс, — а не по UTC: полночь UTC приходится на 03:00 по
+# Москве, и граница дня уехала бы на три часа назад. Фиксированный сдвиг,
+# а не zoneinfo("Europe/Moscow") — Россия не переходит на летнее время с
+# 2014 года, а zoneinfo на python:3.12-slim требует отдельно поставленного
+# пакета tzdata (не факт, что стоит в контейнере) ради того, что и так
+# не меняется.
+MOSCOW_TZ = timezone(timedelta(hours=3), name="MSK")
 
 # Сколько сообщений диалога поднимаем из БД в контекст модели. Совпадает с
 # HISTORY_WINDOW в app/agent/loop.py — там же лишнее ещё раз обрежется, но
@@ -86,7 +95,7 @@ class DialogStore(Protocol):
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None: ...
 
-    async def count_concessions_today(self) -> int: ...
+    async def count_concessions_today(self, now: Optional[datetime] = None) -> int: ...
 
 
 # --------------------------------------------------------------------------
@@ -232,12 +241,12 @@ class InMemoryDialogStore:
             {"chat_id": chat_id, "event": event, "at": datetime.now(timezone.utc)}
         )
 
-    async def count_concessions_today(self) -> int:
-        today = datetime.now(timezone.utc).date()
+    async def count_concessions_today(self, now: Optional[datetime] = None) -> int:
+        today_msk = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ).date()
         return sum(
             1
             for row in self.concession_log
-            if row["event"].decision.allowed and row["at"].date() == today
+            if row["event"].decision.allowed and row["at"].astimezone(MOSCOW_TZ).date() == today_msk
         )
 
 
@@ -502,27 +511,37 @@ class SqlAlchemyDialogStore:
             )
             await session.commit()
 
-    async def count_concessions_today(self) -> int:
+    async def count_concessions_today(self, now: Optional[datetime] = None) -> int:
         """Только реально ВЫДАННЫЕ (allowed=True) — «требует одобрения, но
         ещё не решено» и «оператор отклонил» в это число не входят. Точность
         ограничена: строка пишется в момент, когда ход дошёл до модерации, а
         не в момент фактического одобрения (см. app/pipeline.py) — значит
         отклонённая в течение дня уступка на короткое время всё же
         засчитывается в «сегодня выдано». Известный компромисс, не бага: для
-        карточки оператора нужна оценка, а не бухгалтерская точность."""
-        from datetime import datetime, timezone
+        карточки оператора нужна оценка, а не бухгалтерская точность.
 
+        Границу дня считаем по Москве (см. MOSCOW_TZ) — `created_at`
+        хранится как `timestamptz`, и сравнение с MSK-датой корректно
+        независимо от того, в каком часовом поясе Postgres хранит значение
+        внутри: сравнение timestamptz идёт по фактическому моменту, не по
+        текстовому представлению. `now` — реальное текущее время по
+        умолчанию; параметризовано ради теста границы дня, который иначе
+        зависел бы от того, в какой час (по UTC) реально идёт прогон —
+        разница между MSK- и UTC-полночью проявляется только в окне
+        21:00–00:00 UTC, и тест на случайное время суток её просто не видит.
+        """
         from sqlalchemy import func, select
 
         from app.db.models import ConcessionLog
 
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        now_msk = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+        today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
         async with self._session_factory() as session:
             count = (
                 await session.execute(
                     select(func.count()).select_from(ConcessionLog).where(
                         ConcessionLog.allowed.is_(True),
-                        ConcessionLog.created_at >= today_start,
+                        ConcessionLog.created_at >= today_start_msk,
                     )
                 )
             ).scalar()

@@ -43,7 +43,7 @@ from app.db.models import (
     Message,
     SendStatus,
 )
-from app.dialog_store import SqlAlchemyDialogStore
+from app.dialog_store import MOSCOW_TZ, SqlAlchemyDialogStore
 from app.ops.state import ChatFlags, PendingReply, SqlAlchemyOpsStore
 from app.pricing.concessions import ConcessionDecision, ConcessionEvent, DialogConcessionState
 from app.pricing.engine import PriceQuote
@@ -321,10 +321,6 @@ async def test_dialog_store_count_concessions_today_counts_only_allowed(session_
 
 
 async def test_dialog_store_count_concessions_today_ignores_yesterday(session_factory):
-    """`count_concessions_today()` сравнивает с РЕАЛЬНЫМ текущим временем
-    (своего now() не принимает), поэтому и здесь — реальное «вчера», а не
-    смещение от фиксированного NOW фикстуры: иначе тест был бы правильным
-    только пока реальная дата прогона отстоит от NOW достаточно далеко."""
     store = SqlAlchemyDialogStore(session_factory)
     await store.log_concession("c-1", _price_concession_event())
 
@@ -335,6 +331,138 @@ async def test_dialog_store_count_concessions_today_ignores_yesterday(session_fa
         await session.commit()
 
     assert await store.count_concessions_today() == 0
+
+
+async def test_dialog_store_day_boundary_is_moscow_not_utc(session_factory):
+    """Детерминированная проверка границы дня — НЕ зависит от того, в какой
+    час UTC реально идёт прогон.
+
+    `now` зафиксирован на 2026-08-25 01:30 МСК (= 2026-08-24 22:30 UTC) —
+    попадает ровно в окно, где UTC- и MSK-полночь расходятся: MSK уже
+    перевалила на 25-е, UTC ещё на 24-м. Дальше два события по разные
+    стороны ИМЕННО MSK-полночи:
+      * `c-yesterday` в 23:59 МСК 24-го (= 20:59 UTC 24-го) — MSK-вчера;
+      * `c-today` в 00:30 МСК 25-го (= 21:30 UTC 24-го) — MSK-сегодня.
+    Обе метки лежат ПОСЛЕ ошибочной UTC-полночи (00:00 UTC 24-го), поэтому
+    UTC-граница засчитала бы обе как «сегодня» (count=2) — только
+    MSK-граница отличает их (count=1). Без параметра `now` этот тест ловил
+    бы регрессию UTC↔MSK только по случайности, в зависимости от времени
+    суток прогона — предыдущая версия теста (относительным `datetime.now()
+    - timedelta(days=1))` именно так и не поймала внесённую мутацию.
+    """
+    from sqlalchemy import select, update
+
+    store = SqlAlchemyDialogStore(session_factory)
+    fixed_now_msk = datetime(2026, 8, 25, 1, 30, tzinfo=MOSCOW_TZ)
+    yesterday_msk = datetime(2026, 8, 24, 23, 59, tzinfo=MOSCOW_TZ)
+    today_msk = datetime(2026, 8, 25, 0, 30, tzinfo=MOSCOW_TZ)
+
+    await store.log_concession("c-yesterday", _price_concession_event())
+    await store.log_concession("c-today", _price_concession_event())
+    async with session_factory() as session:
+        await session.execute(
+            update(ConcessionLog).where(ConcessionLog.dialog_id == "c-yesterday")
+            .values(created_at=yesterday_msk)
+        )
+        await session.execute(
+            update(ConcessionLog).where(ConcessionLog.dialog_id == "c-today")
+            .values(created_at=today_msk)
+        )
+        await session.commit()
+
+    assert await store.count_concessions_today(now=fixed_now_msk) == 1
+
+
+# --------------------------------------------------------------------------
+# R10 сквозь весь путь: ToolExecutor -> concessions_today_provider ->
+# decide() -> реальный Postgres. Не просто count_concessions_today() саму
+# по себе (это уже проверено выше) — а что порог реально СРАБАТЫВАЕТ на
+# живом ToolExecutor, тем же путём, каким его вызывает AgentLoop в проде.
+# --------------------------------------------------------------------------
+
+_CALCULATE_PRICE_ARGS = {
+    "zone_id": "bath_russian", "date": "2026-07-18",
+    "start_time": "14:00", "hours": 3, "guests": 6,
+}
+
+
+async def _request_concession(store, dialog_id: str):
+    from app.agent.tools import ToolExecutor
+    from app.kb.loader import load_catalog
+
+    kb = load_catalog()
+    ex = ToolExecutor(kb, dialog_id, concessions_today_provider=store.count_concessions_today)
+    await ex.run("calculate_price", _CALCULATE_PRICE_ARGS)
+    result = await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+    return result, ex, kb.concessions.policy.max_concessions_per_day
+
+
+async def test_r10_nth_concession_is_still_allowed(session_factory):
+    """N-1 уступок уже выдано (другими диалогами) — N-я, для НОВОГО
+    диалога, всё ещё в пределах лимита: R10 её не блокирует.
+
+    Проверяем именно `daily_limit_exhausted`, а не `result["allowed"]` —
+    `ToolExecutor._slot_known_free()` пока жёстко возвращает False
+    (booking_provider туда не подключён, отдельный, более старый пробел),
+    поэтому реальный ToolExecutor всегда откажет на R6 ПОСЛЕ прохождения
+    R10 — это ожидаемо и не про дневной лимит, который здесь и тестируется.
+    """
+    store = SqlAlchemyDialogStore(session_factory)
+    _, _ex, limit = await _request_concession(store, "d-probe")
+    assert limit > 1, "тест предполагает лимит больше единицы (реально 5)"
+
+    for i in range(limit - 1):
+        await store.log_concession(f"c-other-{i}", _price_concession_event())
+
+    result, ex, _ = await _request_concession(store, "d-new")
+
+    decision = ex.concession_events[-1].decision
+    assert decision.daily_limit_exhausted is False
+    assert result["allowed"] is False   # из-за R6 (см. докстринг), не из-за R10
+    assert "R10" not in (decision.denial_reason or "")
+
+
+async def test_r10_nplus1th_concession_is_denied(session_factory):
+    """Ровно `limit` уступок уже выдано СЕГОДНЯ по РАЗНЫМ чатам — следующий
+    запрос, из третьего, нового диалога, запрещён явно, не молча."""
+    store = SqlAlchemyDialogStore(session_factory)
+    _, _ex, limit = await _request_concession(store, "d-probe")
+
+    for i in range(limit):
+        await store.log_concession(f"c-other-{i}", _price_concession_event())
+    assert await store.count_concessions_today() == limit
+
+    result, ex, _ = await _request_concession(store, "d-new")
+
+    assert result["allowed"] is False
+    decision = ex.concession_events[-1].decision
+    assert decision.daily_limit_exhausted is True
+    assert "R10" in decision.denial_reason
+    assert str(limit) in decision.denial_reason
+
+
+async def test_r10_resets_the_next_day(session_factory):
+    """Вчерашние `limit` уступок не должны блокировать сегодняшний запрос —
+    граница дня по Москве, реальное «вчера», а не смещение от фикстуры.
+    Про `daily_limit_exhausted`, а не `result["allowed"]` — см. докстринг
+    `test_r10_nth_concession_is_still_allowed`."""
+    store = SqlAlchemyDialogStore(session_factory)
+    _, _ex, limit = await _request_concession(store, "d-probe")
+
+    for i in range(limit):
+        await store.log_concession(f"c-yesterday-{i}", _price_concession_event())
+    async with session_factory() as session:
+        from sqlalchemy import update
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        await session.execute(update(ConcessionLog).values(created_at=yesterday))
+        await session.commit()
+    assert await store.count_concessions_today() == 0
+
+    result, ex, _ = await _request_concession(store, "d-today")
+
+    decision = ex.concession_events[-1].decision
+    assert decision.daily_limit_exhausted is False
+    assert "R10" not in (decision.denial_reason or "")
 
 
 # ==========================================================================

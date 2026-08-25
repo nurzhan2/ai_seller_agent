@@ -84,6 +84,7 @@ from app.ops.notifications import (
     concession_keyboard,
     dialog_keyboard,
     render_concession_request,
+    render_daily_limit_notice,
     render_dialog_card,
 )
 from app.ops.state import PendingReply
@@ -104,6 +105,7 @@ class MessagePipeline:
         agent_loop: Any,
         ops_service: Any,
         settings: Any,
+        kb: Any = None,
         avito_client: Any = None,
         ops_bot: Any = None,
         debounce_window_seconds: Optional[float] = None,
@@ -114,6 +116,13 @@ class MessagePipeline:
         self.agent_loop = agent_loop
         self.ops_service = ops_service
         self.settings = settings
+        # Явный параметр, а не chтение agent_loop.kb: конвейеру нужен только
+        # max_concessions_per_day для уведомления об исчерпанном лимите
+        # (_notify_daily_limit_exhausted), и завязываться на внутреннее
+        # устройство AgentLoop ради одного числа — заставлять любой фейк
+        # agent_loop в тестах притворяться, что у него есть .kb, хотя это
+        # его собственная, а не конвейера, ответственность.
+        self.kb = kb
         self.avito_client = avito_client
         self.ops_bot = ops_bot
         self.now_fn = now_fn
@@ -249,6 +258,16 @@ class MessagePipeline:
             return
 
         gate = self._concession_gate(result)
+
+        # Дневной лимит уступок (R10) — не гейт (нечего одобрять, движок
+        # уже отказал сам), а информирование: оператор обязан узнать, что с
+        # этого момента клиенты дня идут без скидок, чтобы вмешаться вручную,
+        # если сочтёт нужным. Не привязано к gate/dry_run — это факт про
+        # весь бизнес-день, а не про решение по конкретному ответу.
+        for event in result.concession_events:
+            if event.decision.daily_limit_exhausted:
+                await self._notify_daily_limit_exhausted(chat_id)
+                break
 
         # «Чистый» запасной ответ считается заранее, ещё до постановки в
         # очередь — не в момент таймаута (см. докстринг модуля). Только для
@@ -531,3 +550,26 @@ class MessagePipeline:
         except Exception:
             # Телеграм недоступен — ответ уже в очереди, диалог не теряется.
             logger.exception("pipeline: operator notification failed", extra={"chat_id": chat.chat_id})
+
+    async def _notify_daily_limit_exhausted(self, chat_id: str) -> None:
+        """R10: дневной лимит уступок исчерпан. Всегда логируется (ниже) —
+        Telegram-уведомление лучшая попытка, а не гарантия: без бота или без
+        TELEGRAM_OPS_CHAT_ID лог остаётся единственным способом узнать."""
+        if self.kb is None:
+            logger.warning("concession daily limit exhausted", extra={"chat_id": chat_id})
+            return
+        limit = self.kb.concessions.policy.max_concessions_per_day
+        logger.warning(
+            "concession daily limit exhausted", extra={"chat_id": chat_id, "limit": limit}
+        )
+        if self.ops_bot is None or not getattr(self.settings, "telegram_ops_chat_id", ""):
+            return
+        try:
+            await self.ops_bot.send_message(
+                chat_id=self.settings.telegram_ops_chat_id,
+                text=render_daily_limit_notice(chat_id, limit),
+            )
+        except Exception:
+            logger.exception(
+                "pipeline: daily limit notification failed", extra={"chat_id": chat_id}
+            )

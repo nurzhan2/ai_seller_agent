@@ -488,6 +488,21 @@ def test_r10_daily_limit_denies(kb, bath_quote):
     assert "R10" in d.denial_reason
 
 
+def test_r10_daily_limit_sets_the_structured_flag(kb, bath_quote):
+    """Флаг, не текст denial_reason — конвейер (app/pipeline.py) уведомляет
+    оператора именно по нему, парсить русскую строку не должен."""
+    d = decide(req(bath_quote, concessions_today=5), kb)
+    assert d.daily_limit_exhausted is True
+
+
+def test_dialog_limit_does_not_set_the_daily_flag(kb, bath_quote):
+    """Разные лимиты — разный сигнал. Диалоговый лимит не событие «на весь
+    бизнес», уведомлять оператора об исчерпании ЭТОГО лимита не нужно."""
+    d = decide(req(bath_quote, already_used_tiers=(1, 2, 3, 4, 5, 6)), kb)
+    assert not d.allowed
+    assert d.daily_limit_exhausted is False
+
+
 def test_r10_under_daily_limit_allows(kb, bath_quote):
     assert decide(req(bath_quote, concessions_today=4), kb).allowed
 

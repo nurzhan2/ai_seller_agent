@@ -287,18 +287,24 @@ async def lifespan(app: FastAPI):
     from app.pipeline import MessagePipeline
 
     dialog_model, classifier_model = resolve_models(settings)
+    # Одна переменная, а не инлайн в MessagePipeline(store=...): её
+    # count_concessions_today нужен ещё и AgentLoop — R10 (дневной лимит
+    # уступок) без него никогда не видит реальное число, только 0.
+    dialog_store = SqlAlchemyDialogStore(get_sessionmaker())
     agent_loop = AgentLoop(
         client=build_provider(settings),
         kb=app.state.kb,
         dialog_model=dialog_model,
         classifier_model=classifier_model,
         booking_provider=booking_provider,
+        concessions_today_provider=dialog_store.count_concessions_today,
     )
     pipeline = MessagePipeline(
-        store=SqlAlchemyDialogStore(get_sessionmaker()),
+        store=dialog_store,
         agent_loop=agent_loop,
         ops_service=ops_service,
         settings=settings,
+        kb=app.state.kb,
         avito_client=avito_client,
         ops_bot=ops_bot,
         # Пауза «как живой человек» перед реальной отправкой — не в DRY_RUN,

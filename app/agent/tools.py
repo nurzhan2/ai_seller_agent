@@ -322,6 +322,7 @@ class ToolExecutor:
         lead_sink: Any = None,
         booking_provider: Any = None,
         concessions_blocked: bool = False,
+        concessions_today_provider: Any = None,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
@@ -329,6 +330,15 @@ class ToolExecutor:
         self.photo_provider = photo_provider
         self.lead_sink = lead_sink
         self.booking_provider = booking_provider
+        # Async-колбэк без аргументов -> int, считает уступки ПО ВСЕМ чатам
+        # за сегодня (R10, дневной лимит) — тот же приём внедрения, что у
+        # booking_provider/photo_provider. Вызывается лениво, внутри
+        # _tool_request_concession, а не один раз на весь ход: большинство
+        # ходов вообще не доходят до запроса на скидку, и платить лишним
+        # походом в БД за каждый из них незачем. None (по умолчанию, и во
+        # всех тестах/харнессе, которые его не передают) — 0, то же
+        # безопасное вырождение, что и у отсутствующего booking_provider.
+        self.concessions_today_provider = concessions_today_provider
         # True для «чистого» повторного хода после таймаута запроса на
         # скидку (app/pipeline.py) — модель ведёт диалог дальше, но
         # request_concession не вызывает decide() вообще, ни при каких
@@ -472,6 +482,9 @@ class ToolExecutor:
             }
 
         base_price_before = self.last_quote.total
+        concessions_today = 0
+        if self.concessions_today_provider is not None:
+            concessions_today = await self.concessions_today_provider()
         request = ConcessionRequest(
             dialog_id=self.dialog_id,
             quote=self.last_quote,
@@ -480,7 +493,7 @@ class ToolExecutor:
             days_until_date=self._days_until(),
             slot_confirmed_free=self._slot_known_free(),
             already_used_tiers=tuple(sorted(self.state.used_tiers)),
-            concessions_today=0,
+            concessions_today=concessions_today,
             base_price_quoted=self.state.base_price_quoted,
             floor_reached=self.state.floor_reached,
             touch_count=self.state.touch_count,

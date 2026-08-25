@@ -22,6 +22,7 @@ from app.agent.touch_tracking import TouchState, is_due
 from app.config import Settings
 from app.db.models import Author, Direction, SendStatus
 from app.dialog_store import InMemoryDialogStore
+from app.kb.loader import load_catalog
 from app.ops.bot import OpsService
 from app.ops.state import InMemoryOpsStore, PendingReply
 from app.pipeline import MessagePipeline
@@ -31,6 +32,11 @@ from app.pricing.engine import PriceQuote
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 
 OUR_USER_ID = "seller-1"
+
+
+@pytest.fixture(scope="module")
+def kb():
+    return load_catalog()
 
 
 def _payload(
@@ -709,14 +715,15 @@ def _live_settings(**overrides) -> Settings:
     return Settings(**base)
 
 
-def _build_live(*, agent, moderation_mode="concessions_only", avito=None, store=None):
+def _build_live(*, agent, moderation_mode="concessions_only", avito=None, store=None,
+                 kb=None, ops_bot=None):
     settings = _live_settings(moderation_mode=moderation_mode)
     store = store or InMemoryDialogStore()
     avito = avito if avito is not None else _FakeAvito()
     ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
     pipeline = MessagePipeline(
         store=store, agent_loop=agent, ops_service=ops_service, settings=settings,
-        avito_client=avito, ops_bot=None, debounce_window_seconds=0, now_fn=lambda: NOW,
+        kb=kb, avito_client=avito, ops_bot=ops_bot, debounce_window_seconds=0, now_fn=lambda: NOW,
     )
     return pipeline, store, avito, ops_service, settings
 
@@ -885,6 +892,80 @@ async def test_concessions_today_counts_only_allowed_grants():
     await pipeline.handle_message(_payload(chat_id="chat-2", message_id="m2"))
     await _settle()
     assert await store.count_concessions_today() == 2
+
+
+# --------------------------------------------------------------------------
+# R10 — дневной лимит уступок исчерпан: уведомление, не молчание
+# --------------------------------------------------------------------------
+
+def _daily_limit_event():
+    decision = ConcessionDecision(
+        allowed=False, tier=5, kind="price", daily_limit_exhausted=True,
+        denial_reason="R10: исчерпан дневной лимит уступок (5)",
+    )
+    return ConcessionEvent(decision=decision, base_price=Decimal("7000"), zone_id="bath_russian", trigger="price_objection")
+
+
+async def test_daily_limit_exhausted_notifies_the_operator(kb):
+    """Оператор получает ОБА сообщения: обычную FYI-карточку с перепиской
+    (сообщение всё равно ушло клиенту автономно — держать на одобрении
+    нечего) и отдельное предупреждение про лимит."""
+    bot = _FakeOpsBot()
+    result = TurnResult(text="Уточню детали и вернусь с ответом.", concession_events=[_daily_limit_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, settings = _build_live(
+        agent=agent, kb=kb, ops_bot=bot,
+    )
+    settings.telegram_ops_chat_id = "-100500"
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    limit_notices = [m for m in bot.messages if "ЛИМИТ" in m["text"]]
+    assert len(limit_notices) == 1
+    assert "chat-1" in limit_notices[0]["text"]
+    assert "(5)" in limit_notices[0]["text"]
+
+
+async def test_daily_limit_exhausted_does_not_block_the_message():
+    """Отказ уже принят движком — держать ответ на одобрении нечего, это
+    не gate. Сообщение (без скидки) уходит клиенту как обычно."""
+    result = TurnResult(text="Уточню детали и вернусь с ответом.", concession_events=[_daily_limit_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", "Уточню детали и вернусь с ответом.")]
+
+
+async def test_daily_limit_exhausted_logs_even_without_a_bot(caplog):
+    """Бот не настроен — уведомление лучшая попытка, а не гарантия, но лог
+    обязан остаться единственным надёжным способом узнать."""
+    result = TurnResult(text="Уточню детали.", concession_events=[_daily_limit_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent, ops_bot=None)
+
+    with caplog.at_level("WARNING", logger="parmangal"):
+        await pipeline.handle_message(_payload())
+        await _settle()
+
+    assert "daily limit exhausted" in caplog.text
+
+
+async def test_no_daily_limit_event_means_no_notification():
+    """Обычная автономная отправка шлёт свою FYI-карточку (см. раздел
+    «Автономная отправка + FYI» выше) — но не карточку про дневной лимит."""
+    bot = _FakeOpsBot()
+    agent = _FakeConcessionAgentLoop(TurnResult(text="Баня — 7 000 ₽."))
+    pipeline, store, avito, ops_service, settings = _build_live(agent=agent, ops_bot=bot)
+    settings.telegram_ops_chat_id = "-100500"
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert not any("ЛИМИТ" in m["text"] for m in bot.messages)
 
 
 # --------------------------------------------------------------------------
