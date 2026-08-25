@@ -15,11 +15,12 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from app.booking.mapping import InMemoryZoneMapping, coverage_report
 from app.config import get_settings
+from app.kb.editor import human_value
 from app.kb.loader import KnowledgeBase, audit_readiness, global_blockers, load_catalog
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -144,7 +145,67 @@ async def catalog(request: Request, _: str = Depends(require_admin)) -> HTMLResp
             f"<td class='{'yes' if question.status == 'answered' else ''}'>{question.status}</td></tr>"
         )
     body.append("</table>")
+
+    body.append("<h1>Правки из Telegram</h1>")
+    body.append(
+        "<p class='note'>YAML в git остаётся базой — это слой изменений поверх "
+        "него, живёт в БД (файловая система контейнера на Railway эфемерная). "
+        "Кто, когда, что было, что стало.</p>"
+    )
+    editor = getattr(request.app.state, "catalog_editor", None)
+    if editor is None:
+        body.append("<p class='note'>Журнал правок не подключён.</p>")
+    else:
+        records = await editor.store.list_journal(limit=200)
+        if not records:
+            body.append("<p class='note'>Правок ещё не было.</p>")
+        else:
+            last_active_id = next((r.id for r in records if r.is_active), None)
+            body.append(
+                "<table><tr><th>когда</th><th>путь</th><th>было</th><th>стало</th>"
+                "<th>кто</th><th>статус</th><th></th></tr>"
+            )
+            for record in records:
+                when = record.created_at.strftime("%Y-%m-%d %H:%M") if record.created_at else "—"
+                status_html = (
+                    f"откачено (user {record.reverted_by})" if not record.is_active else "действует"
+                )
+                revert_button = ""
+                if editor is not None and record.id == last_active_id:
+                    revert_button = (
+                        "<form method='post' action='/admin/catalog/revert' style='margin:0'>"
+                        "<button type='submit'>Откатить</button></form>"
+                    )
+                body.append(
+                    f"<tr><td>{when}</td><td><code>{record.path}</code></td>"
+                    f"<td>{human_value(record.previous_value)}</td>"
+                    f"<td>{human_value(record.value)}</td>"
+                    f"<td>{record.changed_by}</td>"
+                    f"<td class='{'yes' if record.is_active else ''}'>{status_html}</td>"
+                    f"<td>{revert_button}</td></tr>"
+                )
+            body.append("</table>")
+
     return _page("Каталог и спорные поля", "".join(body))
+
+
+@router.post("/catalog/revert")
+async def catalog_revert(request: Request, _: str = Depends(require_admin)) -> RedirectResponse:
+    """Откат последней действующей правки. Та же логика, что у кнопки в
+    Telegram (app/ops/menu_service.py) — разными путями к одному
+    `CatalogEditor.revert_last`, чтобы поведение не разошлось.
+
+    `user_id=0` — сентинел «через админку, не Telegram»: `changed_by`/
+    `reverted_by` в БД типа BigInteger под настоящий user_id, а у входа
+    через HTTP Basic числового id нет.
+    """
+    editor = getattr(request.app.state, "catalog_editor", None)
+    if editor is not None:
+        result = await editor.revert_last(user_id=0)
+        on_kb_reloaded = getattr(request.app.state, "on_kb_reloaded", None)
+        if result is not None and on_kb_reloaded is not None:
+            on_kb_reloaded(result.kb)
+    return RedirectResponse(url="/admin/catalog", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/booking", response_class=HTMLResponse)

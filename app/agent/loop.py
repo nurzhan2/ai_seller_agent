@@ -143,9 +143,14 @@ class AgentLoop:
         self.kb = kb
         self.dialog_model = dialog_model
         self.classifier_model = classifier_model
+        # `self.kb`, а НЕ захваченный параметр `kb`: база знаний
+        # перезагружается на лету, когда оператор правит цену из Telegram
+        # (app/ops/menu_service.py), и обновление `agent_loop.kb` обязано
+        # доезжать до новых исполнителей инструментов. С захваченным
+        # параметром правка молча не влияла бы на расчёт до рестарта.
         self.executor_factory = executor_factory or (
             lambda dialog_id, state, concessions_blocked=False: ToolExecutor(
-                kb, dialog_id, state, booking_provider=booking_provider,
+                self.kb, dialog_id, state, booking_provider=booking_provider,
                 concessions_blocked=concessions_blocked,
                 concessions_today_provider=concessions_today_provider,
             )

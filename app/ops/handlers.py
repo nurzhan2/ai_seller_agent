@@ -26,8 +26,32 @@ def parse_callback(data: str) -> tuple[str, str]:
     return action, chat_id
 
 
-def build_dispatcher(service: OpsService, stats_provider=None) -> Dispatcher:
+def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None) -> Dispatcher:
     dp = Dispatcher()
+
+    async def _send(event, reply) -> None:
+        """Показать `Reply` из MenuService.
+
+        `edit=True` — правим сообщение с меню на месте, чтобы чат не
+        зарастал копиями одного и того же меню. Правка чужого/устаревшего
+        сообщения — штатная ошибка Telegram («message is not modified»,
+        «message can't be edited»), и она не должна выглядеть как сломанная
+        кнопка: падаем обратно на новое сообщение.
+        """
+        if reply.alert:
+            await event.answer(reply.alert, show_alert=True)
+            return
+        if isinstance(event, CallbackQuery):
+            if reply.edit and event.message is not None:
+                try:
+                    await event.message.edit_text(reply.text, reply_markup=reply.markup)
+                    return
+                except Exception:
+                    logger.debug("edit_text failed, sending a new message", exc_info=True)
+            if event.message is not None:
+                await event.message.answer(reply.text, reply_markup=reply.markup)
+            return
+        await event.answer(reply.text, reply_markup=reply.markup)
 
     async def _guard(event, user_id: int) -> bool:
         if service.is_allowed(user_id):
@@ -141,7 +165,124 @@ def build_dispatcher(service: OpsService, stats_provider=None) -> Dispatcher:
         result = await service.send_edited(chat_id, message.from_user.id, message.text or "")
         await message.answer(result["message"])
 
+    # ---- инлайн-меню управления ассистентом -------------------------------
+    #
+    # Регистрируется только если меню собрано (menu_service передан). Без
+    # него бот работает ровно как раньше — старые кнопки модерации и
+    # команды никуда не делись.
+    if menu_service is not None:
+
+        @dp.message(Command("menu", "start"))
+        async def on_menu(message: Message) -> None:
+            if not await _guard(message, message.from_user.id):
+                return
+            await _send(message, await menu_service.root(message.from_user.id))
+
+        @dp.callback_query(F.data.startswith("m:"))
+        async def on_section(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, section = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.open_section(callback.from_user.id, section))
+
+        @dp.callback_query(F.data.startswith("z:"))
+        async def on_zone(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, zone_id = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.open_zone(callback.from_user.id, zone_id))
+
+        @dp.callback_query(F.data.startswith("e:"))
+        async def on_edit(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            parts = (callback.data or "").split(":")
+            field_key = parts[1] if len(parts) > 1 else ""
+            zone_id = parts[2] if len(parts) > 2 else None
+            await _send(callback, await menu_service.start_edit(
+                callback.from_user.id, field_key, zone_id))
+
+        @dp.callback_query(F.data.startswith("ok:"))
+        async def on_confirm(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, token = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.confirm(callback.from_user.id, token))
+
+        @dp.callback_query(F.data.startswith("no:"))
+        async def on_cancel(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, token = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.cancel(callback.from_user.id, token))
+
+        @dp.callback_query(F.data.startswith("md:"))
+        async def on_mode(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, mode = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.set_moderation(callback.from_user.id, mode))
+
+        @dp.callback_query(F.data.startswith("tg:"))
+        async def on_toggle(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            _, _, action = (callback.data or "").partition(":")
+            await _send(callback, await menu_service.toggle(callback.from_user.id, action))
+
+        @dp.callback_query(F.data.startswith("rv:"))
+        async def on_revert(callback: CallbackQuery) -> None:
+            if not await _guard(callback, callback.from_user.id):
+                return
+            await callback.answer()
+            await _send(callback, await menu_service.revert_last(callback.from_user.id))
+
+        # Обычное сообщение — возможно, это присланное значение для правки.
+        # Стоит ПОСЛЕДНИМ и ниже F.reply_to_message: реплай на карточку
+        # диалога — это ответ клиенту, и перехватывать его нельзя.
+        @dp.message(F.text)
+        async def on_value(message: Message) -> None:
+            reply = await menu_service.receive_value(message.from_user.id, message.text or "")
+            if reply is None:
+                return          # не наш текст — молчим, как и раньше
+            await _send(message, reply)
+
     return dp
+
+
+# Меню команд Telegram — появляется в интерфейсе само (пункт 5).
+BOT_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("menu", "Управление ассистентом"),
+    ("stats", "Статистика"),
+    ("moderation", "Режим модерации"),
+    ("dryrun", "DRY_RUN вкл/выкл"),
+    ("pause", "Поставить агента на паузу"),
+    ("resume", "Снять агента с паузы"),
+    ("provider", "LLM-провайдер"),
+    ("chat", "Статус чата по id"),
+)
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    """Вызывается при старте приложения. Сбой не должен ронять запуск:
+    список команд — удобство, а не работоспособность бота."""
+    from aiogram.types import BotCommand
+
+    try:
+        await bot.set_my_commands([
+            BotCommand(command=name, description=description)
+            for name, description in BOT_COMMANDS
+        ])
+        logger.info("telegram bot commands registered")
+    except Exception:
+        logger.exception("failed to register telegram bot commands")
 
 
 def _chat_id_from_card(card_text: str) -> str | None:

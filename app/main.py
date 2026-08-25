@@ -23,7 +23,7 @@ from app.kb.loader import KnowledgeBase, load_catalog
 from app.logging_setup import configure_logging
 from app.metrics import dry_run_gauge, render_metrics
 from app.ops.bot import OpsService
-from app.ops.handlers import build_dispatcher
+from app.ops.handlers import build_dispatcher, set_bot_commands
 from app.ops.notifications import DialogCard, dialog_keyboard, render_dialog_card
 from app.ops.state import SqlAlchemyOpsStore
 from app.ops.touch_scheduler import SqlAlchemyTouchStore, run_scheduler_pass
@@ -94,7 +94,7 @@ def build_touch_sender(
 
 async def supervised_touch_scheduler(
     store: SqlAlchemyTouchStore,
-    kb: KnowledgeBase,
+    kb: Any,
     send: Any,
     *,
     delay_minutes: int,
@@ -108,13 +108,22 @@ async def supervised_touch_scheduler(
     останавливать все последующие — та же логика изоляции, что и у
     `supervised_bot_polling`. `now_fn` — реальное время по умолчанию;
     параметризовано ради теста устойчивости к сбою, который иначе зависел бы
-    от того, идёт ли прогон тестов внутри рабочего окна 9:00–23:00."""
-    templates = kb.concessions.policy.touch_templates
-    window = kb.catalog.constants.working_window
+    от того, идёт ли прогон тестов внутри рабочего окна 9:00–23:00.
+
+    `kb` принимает и саму базу знаний, и функцию, которая её отдаёт. Второе
+    нужно, потому что рабочее окно правится из Telegram на лету: со
+    снимком, взятым один раз при старте, воркер продолжал бы будить
+    клиентов по старому расписанию до ближайшего рестарта.
+    """
+    def _kb() -> KnowledgeBase:
+        return kb() if callable(kb) else kb
+
     while True:
         try:
+            current = _kb()
             await run_scheduler_pass(
-                store, templates, window, send, now_fn(),
+                store, current.concessions.policy.touch_templates,
+                current.catalog.constants.working_window, send, now_fn(),
                 delay_minutes=delay_minutes, max_count=max_count,
             )
         except asyncio.CancelledError:
@@ -152,7 +161,22 @@ async def lifespan(app: FastAPI):
 
     # Load and validate the knowledge base at startup: an invalid KB must
     # stop the process, not surface as a wrong price mid-conversation.
-    app.state.kb = load_catalog()
+    #
+    # Правки из Telegram (app/ops/menu_service.py) накладываются здесь же —
+    # они живут в БД (`catalog_overrides`), а не в YAML на диске: файловая
+    # система контейнера на Railway эфемерная, запись в неё пропала бы при
+    # следующем деплое молча. Сбой самой БД на старте — не повод падать: YAML
+    # сам по себе всегда валиден (его тело этот же вызов и проверяет), и
+    # деградация в «без правок» безопаснее, чем не подняться вовсе.
+    from app.kb.override_store import SqlAlchemyOverrideStore, to_overrides
+
+    override_store = SqlAlchemyOverrideStore(get_sessionmaker())
+    try:
+        active_overrides = to_overrides(await override_store.list_active())
+    except Exception:
+        logger.exception("catalog overrides: failed to load, starting with plain YAML")
+        active_overrides = []
+    app.state.kb = load_catalog(overrides=active_overrides)
     dry_run_gauge.set(1 if settings.dry_run else 0)
 
     if settings.dry_run:
@@ -235,20 +259,14 @@ async def lifespan(app: FastAPI):
     ops_service = OpsService(store=SqlAlchemyOpsStore(get_sessionmaker()), settings=settings)
     app.state.ops_service = ops_service
 
-    bot_task: asyncio.Task | None = None
+    # `ops_bot` (клиент aiogram) заводится здесь, РАНЬШЕ диспетчера — тот
+    # соберётся позже, когда появится menu_service, а конвейеру и воркеру
+    # касаний бот нужен уже сейчас, чтобы слать карточки.
     ops_bot = None
     if settings.telegram_bot_token.get_secret_value():
         from aiogram import Bot
 
         ops_bot = Bot(token=settings.telegram_bot_token.get_secret_value())
-        # /stats теперь тоже с данными: до этого stats_provider не
-        # передавался и команда отвечала «Статистика пока недоступна».
-        dispatcher = build_dispatcher(
-            ops_service,
-            stats_provider=lambda: admin_queries.stats(ops_service.store),
-        )
-        bot_task = asyncio.create_task(supervised_bot_polling(dispatcher, ops_bot))
-        logger.info("telegram operator bot: polling started")
     else:
         logger.warning(
             "TELEGRAM_BOT_TOKEN не задан — операторский бот не запущен, "
@@ -269,7 +287,10 @@ async def lifespan(app: FastAPI):
     touch_sender = build_touch_sender(settings, ops_service, ops_bot, avito_client)
     touch_task = asyncio.create_task(
         supervised_touch_scheduler(
-            touch_store, app.state.kb, touch_sender,
+            # Функция, а не снимок: рабочее окно правится из Telegram на
+            # лету (app/ops/menu_service.py), и воркер обязан видеть правку
+            # без рестарта — см. докстринг supervised_touch_scheduler.
+            touch_store, lambda: app.state.kb, touch_sender,
             delay_minutes=settings.touch_reminder_delay_minutes,
             max_count=settings.touch_max_count,
             interval_seconds=settings.touch_scheduler_interval_seconds,
@@ -326,6 +347,56 @@ async def lifespan(app: FastAPI):
         )
     )
     logger.info("concession timeout scheduler: started")
+
+    # Управление ассистентом из Telegram — меню, правка каталога.
+    # `on_kb_reloaded` доводит новый KnowledgeBase до каждого места, что
+    # держит собственную ссылку на него: `app.state.kb` (админка читает его
+    # заново на каждый запрос — этого достаточно), `agent_loop.kb` (иначе
+    # следующий ход агента считал бы по старой цене) и `pipeline.kb`
+    # (нужен только для уведомления о дневном лимите, но должен быть
+    # согласован с остальными). Воркер касаний правку подхватывает сам —
+    # ему передан `lambda: app.state.kb`, а не снимок.
+    from app.kb.editor import CatalogEditor
+    from app.kb.override_store import SqlAlchemyOverrideStore as _OverrideStore
+    from app.ops.menu_service import MenuService
+
+    def _on_kb_reloaded(new_kb) -> None:
+        app.state.kb = new_kb
+        agent_loop.kb = new_kb
+        pipeline.kb = new_kb
+
+    # Тот же колбэк использует /admin/catalog при откате правки — одна
+    # функция вместо двух копий одной и той же логики в двух модулях.
+    app.state.on_kb_reloaded = _on_kb_reloaded
+
+    catalog_editor = CatalogEditor(_OverrideStore(get_sessionmaker()))
+    menu_service = MenuService(
+        editor=catalog_editor,
+        settings=settings,
+        ops_service=ops_service,
+        stats_provider=lambda: admin_queries.stats(ops_service.store),
+        dialogs_provider=admin_queries.list_dialogs,
+        on_kb_reloaded=_on_kb_reloaded,
+    )
+    app.state.menu_service = menu_service
+    # Отдельно от menu_service — /admin/catalog читает журнал и делает откат
+    # напрямую, ему незачем тянуть весь Telegram-слой ради этого.
+    app.state.catalog_editor = catalog_editor
+
+    bot_task: asyncio.Task | None = None
+    if ops_bot is not None:
+        dispatcher = build_dispatcher(
+            ops_service,
+            stats_provider=lambda: admin_queries.stats(ops_service.store),
+            menu_service=menu_service,
+        )
+        bot_task = asyncio.create_task(supervised_bot_polling(dispatcher, ops_bot))
+        # Список команд в интерфейсе Telegram — появляется сам, без ручной
+        # настройки через @BotFather. Сбой не должен ронять старт (см.
+        # set_bot_commands), поэтому отдельным шагом, не внутри try/except
+        # остального лайфспана.
+        await set_bot_commands(ops_bot)
+        logger.info("telegram operator bot: polling started")
 
     yield
 

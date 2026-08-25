@@ -238,3 +238,31 @@ def test_lifespan_wires_the_incoming_pipeline_to_the_webhook():
     _real_app_state()
 
     assert webhooks._handler is not None
+
+
+def test_lifespan_wires_the_menu_service():
+    """Без него /menu в боте не работал бы — тот же класс бага, что и
+    у admin-провайдеров: собранная логика, ни разу не подключённая."""
+    from app.kb.override_store import SqlAlchemyOverrideStore
+    from app.ops.menu_service import MenuService
+
+    state = _real_app_state()
+
+    assert isinstance(state.menu_service, MenuService)
+    assert isinstance(state.menu_service.editor.store, SqlAlchemyOverrideStore)
+
+
+def test_lifespan_kb_reload_updates_agent_loop_and_pipeline():
+    """Правка каталога из Telegram обязана долетать до живого агента без
+    рестарта — иначе следующий ход считает по старой цене, пока кто-то не
+    передеплоит контейнер."""
+    from app.kb.loader import load_catalog
+
+    state = _real_app_state()
+    new_kb = load_catalog()
+
+    state.menu_service.on_kb_reloaded(new_kb)
+
+    assert state.kb is new_kb
+    assert state.pipeline.agent_loop.kb is new_kb
+    assert state.pipeline.kb is new_kb

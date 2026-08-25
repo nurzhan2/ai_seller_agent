@@ -552,18 +552,63 @@ def _read_yaml(path: Path) -> Any:
         return yaml.safe_load(f)
 
 
-def load_catalog(kb_dir: Optional[Path] = None) -> KnowledgeBase:
-    """Load and fully validate the four KB files. Raises on anything invalid
-    — an app built on top of this must not start with a broken knowledge
-    base. Logs a WARNING listing every unresolved *blocking* question."""
-    base = kb_dir or KB_DIR
+def read_raw_kb(kb_dir: Optional[Path] = None) -> dict:
+    """Четыре YAML как есть, без валидации и без правок.
 
-    raw = {
+    Отдельно от `load_catalog`, потому что слой правок (app/kb/overrides.py)
+    обязан валидировать НОВЫЙ документ целиком — то есть ему нужен сырой
+    исходник до сборки в pydantic-модель."""
+    base = kb_dir or KB_DIR
+    return {
         "catalog": _read_yaml(base / "catalog.yaml"),
         "promos": _read_yaml(base / "promos.yaml"),
         "concessions": _read_yaml(base / "concessions.yaml"),
         "payment": _read_yaml(base / "payment.yaml"),
     }
+
+
+def validate_raw(raw: dict) -> KnowledgeBase:
+    """Те же самые проверки, что проходит YAML при старте, — ни одной
+    меньше. Правка из Telegram обязана пройти ровно этот путь, иначе
+    «валидная» правка может оказаться невалидной базой знаний на следующем
+    рестарте, когда чинить будет уже поздно."""
+    structural_errors = validate_no_orphan_disputed(raw)
+
+    open_question_ids = {q["id"] for q in raw["catalog"]["open_questions"]}
+    used_question_ids = collect_question_ids(raw)
+    missing_ids = used_question_ids - open_question_ids
+    if missing_ids:
+        structural_errors.append(
+            f"question_id referenced but not declared in open_questions: {sorted(missing_ids)}"
+        )
+
+    if structural_errors:
+        raise ValueError("Invalid knowledge base:\n" + "\n".join(f"- {e}" for e in structural_errors))
+
+    return KnowledgeBase.model_validate(raw)
+
+
+def load_catalog(
+    kb_dir: Optional[Path] = None,
+    overrides: Optional[list] = None,
+) -> KnowledgeBase:
+    """Load and fully validate the four KB files. Raises on anything invalid
+    — an app built on top of this must not start with a broken knowledge
+    base. Logs a WARNING listing every unresolved *blocking* question.
+
+    `overrides` — правки из БД (`app.kb.overrides.Override`), наложенные
+    поверх YAML. YAML остаётся базой: он в git и ревьюится, а правки —
+    отдельным слоем, потому что файловая система контейнера на Railway
+    эфемерная и запись в неё пропала бы при следующем деплое молча.
+    """
+    base = kb_dir or KB_DIR
+
+    raw = read_raw_kb(base)
+
+    if overrides:
+        from app.kb.overrides import apply_overrides
+
+        raw = apply_overrides(raw, overrides)
 
     structural_errors = validate_no_orphan_disputed(raw)
 

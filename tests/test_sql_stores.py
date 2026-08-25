@@ -60,6 +60,7 @@ NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 _TABLES = (
     "messages", "dialog_states", "pending_replies", "operator_actions",
     "concession_log", "leads", "item_zone_map", "zone_service_map", "chats",
+    "catalog_overrides",
 )
 
 
@@ -922,3 +923,141 @@ async def test_admin_stats_combines_db_counts_with_moderation_log(seeded):
     # TypeError прямо в руках оператора.
     from app.ops.notifications import render_stats
     assert isinstance(render_stats(**data), str)
+
+
+# ==========================================================================
+# Правки каталога (управление ассистентом из Telegram) — реальный Postgres
+#
+# InMemoryOverrideStore в tests/test_kb_editor.py и tests/test_menu_service.py
+# проверяет ПРАВИЛА (валидация, откат, пересчёт цены). Здесь — что ровно то
+# же самое переживает настоящую запись/чтение из БД: единственное, ради
+# чего вся эта таблица вообще существует, — файловая система контейнера на
+# Railway эфемерная, а Postgres нет.
+# ==========================================================================
+
+async def test_override_store_survives_a_new_instance(session_factory):
+    """«Новый процесс» — эквивалент рестарта контейнера на Railway."""
+    from app.kb.override_store import SqlAlchemyOverrideStore
+
+    writer = SqlAlchemyOverrideStore(session_factory)
+    await writer.add(
+        path="$.catalog.zones[id=dome_bags].pricing.weekend_per_hour",
+        value={"value": 1800, "resolved_from": "оператор через Telegram (user_id=111)"},
+        previous_value={"value": 1500}, field_key="we_hour", zone_id="dome_bags",
+        changed_by=111,
+    )
+
+    reader = SqlAlchemyOverrideStore(session_factory)
+    active = await reader.list_active()
+
+    assert len(active) == 1
+    assert active[0].value["value"] == 1800
+    assert active[0].changed_by == 111
+
+
+async def test_override_store_last_active_is_the_most_recent(session_factory):
+    from app.kb.override_store import SqlAlchemyOverrideStore
+
+    store = SqlAlchemyOverrideStore(session_factory)
+    await store.add(path="$.a", value=1, previous_value=None, field_key=None, zone_id=None, changed_by=1)
+    second = await store.add(path="$.b", value=2, previous_value=None, field_key=None, zone_id=None, changed_by=1)
+
+    last = await store.last_active()
+
+    assert last.id == second.id
+
+
+async def test_override_store_revert_marks_reverted_not_deletes(session_factory):
+    from app.kb.override_store import SqlAlchemyOverrideStore
+
+    store = SqlAlchemyOverrideStore(session_factory)
+    record = await store.add(
+        path="$.a", value=2, previous_value=1, field_key=None, zone_id=None, changed_by=111,
+    )
+
+    reverted = await store.revert(record.id, reverted_by=222)
+
+    assert reverted.reverted_by == 222
+    assert reverted.reverted_at is not None
+    # Строка НЕ удалена — journal её всё ещё видит.
+    journal = await store.list_journal()
+    assert len(journal) == 1
+    assert journal[0].id == record.id
+    # И больше не активна — накладываться на YAML не будет.
+    assert await store.list_active() == []
+
+
+async def test_override_store_reverting_twice_is_a_noop(session_factory):
+    from app.kb.override_store import SqlAlchemyOverrideStore
+
+    store = SqlAlchemyOverrideStore(session_factory)
+    record = await store.add(path="$.a", value=2, previous_value=1, field_key=None, zone_id=None, changed_by=1)
+    await store.revert(record.id, reverted_by=1)
+
+    assert await store.revert(record.id, reverted_by=1) is None
+
+
+async def test_overrides_from_the_database_apply_on_top_of_the_yaml(session_factory):
+    """Полный путь: правка сохранена в БД реальным store -> `load_catalog`
+    с этими правками -> итоговая цена именно та, что была введена, а не из
+    YAML. Ради этого пути таблица и заведена."""
+    from app.kb.loader import load_catalog
+    from app.kb.override_store import SqlAlchemyOverrideStore, to_overrides
+
+    store = SqlAlchemyOverrideStore(session_factory)
+    await store.add(
+        path="$.catalog.zones[id=dome_bags].pricing.weekend_per_hour",
+        value={"value": 1800, "resolved_from": "оператор через Telegram (user_id=111)"},
+        previous_value={"value": 1500}, field_key="we_hour", zone_id="dome_bags",
+        changed_by=111,
+    )
+
+    overrides = to_overrides(await store.list_active())
+    kb = load_catalog(overrides=overrides)
+
+    zone = next(z for z in kb.catalog.zones if z.id == "dome_bags")
+    assert zone.pricing["weekend_per_hour"]["value"] == 1800
+
+
+async def test_reverted_overrides_are_not_applied(session_factory):
+    from app.kb.loader import load_catalog
+    from app.kb.override_store import SqlAlchemyOverrideStore, to_overrides
+
+    store = SqlAlchemyOverrideStore(session_factory)
+    record = await store.add(
+        path="$.catalog.zones[id=dome_bags].pricing.weekend_per_hour",
+        value={"value": 1800}, previous_value={"value": 1500},
+        field_key="we_hour", zone_id="dome_bags", changed_by=111,
+    )
+    await store.revert(record.id, reverted_by=111)
+
+    overrides = to_overrides(await store.list_active())
+    kb = load_catalog(overrides=overrides)
+
+    zone = next(z for z in kb.catalog.zones if z.id == "dome_bags")
+    assert zone.pricing["weekend_per_hour"]["value"] == 1500      # исходное
+
+
+async def test_catalog_editor_over_the_sql_store_end_to_end(session_factory):
+    """CatalogEditor (валидация + пересчёт примера цены) поверх настоящего
+    Postgres, а не InMemory — тот же путь, каким его вызывает Telegram-бот
+    в проде."""
+    from app.kb.editable import field_by_key
+    from app.kb.editor import CatalogEditor
+    from app.kb.override_store import SqlAlchemyOverrideStore
+
+    editor = CatalogEditor(SqlAlchemyOverrideStore(session_factory))
+
+    preview = await editor.preview("we_hour", "1000", user_id=111, zone_id="dome_bags")
+    result = await editor.apply(preview, user_id=111)
+
+    assert result.record.changed_by == 111
+    assert "4000" in result.price_example        # 1000 ₽/ч × 4 ч
+
+    # «Новый процесс» подхватывает то же значение.
+    fresh_editor = CatalogEditor(SqlAlchemyOverrideStore(session_factory))
+    value = await fresh_editor.current_value(field_by_key("we_hour"), "dome_bags")
+    assert value["value"] == 1000
+
+    reverted = await fresh_editor.revert_last(user_id=111)
+    assert "6000" in reverted.price_example      # обратно к 1500 ₽/ч × 4 ч

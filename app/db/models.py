@@ -286,6 +286,53 @@ class PendingReplyRow(Base):
     )
 
 
+class CatalogOverride(Base):
+    """Правка каталога поверх YAML — цена, график, вместимость.
+
+    Существует потому, что файловая система контейнера на Railway
+    эфемерная: запись в `app/kb/catalog.yaml` пережила бы ровно до
+    следующего деплоя и исчезла бы МОЛЧА. YAML остаётся базой (он в git,
+    он ревьюится), БД — слоем изменений поверх него.
+
+    Строки не удаляются и не переписываются: каждая правка добавляет новую,
+    последняя по времени для того же `path` побеждает. Это и журнал («кто,
+    когда, что было, что стало»), и механика отката — откат помечает
+    `reverted_at`, а не стирает историю.
+    """
+
+    __tablename__ = "catalog_overrides"
+    __table_args__ = (
+        # Активные правки читаются на каждом старте и после каждой правки —
+        # это единственный запрос к таблице в горячем пути.
+        Index("ix_catalog_overrides_active", "reverted_at", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Путь в документе, формат — см. app/kb/overrides.py
+    # ($.catalog.zones[id=dome_bags].pricing.weekend_per_hour)
+    path: Mapped[str] = mapped_column(String(512), index=True)
+    # Новое значение, JSON-совместимое: скаляр, список или узел
+    # DisputedValue целиком. JSONB, а не строка: значение бывает и списком
+    # (праздничные даты), и словарём, и числом.
+    value: Mapped[Any] = mapped_column(JSONB)
+    # Что было до правки — только для журнала и для человекочитаемого
+    # «было X, станет Y». Источник истины для отката — не это поле, а
+    # отсутствие строки: откат помечает reverted_at, и предыдущая правка
+    # того же пути (или сам YAML) снова становится действующей.
+    previous_value: Mapped[Optional[Any]] = mapped_column(JSONB)
+    # Ключ поля из app/kb/editable.py — чтобы журнал показывал «Выходные,
+    # ₽/час», а не только путь.
+    field_key: Mapped[Optional[str]] = mapped_column(String(64))
+    zone_id: Mapped[Optional[str]] = mapped_column(String(64))
+    changed_by: Mapped[int] = mapped_column(BigInteger)
+    comment: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    reverted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    reverted_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+
+
 class OperatorAction(Base):
     """Audit trail for the Telegram controls (prompt 6 uses this)."""
 
