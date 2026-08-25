@@ -25,6 +25,14 @@ class PendingReply:
     created_at: datetime
     status: str = "pending"          # pending | approved | rejected | edited
     decided_by: Optional[int] = None
+    # --- Модерация ценовых уступок (MODERATION_MODE=concessions_only) ----
+    # is_concession=True — этот pending на самом деле запрос на скидку, а
+    # не обычный DRY_RUN-холд: у него есть дедлайн, и по истечении фоновый
+    # воркер (app.pipeline.MessagePipeline.check_concession_timeouts)
+    # отправит fallback_text вместо ожидания оператора вечно.
+    is_concession: bool = False
+    fallback_text: Optional[str] = None
+    due_at: Optional[datetime] = None
 
 
 @dataclass
@@ -41,6 +49,7 @@ class OpsStore(Protocol):
     async def get_pending(self, chat_id: str) -> Optional[PendingReply]: ...
     async def set_pending(self, chat_id: str, reply: Optional[PendingReply]) -> None: ...
     async def log_action(self, chat_id: str, user_id: int, action: str, payload: dict) -> None: ...
+    async def list_due_concessions(self, now: datetime) -> list[PendingReply]: ...
 
 
 @dataclass
@@ -84,6 +93,25 @@ class InMemoryOpsStore:
 
     def bump_moderation(self, key: str) -> None:
         self.moderation[key] = self.moderation.get(key, 0) + 1
+
+    async def list_due_concessions(self, now: datetime) -> list[PendingReply]:
+        return [
+            reply for reply in self.pending.values()
+            if reply.is_concession and reply.due_at is not None and reply.due_at <= now
+        ]
+
+
+def _pending_reply_from_row(row) -> PendingReply:
+    return PendingReply(
+        chat_id=row.chat_id,
+        text=row.text,
+        created_at=row.created_at,
+        status=row.status,
+        decided_by=row.decided_by,
+        is_concession=row.is_concession,
+        fallback_text=row.fallback_text,
+        due_at=row.due_at,
+    )
 
 
 class SqlAlchemyOpsStore:
@@ -169,13 +197,7 @@ class SqlAlchemyOpsStore:
 
         if row is None:
             return None
-        return PendingReply(
-            chat_id=row.chat_id,
-            text=row.text,
-            created_at=row.created_at,
-            status=row.status,
-            decided_by=row.decided_by,
-        )
+        return _pending_reply_from_row(row)
 
     async def set_pending(self, chat_id: str, reply: Optional[PendingReply]) -> None:
         from sqlalchemy import delete, select
@@ -201,7 +223,27 @@ class SqlAlchemyOpsStore:
             row.text = reply.text
             row.status = reply.status
             row.decided_by = reply.decided_by
+            row.is_concession = reply.is_concession
+            row.fallback_text = reply.fallback_text
+            row.due_at = reply.due_at
             await session.commit()
+
+    async def list_due_concessions(self, now: datetime) -> list[PendingReply]:
+        from sqlalchemy import select
+
+        from app.db.models import PendingReplyRow
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(PendingReplyRow).where(
+                        PendingReplyRow.is_concession.is_(True),
+                        PendingReplyRow.due_at.is_not(None),
+                        PendingReplyRow.due_at <= now,
+                    )
+                )
+            ).scalars().all()
+        return [_pending_reply_from_row(row) for row in rows]
 
     async def log_action(self, chat_id: str, user_id: int, action: str, payload: dict) -> None:
         from app.db.models import OperatorAction

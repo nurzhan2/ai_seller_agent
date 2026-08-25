@@ -106,6 +106,21 @@ class Settings(BaseSettings):
     # must be a deliberate, explicit act — never a default.
     dry_run: bool = True
 
+    # --- Модерация -----------------------------------------------------
+    # Не в .env — переключается из Telegram (/moderation), без передеплоя.
+    # DRY_RUN остаётся отдельным аварийным рубильником: пока он включён,
+    # ВСЁ уходит на одобрение независимо от этой настройки — она решает,
+    # что происходит в живом режиме (dry_run=False).
+    #   all             — держать на одобрении всё, как раньше (откат)
+    #   concessions_only — одобрение только на ценовую уступку (по умолчанию)
+    #   off             — полная автономия, включая ценовые уступки
+    moderation_mode: Literal["all", "concessions_only", "off"] = "concessions_only"
+    # Сколько ждать реакции оператора на запрос ценовой уступки, прежде чем
+    # отправить клиенту версию ответа без скидки и продолжить диалог.
+    concession_approval_timeout_minutes: int = 15
+    # Как часто фоновый воркер проверяет просроченные запросы на скидку.
+    concession_timeout_scheduler_interval_seconds: int = 60
+
     # Webhook message ids are remembered this long to drop duplicates.
     webhook_idempotency_ttl_seconds: int = 24 * 60 * 60
     # Access token is refreshed this many seconds before it actually expires.

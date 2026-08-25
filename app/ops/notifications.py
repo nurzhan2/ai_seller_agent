@@ -80,6 +80,69 @@ def dialog_keyboard(chat_id: str, dry_run: bool, taken_over: bool) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+@dataclass(frozen=True)
+class ConcessionRequestCard:
+    """Всё, что нужно оператору, чтобы решить по ценовой уступке НЕ
+    заходя в админку — ровно то, что просили: текст клиента и черновик
+    Иришки, ступень и триггер, база → скидка → недополучено, сколько уже
+    выдано сегодня, пометка provisional. `final_price`/`revenue_delta`
+    приходят `None`, когда решение — requires_operator_approval (загрузка
+    неизвестна): движок его ещё не посчитал, это ЕГО и есть вопрос
+    оператору, а не сокрытая цифра."""
+
+    chat_id: str
+    client_text: str
+    agent_text: str
+    tier: Optional[int]
+    trigger: Optional[str]
+    reason: str                       # почему нужен человек — denial_reason
+    base_price: Optional[Decimal]
+    final_price: Optional[Decimal]
+    revenue_delta: Optional[Decimal]
+    concessions_today: int
+    provisional: bool
+
+
+def render_concession_request(card: ConcessionRequestCard) -> str:
+    lines = [
+        f"💸 ЗАПРОС НА СКИДКУ · чат {card.chat_id}",
+        "",
+        f"💬 Клиент: {_clip(card.client_text, 700)}",
+        f"🤖 Иришка ответит: {_clip(card.agent_text, 1200) or '(пусто)'}",
+        "",
+        f"Ступень: {card.tier if card.tier is not None else '—'}"
+        f" · триггер: {card.trigger or '—'}",
+    ]
+    if card.base_price is not None and card.final_price is not None:
+        lines.append(
+            f"Цена: {card.base_price} ₽ → {card.final_price} ₽"
+            f" (недополучаем {abs(card.revenue_delta or Decimal('0'))} ₽)"
+        )
+    else:
+        lines.append(f"Цена: пока не посчитана — {card.reason}")
+    lines.append(f"Уступок сегодня уже выдано: {card.concessions_today}")
+    if card.provisional:
+        lines.append("⚠️ Правило предварительное (наше, не подтверждённое заказчиком) — вопрос 13.4")
+    lines.append("")
+    lines.append("Нужно решение: разрешить, отклонить или взять чат на себя.")
+    return _clip("\n".join(lines), MAX_TELEGRAM_LEN)
+
+
+def concession_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    """Те же действия и callback_data, что у `dialog_keyboard` (approve/
+    reject/takeover — хендлеры в app/ops/handlers.py их не различают по
+    источнику), только подписи говорят именно про скидку, а не про
+    сообщение вообще."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Разрешить скидку", callback_data=f"approve:{chat_id}")],
+            [InlineKeyboardButton(text="🚫 Отклонить", callback_data=f"reject:{chat_id}")],
+            [InlineKeyboardButton(text="🙋 Взять на себя", callback_data=f"takeover:{chat_id}")],
+            [InlineKeyboardButton(text="🔗 Открыть в Авито", url=AVITO_CHAT_URL.format(chat_id=chat_id))],
+        ]
+    )
+
+
 def render_escalation(chat_id: str, reason: str, urgency: str = "normal") -> str:
     mark = {"high": "🔴🔴", "normal": "🔴", "low": "🟠"}.get(urgency, "🔴")
     return "\n".join(

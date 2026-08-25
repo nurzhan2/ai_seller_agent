@@ -163,6 +163,31 @@ class OpsService:
             "Убедитесь, что метрики позволяют."
         )
 
+    # -- модерация -----------------------------------------------------------
+
+    _MODERATION_MODES = ("all", "concessions_only", "off")
+
+    async def show_moderation_mode(self) -> str:
+        mode = self.settings.moderation_mode
+        return f"Режим модерации: {mode}.\nИспользование: /moderation all|concessions_only|off"
+
+    async def set_moderation_mode(self, user_id: int, mode: str) -> str:
+        if mode not in self._MODERATION_MODES:
+            return "Использование: /moderation all|concessions_only|off"
+        if mode == self.settings.moderation_mode:
+            return f"Уже {mode}."
+        previous = self.settings.moderation_mode
+        self.settings.moderation_mode = mode
+        await self.store.log_action(
+            "*", user_id, "set_moderation_mode", {"from": previous, "to": mode}
+        )
+        explain = {
+            "all": "держим на одобрении всё, как раньше",
+            "concessions_only": "одобрение только на ценовую уступку",
+            "off": "полная автономия, включая ценовые уступки",
+        }[mode]
+        return f"Режим модерации: {previous} → {mode} ({explain})."
+
     # -- LLM-провайдер (промт №12) ------------------------------------------
 
     async def show_provider(self) -> str:

@@ -240,6 +240,49 @@ async def test_dryrun_off_warns_loudly(service):
 
 
 # --------------------------------------------------------------------------
+# /moderation — переключение режима на лету, без передеплоя
+# --------------------------------------------------------------------------
+
+async def test_moderation_mode_defaults_to_concessions_only(settings):
+    assert settings.moderation_mode == "concessions_only"
+
+
+async def test_show_moderation_mode_reports_current(service):
+    message = await service.show_moderation_mode()
+    assert "concessions_only" in message
+
+
+async def test_set_moderation_mode_switches_live_without_redeploy(service, settings):
+    message = await service.set_moderation_mode(ALLOWED_USER, "off")
+
+    assert "concessions_only → off" in message
+    assert settings.moderation_mode == "off"          # тот же объект настроек, что видит пайплайн
+    actions = [a for a in service.store.actions if a["action"] == "set_moderation_mode"]
+    assert actions and actions[0]["payload"] == {"from": "concessions_only", "to": "off"}
+
+
+async def test_set_moderation_mode_rejects_unknown_value(service, settings):
+    message = await service.set_moderation_mode(ALLOWED_USER, "sometimes")
+
+    assert "Использование" in message
+    assert settings.moderation_mode == "concessions_only"
+
+
+async def test_set_moderation_mode_is_a_noop_when_already_active(service, settings):
+    message = await service.set_moderation_mode(ALLOWED_USER, "concessions_only")
+
+    assert "Уже" in message
+    assert not [a for a in service.store.actions if a["action"] == "set_moderation_mode"]
+
+
+async def test_set_moderation_mode_all_three_values_are_accepted(service, settings):
+    for mode in ("all", "off", "concessions_only"):
+        message = await service.set_moderation_mode(ALLOWED_USER, mode)
+        assert settings.moderation_mode == mode
+        assert "Использование" not in message
+
+
+# --------------------------------------------------------------------------
 # LLM-провайдер (промт №12)
 # --------------------------------------------------------------------------
 

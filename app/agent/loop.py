@@ -96,6 +96,10 @@ class TurnResult:
     # исполнителя инструментов» (спам, просьба позвать человека) — состояние
     # не изменилось, перезаписывать в БД нечего.
     concession_state: Any = None
+    # Каждое решение decide() за ход — не только выданные, и не только
+    # ценовые. Конвейер (app/pipeline.py) фильтрует их сам через
+    # ConcessionEvent.needs_operator_approval, решая, нужно ли одобрение.
+    concession_events: list[Any] = field(default_factory=list)
 
 
 def estimate_cost_rub(model: str, input_tokens: int, output_tokens: int) -> Decimal:
@@ -139,7 +143,10 @@ class AgentLoop:
         self.dialog_model = dialog_model
         self.classifier_model = classifier_model
         self.executor_factory = executor_factory or (
-            lambda dialog_id, state: ToolExecutor(kb, dialog_id, state, booking_provider=booking_provider)
+            lambda dialog_id, state, concessions_blocked=False: ToolExecutor(
+                kb, dialog_id, state, booking_provider=booking_provider,
+                concessions_blocked=concessions_blocked,
+            )
         )
 
     # -- классификация -----------------------------------------------------
@@ -164,6 +171,7 @@ class AgentLoop:
         state: Any = None,
         item_id: Optional[str] = None,
         item_lookup: Optional[ItemZoneLookup] = None,
+        concessions_blocked: bool = False,
     ) -> TurnResult:
         classification = await self.classify(user_text)
 
@@ -178,7 +186,14 @@ class AgentLoop:
         if classification == "spam":
             return TurnResult(text="", classification=classification)
 
-        executor = self.executor_factory(dialog_id, state)
+        # kwarg добавляется, только если реально нужен — иначе ломает
+        # existing executor_factory-заглушки в тестах, у которых сигнатура
+        # (dialog_id, state) без третьего параметра.
+        executor = (
+            self.executor_factory(dialog_id, state, concessions_blocked=True)
+            if concessions_blocked
+            else self.executor_factory(dialog_id, state)
+        )
         system = build_system_prompt(self.kb)
 
         # Подсказка о зоне идёт в СОДЕРЖИМОЕ этого хода, а не в системный
@@ -279,6 +294,7 @@ class AgentLoop:
                 llm_meta=llm_meta,
                 tool_call_errors=tool_call_errors,
                 concession_state=getattr(executor, "state", None),
+                concession_events=getattr(executor, "concession_events", []),
             )
 
         return TurnResult(
@@ -293,6 +309,7 @@ class AgentLoop:
             llm_meta=llm_meta,
             tool_call_errors=tool_call_errors,
             concession_state=getattr(executor, "state", None),
+            concession_events=getattr(executor, "concession_events", []),
         )
 
 

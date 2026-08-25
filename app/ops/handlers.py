@@ -92,6 +92,18 @@ def build_dispatcher(service: OpsService, stats_provider=None) -> Dispatcher:
             await service.set_dry_run(message.from_user.id, parts[1] == "on")
         )
 
+    @dp.message(Command("moderation"))
+    async def on_moderation(message: Message) -> None:
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            await message.answer(await service.show_moderation_mode())
+            return
+        await message.answer(
+            await service.set_moderation_mode(message.from_user.id, parts[1].strip())
+        )
+
     @dp.message(Command("provider"))
     async def on_provider(message: Message) -> None:
         if not await _guard(message, message.from_user.id):

@@ -45,7 +45,8 @@ from app.db.models import (
 )
 from app.dialog_store import SqlAlchemyDialogStore
 from app.ops.state import ChatFlags, PendingReply, SqlAlchemyOpsStore
-from app.pricing.concessions import DialogConcessionState
+from app.pricing.concessions import ConcessionDecision, ConcessionEvent, DialogConcessionState
+from app.pricing.engine import PriceQuote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEST_DATABASE_URL = os.environ.get(
@@ -277,6 +278,65 @@ async def test_dialog_store_bumps_the_reply_counter(seeded):
     assert chat.agent_reply_count == 2
 
 
+def _price_concession_event(base=Decimal("7000"), final=Decimal("6000")):
+    decision = ConcessionDecision(
+        allowed=True, tier=5, kind="price",
+        new_quote=PriceQuote(status="ok", total=final, zone_id="bath_russian"),
+        revenue_delta=final - base, revenue_delta_basis="base_rate",
+        offer_template="Скидка",
+    )
+    return ConcessionEvent(decision=decision, base_price=base, zone_id="bath_russian", trigger="price_objection")
+
+
+async def test_dialog_store_log_concession_writes_a_row(session_factory):
+    """`session_factory`, а не `seeded` — та фикстура уже сеет одну строку
+    ConcessionLog сама, и тест проверял бы не то, что написал он сам."""
+    store = SqlAlchemyDialogStore(session_factory)
+
+    await store.log_concession("c-1", _price_concession_event())
+
+    async with session_factory() as session:
+        from sqlalchemy import select
+        row = (await session.execute(select(ConcessionLog))).scalar_one()
+        assert row.dialog_id == "c-1"
+        assert row.tier == 5
+        assert row.base_price == Decimal("7000")
+        assert row.final_price == Decimal("6000")
+        assert row.revenue_delta == Decimal("-1000")
+        assert row.allowed is True
+
+
+async def test_dialog_store_count_concessions_today_counts_only_allowed(session_factory):
+    store = SqlAlchemyDialogStore(session_factory)
+    denied = ConcessionEvent(
+        decision=ConcessionDecision(allowed=False, tier=5, kind="price", requires_operator_approval=True),
+        base_price=Decimal("7000"), zone_id="bath_russian", trigger="price_objection",
+    )
+
+    assert await store.count_concessions_today() == 0
+    await store.log_concession("c-1", _price_concession_event())
+    await store.log_concession("c-1", denied)
+
+    assert await store.count_concessions_today() == 1
+
+
+async def test_dialog_store_count_concessions_today_ignores_yesterday(session_factory):
+    """`count_concessions_today()` сравнивает с РЕАЛЬНЫМ текущим временем
+    (своего now() не принимает), поэтому и здесь — реальное «вчера», а не
+    смещение от фиксированного NOW фикстуры: иначе тест был бы правильным
+    только пока реальная дата прогона отстоит от NOW достаточно далеко."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.log_concession("c-1", _price_concession_event())
+
+    async with session_factory() as session:
+        from sqlalchemy import update
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        await session.execute(update(ConcessionLog).values(created_at=yesterday))
+        await session.commit()
+
+    assert await store.count_concessions_today() == 0
+
+
 # ==========================================================================
 # SqlAlchemyOpsStore — состояние модерации переживает рестарт
 # ==========================================================================
@@ -373,6 +433,64 @@ async def test_ops_store_moderation_stats_come_from_the_action_log(seeded):
     await store.log_action("c-1", 1, "takeover", {})       # не метрика модерации
 
     assert await store.moderation_stats() == {"approved": 2, "rejected": 1, "edited": 1}
+
+
+async def test_ops_store_pending_concession_round_trips_all_fields(seeded):
+    """is_concession/fallback_text/due_at — новые колонки миграции
+    95c862132eaf, ради модерации ценовых уступок."""
+    due = NOW + timedelta(minutes=15)
+    writer = SqlAlchemyOpsStore(seeded)
+    await writer.set_pending("c-1", PendingReply(
+        chat_id="c-1", text="6 000 ₽ вместо 7 000 ₽.", created_at=NOW,
+        is_concession=True, fallback_text="Уточню детали и вернусь с ответом.", due_at=due,
+    ))
+
+    reader = SqlAlchemyOpsStore(seeded)      # «после рестарта контейнера»
+    pending = await reader.get_pending("c-1")
+
+    assert pending.is_concession is True
+    assert pending.fallback_text == "Уточню детали и вернусь с ответом."
+    assert pending.due_at == due
+
+
+async def test_ops_store_regular_pending_defaults_is_concession_to_false(seeded):
+    """Обычный DRY_RUN-холд (не запрос на скидку) — is_concession=False по
+    умолчанию, а не требует явного указания на каждом вызове."""
+    store = SqlAlchemyOpsStore(seeded)
+    await store.set_pending("c-1", PendingReply(chat_id="c-1", text="текст", created_at=NOW))
+
+    pending = await store.get_pending("c-1")
+
+    assert pending.is_concession is False
+    assert pending.due_at is None
+
+
+async def test_ops_store_list_due_concessions_finds_overdue_and_skips_the_rest(seeded):
+    store = SqlAlchemyOpsStore(seeded)
+    await store.set_pending("c-1", PendingReply(
+        chat_id="c-1", text="просрочен", created_at=NOW - timedelta(minutes=20),
+        is_concession=True, fallback_text="fb-1", due_at=NOW - timedelta(minutes=1),
+    ))
+
+    async with seeded() as session:
+        session.add(Chat(chat_id="c-2"))
+        await session.commit()
+    await store.set_pending("c-2", PendingReply(
+        chat_id="c-2", text="ещё не подошёл срок", created_at=NOW,
+        is_concession=True, fallback_text="fb-2", due_at=NOW + timedelta(minutes=10),
+    ))
+
+    async with seeded() as session:
+        session.add(Chat(chat_id="c-3"))
+        await session.commit()
+    await store.set_pending("c-3", PendingReply(
+        chat_id="c-3", text="обычный холд, не скидка", created_at=NOW - timedelta(minutes=30),
+    ))
+
+    due = await store.list_due_concessions(NOW)
+
+    assert [p.chat_id for p in due] == ["c-1"]
+    assert due[0].fallback_text == "fb-1"
 
 
 async def test_ops_service_end_to_end_over_the_sql_store(seeded):

@@ -133,6 +133,30 @@ class ConcessionDecision:
     requires_operator_approval: bool = False
 
 
+@dataclass(frozen=True)
+class ConcessionEvent:
+    """Снимок решения `decide()` вместе с тем, чего в `ConcessionDecision`
+    самом по себе нет, но нужно конвейеру и карточке оператора:
+    ценой ДО скидки (`ConcessionDecision.revenue_delta` — это разница, не
+    абсолютное число) и зоной. `trigger` — первый из наблюдённых триггеров,
+    для отображения; список целиком остаётся в логе R12."""
+
+    decision: ConcessionDecision
+    base_price: Optional[Money]
+    zone_id: Optional[str]
+    trigger: Optional[str]
+
+    @property
+    def needs_operator_approval(self) -> bool:
+        """Требует ли ЭТО решение подтверждения в режиме concessions_only —
+        см. app/pipeline.py. Ценовая уступка (allowed И kind=price) — да.
+        Отказ из-за неизвестной загрузки (R7, occupancy_ratio=None) — тоже
+        да, это не обычный отказ, а решение, которое движок сознательно
+        передал человеку. Неценовые ступени и обычные отказы — нет."""
+        d = self.decision
+        return (d.allowed and d.kind == "price") or d.requires_operator_approval
+
+
 # --------------------------------------------------------------------------
 # Logging (R12)
 # --------------------------------------------------------------------------

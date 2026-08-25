@@ -272,6 +272,15 @@ class PendingReplyRow(Base):
     # миграцией за каждое новое значение.
     status: Mapped[str] = mapped_column(String(32), default="pending")
     decided_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+    # --- Модерация ценовых уступок (MODERATION_MODE=concessions_only) ----
+    # is_concession: этот pending — запрос на скидку, а не обычный
+    # DRY_RUN-холд. У него есть дедлайн (due_at); просроченный воркер
+    # (app.pipeline.MessagePipeline.check_concession_timeouts) отправляет
+    # клиенту fallback_text — предпосчитанный ответ БЕЗ скидки — вместо
+    # того, чтобы держать диалог в тишине, пока оператор не освободится.
+    is_concession: Mapped[bool] = mapped_column(Boolean, default=False)
+    fallback_text: Mapped[Optional[str]] = mapped_column(Text)
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

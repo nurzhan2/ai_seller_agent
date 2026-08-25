@@ -22,6 +22,7 @@ from typing import Any, Optional
 from app.config import get_settings
 from app.kb.loader import KnowledgeBase
 from app.pricing.concessions import (
+    ConcessionEvent,
     ConcessionRequest,
     DialogConcessionState,
     decide,
@@ -320,6 +321,7 @@ class ToolExecutor:
         photo_provider: Any = None,
         lead_sink: Any = None,
         booking_provider: Any = None,
+        concessions_blocked: bool = False,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
@@ -327,6 +329,11 @@ class ToolExecutor:
         self.photo_provider = photo_provider
         self.lead_sink = lead_sink
         self.booking_provider = booking_provider
+        # True для «чистого» повторного хода после таймаута запроса на
+        # скидку (app/pipeline.py) — модель ведёт диалог дальше, но
+        # request_concession не вызывает decide() вообще, ни при каких
+        # условиях не предлагая клиенту скидку в этом ходе.
+        self.concessions_blocked = concessions_blocked
         self.escalated = False
         self.escalation_reason: Optional[str] = None
         self.last_quote: Optional[PriceQuote] = None
@@ -335,6 +342,11 @@ class ToolExecutor:
         # праздник, а не верит булеву флагу от вызывающего кода.
         self.last_booking_date: Optional[DateType] = None
         self.granted_offer_templates: list[str] = []
+        # Каждое решение decide() за ход — не только выданные. Нужно
+        # конвейеру, чтобы решить, требует ли ход одобрения оператора
+        # (app.pricing.concessions.ConcessionEvent.needs_operator_approval),
+        # и чтобы писать ConcessionLog.
+        self.concession_events: list[ConcessionEvent] = []
 
     async def run(self, name: str, args: dict) -> dict:
         handler = getattr(self, f"_tool_{name}", None)
@@ -446,6 +458,20 @@ class ToolExecutor:
                 touch_count=touch_max_count,
             )
 
+        if self.concessions_blocked:
+            # Запрос на предыдущую скидку истёк по таймауту — decide() не
+            # вызывается вообще, и в concession_events ничего не попадает:
+            # это не решение по скидке, а его сознательное отсутствие в
+            # этом ходе. См. app/pipeline.py._send_concession_fallback.
+            return {
+                "allowed": False,
+                "instruction": (
+                    "Скидку сейчас предложить нельзя. Продолжай разговор без неё — "
+                    "можешь рассказать, что входит в стоимость, или предложить другую дату."
+                ),
+            }
+
+        base_price_before = self.last_quote.total
         request = ConcessionRequest(
             dialog_id=self.dialog_id,
             quote=self.last_quote,
@@ -461,6 +487,14 @@ class ToolExecutor:
             booking_date=self.last_booking_date or DateType.today(),
         )
         decision = decide(request, self.kb)
+        self.concession_events.append(
+            ConcessionEvent(
+                decision=decision,
+                base_price=base_price_before,
+                zone_id=self.last_quote.zone_id,
+                trigger=observed_triggers[0] if observed_triggers else None,
+            )
+        )
 
         if not decision.allowed:
             return {

@@ -23,9 +23,10 @@ from app.config import Settings
 from app.db.models import Author, Direction, SendStatus
 from app.dialog_store import InMemoryDialogStore
 from app.ops.bot import OpsService
-from app.ops.state import InMemoryOpsStore
+from app.ops.state import InMemoryOpsStore, PendingReply
 from app.pipeline import MessagePipeline
-from app.pricing.concessions import DialogConcessionState
+from app.pricing.concessions import ConcessionDecision, ConcessionEvent, DialogConcessionState
+from app.pricing.engine import PriceQuote
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
 
@@ -632,3 +633,354 @@ async def test_webhook_without_chat_id_is_dropped_quietly():
     await _settle()
 
     assert agent.calls == []
+
+
+# --------------------------------------------------------------------------
+# Модерация: одобрение только на ценовую уступку (moderation_mode)
+# --------------------------------------------------------------------------
+#
+# Все тесты этого раздела — в живом режиме (dry_run=False): DRY_RUN сам по
+# себе держит всё на одобрении независимо от moderation_mode (см. докстринг
+# app/pipeline.py), поэтому только тут вообще видно, что отличает
+# moderation_mode друг от друга.
+
+def _quote(total=Decimal("7000")):
+    return PriceQuote(status="ok", total=total, zone_id="bath_russian", day_type="weekend")
+
+
+def _price_concession_event(base=Decimal("7000"), final=Decimal("6000")):
+    """Как если бы decide() выдал ценовую уступку (ступень 5)."""
+    decision = ConcessionDecision(
+        allowed=True, tier=5, kind="price", new_quote=_quote(final),
+        revenue_delta=final - base, revenue_delta_basis="base_rate",
+        offer_template="Идёт навстречу — 6 000 ₽ вместо 7 000 ₽.",
+    )
+    return ConcessionEvent(decision=decision, base_price=base, zone_id="bath_russian", trigger="price_objection")
+
+
+def _non_price_concession_event():
+    """Как если бы decide() выдал неценовую ступень (перенос на будни)."""
+    decision = ConcessionDecision(
+        allowed=True, tier=1, kind="non_price",
+        offer_template="Могу предложить будний день — там дешевле.",
+    )
+    return ConcessionEvent(decision=decision, base_price=Decimal("7000"), zone_id="bath_russian", trigger="price_objection")
+
+
+def _requires_operator_approval_event():
+    """Как если бы decide() не смог посчитать загрузку (R7)."""
+    decision = ConcessionDecision(
+        allowed=False, tier=5, kind="price", requires_operator_approval=True,
+        denial_reason="Загрузка на эту дату неизвестна — нужно ваше решение по скидке",
+    )
+    return ConcessionEvent(decision=decision, base_price=Decimal("7000"), zone_id="bath_russian", trigger="price_objection")
+
+
+class _FakeConcessionAgentLoop:
+    """Отличает обычный ход от «чистого» повторного — конвейер вызывает
+    run_turn дважды для запроса на скидку в живом режиме: один раз как
+    обычно, второй раз с concessions_blocked=True за запасным ответом."""
+
+    def __init__(self, result: TurnResult, fallback_text: str = "Отвечу без скидки — актуальны ли даты?"):
+        self.result = result
+        self.fallback_text = fallback_text
+        self.calls: list[dict] = []
+
+    async def run_turn(self, dialog_id, history, user_text, state=None, item_id=None,
+                        item_lookup=None, concessions_blocked=False):
+        self.calls.append({"user_text": user_text, "concessions_blocked": concessions_blocked})
+        if concessions_blocked:
+            return TurnResult(text=self.fallback_text)
+        return self.result
+
+
+def _live_settings(**overrides) -> Settings:
+    base = dict(
+        dry_run=False,
+        avito_user_id=OUR_USER_ID,
+        debounce_window_seconds=0,
+        telegram_ops_chat_id="",
+        telegram_allowed_users=[1],
+        touch_reminder_delay_minutes=30,
+        touch_max_count=3,
+        concession_approval_timeout_minutes=15,
+    )
+    base.update(overrides)
+    return Settings(**base)
+
+
+def _build_live(*, agent, moderation_mode="concessions_only", avito=None, store=None):
+    settings = _live_settings(moderation_mode=moderation_mode)
+    store = store or InMemoryDialogStore()
+    avito = avito if avito is not None else _FakeAvito()
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    pipeline = MessagePipeline(
+        store=store, agent_loop=agent, ops_service=ops_service, settings=settings,
+        avito_client=avito, ops_bot=None, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+    return pipeline, store, avito, ops_service, settings
+
+
+async def test_plain_price_quote_goes_out_without_approval():
+    """Ответ по прайсу — calculate_price без единого request_concession за
+    ход — уходит клиенту сразу, concession_events пуст."""
+    agent = _FakeConcessionAgentLoop(TurnResult(text="Баня в субботу — 7 000 ₽ за 2 часа."))
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", "Баня в субботу — 7 000 ₽ за 2 часа.")]
+    assert await ops_service.store.get_pending("chat-1") is None
+    assert len(agent.calls) == 1   # ни одного повторного «чистого» хода — approval не требовался
+
+
+async def test_price_concession_requires_approval():
+    """Ценовая уступка (allowed=True, kind=price) не уходит клиенту
+    напрямую — держится на одобрении с богатой карточкой."""
+    result = TurnResult(
+        text="Идёт навстречу — 6 000 ₽ вместо 7 000 ₽.",
+        concession_events=[_price_concession_event()],
+    )
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == []
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is not None
+    assert pending.is_concession is True
+    assert pending.text == "Идёт навстречу — 6 000 ₽ вместо 7 000 ₽."
+    assert pending.due_at == NOW + timedelta(minutes=15)
+
+
+async def test_non_price_concession_does_not_require_approval():
+    """Неценовая ступень (перенос на будни и т.п.) не расходует деньги —
+    уходит клиенту сразу, как обычный ответ."""
+    result = TurnResult(
+        text="Могу предложить будний день — там дешевле.",
+        concession_events=[_non_price_concession_event()],
+    )
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", "Могу предложить будний день — там дешевле.")]
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_requires_operator_approval_requires_approval():
+    """occupancy_ratio неизвестен (R7, каталог YCLIENTS пуст) — decide()
+    вернул requires_operator_approval=True, а не обычный отказ. Это ЗНАЧИМОЕ
+    решение и держится на одобрении, хотя allowed=False."""
+    result = TurnResult(
+        text="Уточню детали и вернусь с ответом.",
+        concession_events=[_requires_operator_approval_event()],
+    )
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == []
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is not None and pending.is_concession is True
+
+
+async def test_routine_denial_does_not_require_approval():
+    """Обычный отказ (R1/R2/R6 — например, триггер не сработал) не должен
+    держать сообщение: needs_operator_approval=False у таких решений."""
+    decision = ConcessionDecision(allowed=False, denial_reason="R1: ни один триггер не сработал")
+    event = ConcessionEvent(decision=decision, base_price=Decimal("7000"), zone_id="bath_russian", trigger=None)
+    result = TurnResult(text="Баня — 7 000 ₽.", concession_events=[event])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", "Баня — 7 000 ₽.")]
+
+
+async def test_moderation_mode_off_sends_even_price_concessions_without_approval():
+    result = TurnResult(text="6 000 ₽ вместо 7 000 ₽.", concession_events=[_price_concession_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent, moderation_mode="off")
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", "6 000 ₽ вместо 7 000 ₽.")]
+
+
+async def test_moderation_mode_all_holds_even_a_plain_price_quote():
+    agent = _FakeConcessionAgentLoop(TurnResult(text="Баня — 7 000 ₽."))
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent, moderation_mode="all")
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert avito.sent == []
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is not None
+    assert pending.is_concession is False   # обычный холд, без дедлайна и карточки скидки
+    assert pending.due_at is None
+
+
+async def test_price_concession_computes_the_fallback_turn_eagerly():
+    """Запасной ответ считается заранее, вторым ходом с
+    concessions_blocked=True — не в момент таймаута."""
+    result = TurnResult(text="6 000 ₽ вместо 7 000 ₽.", concession_events=[_price_concession_event()])
+    agent = _FakeConcessionAgentLoop(result, fallback_text="Уточните дату, посчитаю точнее.")
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert len(agent.calls) == 2
+    assert agent.calls[0]["concessions_blocked"] is False
+    assert agent.calls[1]["concessions_blocked"] is True
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending.fallback_text == "Уточните дату, посчитаю точнее."
+
+
+async def test_dry_run_holds_concessions_without_computing_a_fallback():
+    """DRY_RUN — мастер-рубильник: держит на одобрении и без дедлайна,
+    вторая (LLM-затратная) попытка ради fallback_text ни к чему, раз
+    авто-отправка по таймауту тут в принципе не сработает."""
+    result = TurnResult(text="6 000 ₽ вместо 7 000 ₽.", concession_events=[_price_concession_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    settings = _live_settings(dry_run=True)
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    pipeline = MessagePipeline(
+        store=InMemoryDialogStore(), agent_loop=agent, ops_service=ops_service, settings=settings,
+        debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert len(agent.calls) == 1   # ни одного вызова с concessions_blocked=True
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending.is_concession is True
+    assert pending.due_at is None
+    assert pending.fallback_text is None
+
+
+async def test_concessions_today_counts_only_allowed_grants():
+    result = TurnResult(text="6 000 ₽.", concession_events=[_price_concession_event()])
+    agent = _FakeConcessionAgentLoop(result)
+    pipeline, store, avito, ops_service, _ = _build_live(agent=agent)
+
+    assert await store.count_concessions_today() == 0
+    await pipeline.handle_message(_payload(message_id="m1"))
+    await _settle()
+    assert await store.count_concessions_today() == 1
+
+    await pipeline.handle_message(_payload(chat_id="chat-2", message_id="m2"))
+    await _settle()
+    assert await store.count_concessions_today() == 2
+
+
+# --------------------------------------------------------------------------
+# Таймаут запроса на скидку
+# --------------------------------------------------------------------------
+
+async def test_timeout_sends_the_precomputed_fallback_and_clears_pending():
+    """Просроченный запрос на скидку — клиенту уходит fallback_text, а не
+    тишина, диалог продолжается."""
+    settings = _live_settings()
+    store = InMemoryDialogStore()
+    avito = _FakeAvito()
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="6 000 ₽ вместо 7 000 ₽.", created_at=NOW - timedelta(minutes=20),
+            is_concession=True, fallback_text="Уточню детали и вернусь с ответом.",
+            due_at=NOW - timedelta(minutes=5),   # уже просрочен
+        ),
+    )
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=avito, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert handled == ["chat-1"]
+    assert avito.sent == [("chat-1", "Уточню детали и вернусь с ответом.")]
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_timeout_logs_the_reason():
+    settings = _live_settings()
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="скидка", created_at=NOW - timedelta(minutes=20),
+            is_concession=True, fallback_text="без скидки", due_at=NOW - timedelta(minutes=1),
+        ),
+    )
+    pipeline = MessagePipeline(
+        store=InMemoryDialogStore(), agent_loop=_FakeAgentLoop(), ops_service=ops_service,
+        settings=settings, avito_client=_FakeAvito(), debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    await pipeline.check_concession_timeouts()
+
+    actions = [a for a in ops_service.store.actions if a["action"] == "concession_timeout"]
+    assert actions and actions[0]["chat_id"] == "chat-1"
+
+
+async def test_timeout_ignores_requests_not_yet_due():
+    settings = _live_settings()
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="скидка", created_at=NOW, is_concession=True,
+            fallback_text="без скидки", due_at=NOW + timedelta(minutes=10),   # ещё не подошёл срок
+        ),
+    )
+    avito = _FakeAvito()
+    pipeline = MessagePipeline(
+        store=InMemoryDialogStore(), agent_loop=_FakeAgentLoop(), ops_service=ops_service,
+        settings=settings, avito_client=avito, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert handled == []
+    assert avito.sent == []
+    assert await ops_service.store.get_pending("chat-1") is not None
+
+
+async def test_timeout_never_fires_under_dry_run_even_with_a_stale_due_at():
+    """Мастер-рубильник проверяется и в самом воркере — на случай, если
+    DRY_RUN включили обратно, пока запрос ждал оператора."""
+    settings = _live_settings(dry_run=True)
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="скидка", created_at=NOW - timedelta(hours=1), is_concession=True,
+            fallback_text="без скидки", due_at=NOW - timedelta(minutes=1),
+        ),
+    )
+    avito = _FakeAvito()
+    pipeline = MessagePipeline(
+        store=InMemoryDialogStore(), agent_loop=_FakeAgentLoop(), ops_service=ops_service,
+        settings=settings, avito_client=avito, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert handled == []
+    assert avito.sent == []

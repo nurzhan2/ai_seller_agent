@@ -21,7 +21,7 @@ from typing import Any, Optional, Protocol
 from app.agent.listing_context import ItemZoneRow
 from app.agent.touch_tracking import TouchState
 from app.db.models import Author, Direction, SendStatus
-from app.pricing.concessions import DialogConcessionState
+from app.pricing.concessions import ConcessionEvent, DialogConcessionState
 
 logger = logging.getLogger("parmangal.dialog_store")
 
@@ -84,6 +84,10 @@ class DialogStore(Protocol):
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
+    async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None: ...
+
+    async def count_concessions_today(self) -> int: ...
+
 
 # --------------------------------------------------------------------------
 # Реализация для тестов
@@ -105,6 +109,7 @@ class InMemoryDialogStore:
     touches: dict[str, TouchState] = field(default_factory=dict)
     item_zones: dict[str, ItemZoneRow] = field(default_factory=dict)
     seen_message_ids: set[str] = field(default_factory=set)
+    concession_log: list[dict] = field(default_factory=list)
 
     async def get_or_create_chat(
         self, chat_id: str, item_id: Optional[str] = None, buyer_name: Optional[str] = None
@@ -221,6 +226,19 @@ class InMemoryDialogStore:
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         return self.item_zones.get(item_id)
+
+    async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None:
+        self.concession_log.append(
+            {"chat_id": chat_id, "event": event, "at": datetime.now(timezone.utc)}
+        )
+
+    async def count_concessions_today(self) -> int:
+        today = datetime.now(timezone.utc).date()
+        return sum(
+            1
+            for row in self.concession_log
+            if row["event"].decision.allowed and row["at"].date() == today
+        )
 
 
 # --------------------------------------------------------------------------
@@ -453,3 +471,59 @@ class SqlAlchemyDialogStore:
         if row is None:
             return None
         return ItemZoneRow(zone_id=row.zone_id, category=row.category)
+
+    async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None:
+        """Пишет только то, что дошло до фильтра
+        `ConcessionEvent.needs_operator_approval` (вызывающий код —
+        app/pipeline.py решает это ДО вызова) — обычные R1/R2/R6 отказы,
+        которых большинство ходов, в этой таблице только шумели бы: она
+        для аудита реальных ценовых решений и для «сколько уступок выдано
+        сегодня» на карточке оператора, а не зеркало логов decide()
+        (те уже есть в logger.info, см. app.pricing.concessions._log)."""
+        from app.db.models import ConcessionLog
+
+        decision = event.decision
+        async with self._session_factory() as session:
+            session.add(
+                ConcessionLog(
+                    dialog_id=chat_id,
+                    zone=event.zone_id,
+                    tier=decision.tier,
+                    trigger=event.trigger,
+                    base_price=event.base_price,
+                    final_price=decision.new_quote.total if decision.new_quote else None,
+                    revenue_delta=decision.revenue_delta,
+                    revenue_delta_basis=decision.revenue_delta_basis,
+                    exchange_given=decision.exchange_required or None,
+                    allowed=decision.allowed,
+                    denial_reason=decision.denial_reason,
+                    provisional_policy=decision.provisional_policy,
+                )
+            )
+            await session.commit()
+
+    async def count_concessions_today(self) -> int:
+        """Только реально ВЫДАННЫЕ (allowed=True) — «требует одобрения, но
+        ещё не решено» и «оператор отклонил» в это число не входят. Точность
+        ограничена: строка пишется в момент, когда ход дошёл до модерации, а
+        не в момент фактического одобрения (см. app/pipeline.py) — значит
+        отклонённая в течение дня уступка на короткое время всё же
+        засчитывается в «сегодня выдано». Известный компромисс, не бага: для
+        карточки оператора нужна оценка, а не бухгалтерская точность."""
+        from datetime import datetime, timezone
+
+        from sqlalchemy import func, select
+
+        from app.db.models import ConcessionLog
+
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with self._session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count()).select_from(ConcessionLog).where(
+                        ConcessionLog.allowed.is_(True),
+                        ConcessionLog.created_at >= today_start,
+                    )
+                )
+            ).scalar()
+        return count or 0

@@ -37,12 +37,33 @@
 гейт применяется к состоянию, которое каждый раз начинается с нуля, — и
 после перезапуска процесса агент спокойно назовёт цену выше уже обещанной.
 Гейт без персистентности — это гейт с одной петлёй, а не с двумя.
+
+ПРО MODERATION_MODE. Раньше в DRY_RUN на одобрение уходило ВСЁ, без
+различия. Теперь — три уровня (app.config.Settings.moderation_mode):
+`all` держит всё, как раньше; `off` не держит ничего (полная автономия);
+`concessions_only` (по умолчанию) — одобрение требуется только когда за ход
+`decide()` вернул решение, которое ConcessionEvent.needs_operator_approval
+считает значимым (выданная ЦЕНОВАЯ уступка либо «загрузка неизвестна» —
+requires_operator_approval). DRY_RUN остаётся отдельным аварийным
+рубильником НАД этой настройкой: пока он включён, всё уходит на одобрение
+независимо от moderation_mode — см. `_deliver`.
+
+Для запроса на скидку (не для обычного DRY_RUN-холда) заранее, ещё до
+постановки в очередь, считается ВТОРОЙ, «чистый» ответ — тем же ходом
+агента, но с заблокированными уступками (`concessions_blocked=True` у
+`AgentLoop.run_turn`). Если оператор не отреагирует за
+`concession_approval_timeout_minutes`, этот запасной текст уходит клиенту
+вместо ожидания — диалог не должен стоять в тишине из-за того, что
+оператор отошёл. Посчитан заранее, а не в момент таймаута: фоновый воркер
+(`check_concession_timeouts`) тогда работает только с уже готовыми
+строками из БД, без похода к LLM внутри периодического прохода — тот же
+принцип, что у `app.ops.touch_scheduler`.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from app.agent.debounce import Debouncer
@@ -57,7 +78,15 @@ from app.channels.avito_payloads import (
 from app.db.models import SendStatus
 from app.dialog_store import HISTORY_LIMIT, DialogStore
 from app.metrics import messages_total
-from app.ops.notifications import DialogCard, dialog_keyboard, render_dialog_card
+from app.ops.notifications import (
+    ConcessionRequestCard,
+    DialogCard,
+    concession_keyboard,
+    dialog_keyboard,
+    render_concession_request,
+    render_dialog_card,
+)
+from app.ops.state import PendingReply
 
 logger = logging.getLogger("parmangal.pipeline")
 
@@ -219,7 +248,45 @@ class MessagePipeline:
             )
             return
 
-        await self._deliver(chat, result, client_text=merged_text)
+        gate = self._concession_gate(result)
+
+        # «Чистый» запасной ответ считается заранее, ещё до постановки в
+        # очередь — не в момент таймаута (см. докстринг модуля). Только для
+        # живого режима: в DRY_RUN due_at никогда не выставляется, значит
+        # авто-отправка по таймауту всё равно не сработает, а лишний вызов
+        # модели того не стоит.
+        fallback_text: Optional[str] = None
+        if gate is not None and not self.settings.dry_run:
+            fallback = await self.agent_loop.run_turn(
+                dialog_id=chat_id,
+                history=history,
+                user_text=merged_text,
+                state=concession,
+                item_id=chat.item_id,
+                item_lookup=self.store,
+                concessions_blocked=True,
+            )
+            fallback_text = fallback.text
+
+        await self._deliver(chat, result, client_text=merged_text, gate=gate, fallback_text=fallback_text)
+
+    def _concession_gate(self, result: Any) -> Optional[Any]:
+        """Первое решение за ход, которое требует одобрения — или None.
+
+        `moderation_mode="off"` отключает гейт целиком (полная автономия,
+        включая ценовые уступки). При любом другом значении — первое
+        совпадение по `ConcessionEvent.needs_operator_approval`; за ход
+        обычно один вызов `request_concession`, но если их несколько,
+        достаточно одного значимого решения, чтобы придержать весь ответ
+        целиком — частичная отправка (часть текста без одобрения, часть с)
+        технически невозможна: ответ — один текст на весь ход.
+        """
+        if self.settings.moderation_mode == "off":
+            return None
+        for event in result.concession_events:
+            if event.needs_operator_approval:
+                return event
+        return None
 
     def _advance_touch_after_reply(
         self, concession: Any, touch: TouchState, replied: bool
@@ -240,19 +307,39 @@ class MessagePipeline:
 
     # -- доставка ----------------------------------------------------------
 
-    async def _deliver(self, chat: Any, result: Any, client_text: str) -> None:
+    async def _deliver(
+        self, chat: Any, result: Any, client_text: str,
+        gate: Optional[Any] = None, fallback_text: Optional[str] = None,
+    ) -> None:
         chat_id = chat.chat_id
 
         if self.settings.dry_run:
-            await self.ops_service.queue_reply(chat_id, result.text)
-            await self.store.save_outgoing(
-                chat_id, result.text, SendStatus.dry_run, llm_meta=result.llm_meta
-            )
-            messages_total.labels(direction="outgoing", status="dry_run").inc()
-            await self._notify_operator(chat, result, client_text)
-            await self._count_agent_reply(chat_id)
+            # Мастер-рубильник: пока он включён, ВСЁ уходит на одобрение,
+            # независимо от moderation_mode — карточка только богаче для
+            # запроса на скидку, а решение о самом холде дальше не идёт.
+            if gate is not None:
+                await self._queue_concession_approval(
+                    chat, result, client_text, gate, fallback_text=None, due_at=None,
+                )
+            else:
+                await self._queue_for_moderation(chat, result, client_text)
             return
 
+        if gate is not None:
+            due_at = self.now_fn() + timedelta(
+                minutes=self.settings.concession_approval_timeout_minutes
+            )
+            await self._queue_concession_approval(
+                chat, result, client_text, gate, fallback_text=fallback_text, due_at=due_at,
+            )
+            return
+
+        if self.settings.moderation_mode == "all":
+            await self._queue_for_moderation(chat, result, client_text)
+            return
+
+        # Автономная отправка: не concessions_only-триггер, mode != all,
+        # DRY_RUN выключен — агенту не нужен человек, чтобы ответить.
         await self.delay_fn()
         try:
             await self.avito_client.send_message(chat_id, result.text)
@@ -270,8 +357,130 @@ class MessagePipeline:
         )
         messages_total.labels(direction="outgoing", status="sent").inc()
         await self._count_agent_reply(chat_id)
-        if result.escalated:
-            await self._notify_operator(chat, result, client_text)
+        # Оператор видит переписку ВСЕГДА, не только при эскалации — без
+        # кнопок одобрения (нечего одобрять, сообщение уже ушло), но с
+        # «Взять на себя»: перехватить диалог оператор должен мочь всегда.
+        # render_dialog_card/dialog_keyboard уже дают ровно это при
+        # dry_run=False — отдельная FYI-вёрстка не нужна.
+        await self._notify_operator(chat, result, client_text)
+
+    async def _queue_for_moderation(self, chat: Any, result: Any, client_text: str) -> None:
+        """Обычный холд — DRY_RUN без запроса на скидку, либо
+        moderation_mode=all на не-ценовом ходе. Без дедлайна: авто-отправки
+        по таймауту здесь нет, это не запрос на скидку."""
+        chat_id = chat.chat_id
+        await self.ops_service.queue_reply(chat_id, result.text)
+        await self.store.save_outgoing(
+            chat_id, result.text, SendStatus.dry_run, llm_meta=result.llm_meta
+        )
+        messages_total.labels(direction="outgoing", status="dry_run").inc()
+        await self._notify_operator(chat, result, client_text)
+        await self._count_agent_reply(chat_id)
+
+    async def _queue_concession_approval(
+        self, chat: Any, result: Any, client_text: str, gate: Any,
+        *, fallback_text: Optional[str], due_at: Optional[datetime],
+    ) -> None:
+        """Запрос на ценовую уступку — богатая карточка, отдельные кнопки,
+        и (в живом режиме) дедлайн с заранее посчитанным запасным ответом.
+        """
+        chat_id = chat.chat_id
+        reply = PendingReply(
+            chat_id=chat_id,
+            text=result.text,
+            created_at=self.now_fn(),
+            is_concession=True,
+            fallback_text=fallback_text,
+            due_at=due_at,
+        )
+        await self.ops_service.store.set_pending(chat_id, reply)
+        await self.store.save_outgoing(
+            chat_id, result.text, SendStatus.dry_run, llm_meta=result.llm_meta
+        )
+        messages_total.labels(direction="outgoing", status="dry_run").inc()
+
+        # «Сколько уже выдано сегодня» — ДО записи текущего решения в лог,
+        # иначе карточка сосчитала бы сама себя.
+        concessions_today = await self.store.count_concessions_today()
+        await self.store.log_concession(chat_id, gate)
+
+        decision = gate.decision
+        card = ConcessionRequestCard(
+            chat_id=chat_id,
+            client_text=client_text,
+            agent_text=result.text,
+            tier=decision.tier,
+            trigger=gate.trigger,
+            reason=decision.denial_reason or "",
+            base_price=gate.base_price,
+            final_price=decision.new_quote.total if decision.new_quote else None,
+            revenue_delta=decision.revenue_delta if decision.new_quote else None,
+            concessions_today=concessions_today,
+            provisional=decision.provisional_policy,
+        )
+        if self.ops_bot is not None and getattr(self.settings, "telegram_ops_chat_id", ""):
+            try:
+                await self.ops_bot.send_message(
+                    chat_id=self.settings.telegram_ops_chat_id,
+                    text=render_concession_request(card),
+                    reply_markup=concession_keyboard(chat_id),
+                )
+            except Exception:
+                logger.exception(
+                    "pipeline: concession card send failed", extra={"chat_id": chat_id}
+                )
+        await self._count_agent_reply(chat_id)
+
+    # -- таймаут запроса на скидку ------------------------------------------
+
+    async def check_concession_timeouts(self) -> list[str]:
+        """Один проход фонового воркера. Просроченный запрос на скидку —
+        клиенту уходит заранее посчитанный fallback_text, диалог
+        продолжается, оператор в логе видит явную пометку. Возвращает
+        chat_id всех обработанных диалогов (для теста и для лога воркера).
+        """
+        if self.settings.dry_run:
+            # Мастер-рубильник проверяется и здесь, не только при постановке
+            # в очередь — если DRY_RUN включили обратно, пока запрос ждал
+            # оператора, авто-отправка не должна проскочить между проверками.
+            return []
+
+        handled: list[str] = []
+        for pending in await self.ops_service.store.list_due_concessions(self.now_fn()):
+            if not pending.fallback_text:
+                # Не должно происходить (см. _run_turn — fallback считается
+                # заранее для каждого due_at != None), но пустая строка не
+                # повод молча зависнуть — чат остаётся в очереди до
+                # следующего прохода вместо того, чтобы тихо потерять его.
+                logger.error(
+                    "pipeline: concession timeout without a fallback_text",
+                    extra={"chat_id": pending.chat_id},
+                )
+                continue
+            try:
+                await self.avito_client.send_message(pending.chat_id, pending.fallback_text)
+            except Exception:
+                logger.exception(
+                    "pipeline: concession timeout fallback send failed",
+                    extra={"chat_id": pending.chat_id},
+                )
+                continue
+
+            await self.store.save_outgoing(
+                pending.chat_id, pending.fallback_text, SendStatus.sent,
+            )
+            messages_total.labels(direction="outgoing", status="sent").inc()
+            await self._count_agent_reply(pending.chat_id)
+            await self.ops_service.store.set_pending(pending.chat_id, None)
+            await self.ops_service.store.log_action(
+                pending.chat_id, 0, "concession_timeout", {"text": pending.fallback_text}
+            )
+            logger.info(
+                "уступка не подтверждена по таймауту",
+                extra={"chat_id": pending.chat_id},
+            )
+            handled.append(pending.chat_id)
+        return handled
 
     async def _count_agent_reply(self, chat_id: str) -> None:
         """Счётчик ответов агента растёт В ДВУХ местах, и это не дублирование.

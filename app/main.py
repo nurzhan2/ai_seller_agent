@@ -124,6 +124,24 @@ async def supervised_touch_scheduler(
         await asyncio.sleep(interval_seconds)
 
 
+async def supervised_concession_timeout_scheduler(
+    pipeline: Any,
+    *,
+    interval_seconds: int,
+) -> None:
+    """Периодический проход по просроченным запросам на скидку — тот же
+    приём изоляции сбоя, что и у `supervised_touch_scheduler`: один плохой
+    проход (БД/Авито недоступны) не должен останавливать все следующие."""
+    while True:
+        try:
+            await pipeline.check_concession_timeouts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("concession timeout scheduler: pass failed")
+        await asyncio.sleep(interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -292,8 +310,22 @@ async def lifespan(app: FastAPI):
     webhooks.configure(redis=redis_client, handler=pipeline.handle_message)
     logger.info("incoming pipeline: wired to the Avito webhook")
 
+    # Воркер таймаута запроса на скидку — отдельной задачей, не частью
+    # воркера касаний выше: разный ритм (минуты, а не полчаса-час) и разная
+    # причина существования (незабытый оператор, а не молчание клиента).
+    concession_timeout_task = asyncio.create_task(
+        supervised_concession_timeout_scheduler(
+            pipeline,
+            interval_seconds=settings.concession_timeout_scheduler_interval_seconds,
+        )
+    )
+    logger.info("concession timeout scheduler: started")
+
     yield
 
+    concession_timeout_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await concession_timeout_task
     touch_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await touch_task
