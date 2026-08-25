@@ -263,10 +263,108 @@ def test_r5_never_returns_an_already_used_tier(kb_generous, bath_quote):
 # R6 — every condition must hold
 # ==========================================================================
 
-def test_r6_slot_not_free_denies(kb, bath_quote):
+def test_r6_busy_slot_denies(kb, bath_quote):
+    """Подтверждённо ЗАНЯТ (slot_availability_known=True по умолчанию) —
+    отказ: торговаться за занятый слот нечего, клиенту нужно другое время."""
     d = decide(req(bath_quote, slot_confirmed_free=False), kb)
     assert not d.allowed
     assert "R6" in d.denial_reason
+    assert not d.requires_operator_approval
+
+
+def test_r6_unknown_slot_does_not_deny_non_price_tiers(kb, bath_quote):
+    """UNKNOWN больше не схлопывается в «занято». Неценовая ступень
+    выдаётся как обычно: она уводит клиента ОТ неизвестного слота и не
+    тратит денег, значит и одобрения не требует."""
+    d = decide(
+        req(bath_quote, slot_confirmed_free=False, slot_availability_known=False), kb
+    )
+    assert d.allowed
+    assert d.kind == "non_price"
+    assert not d.requires_operator_approval
+
+
+def test_r6_unknown_slot_sends_price_tiers_to_the_operator(kb, bath_quote):
+    """Ровно тот случай, ради которого requires_operator_approval заводился:
+    мы не знаем занятость, человек знает — пусть решает он. Отказ здесь
+    означал бы, что при пустом каталоге YCLIENTS скидка не выдаётся никогда."""
+    d = decide(
+        req(
+            bath_quote,
+            slot_confirmed_free=False,
+            slot_availability_known=False,
+            already_used_tiers=ALL_NON_PRICE,
+        ),
+        kb,
+    )
+    assert not d.allowed
+    assert d.requires_operator_approval
+    assert d.kind == "price"
+    assert "неизвестна" in d.denial_reason
+
+
+def test_r6_free_slot_with_known_occupancy_grants(kb, bath_quote):
+    """Полный путь до реальной выдачи: слот подтверждённо свободен, загрузка
+    известна и ниже порога, пол для бани в выходной подтверждён — ценовая
+    ступень ВЫДАЁТСЯ, 3 500 -> 2 500 ₽/ч, то есть 10 500 -> 7 500 ₽.
+
+    Пара к `test_r6_free_slot_passes_the_slot_check_and_stops_at_occupancy`
+    в tests/test_sql_stores.py: там показано, где путь останавливается
+    сегодня в проде (загрузка неизвестна -> оператор), здесь — что механика
+    за этой остановкой живая, а не декоративная."""
+    d = decide(
+        req(
+            bath_quote,
+            slot_confirmed_free=True,
+            slot_availability_known=True,
+            occupancy_ratio=0.2,
+            already_used_tiers=ALL_NON_PRICE,
+        ),
+        kb,
+    )
+    assert d.allowed
+    assert d.kind == "price"
+    assert d.new_quote.total == money(7500)
+    assert d.revenue_delta == money(-3000)
+    assert not d.requires_operator_approval
+
+
+def test_r6_unknown_slot_still_respects_the_touch_gate(kb, bath_quote):
+    """Проверка «слот неизвестен» стоит ПОСЛЕ R13: если ступень и так
+    закрыта по счётчику касаний, оператора незачем спрашивать — ответ
+    известен и без него."""
+    d = decide(
+        req(
+            bath_quote,
+            observed_triggers=("going_silent",),   # валидный триггер, но не price_objection
+            touch_count=0,
+            slot_confirmed_free=False,
+            slot_availability_known=False,
+            already_used_tiers=ALL_NON_PRICE,
+        ),
+        kb,
+    )
+    assert not d.allowed
+    assert not d.requires_operator_approval
+    assert "R13" in d.denial_reason
+
+
+def test_contradictory_slot_state_is_rejected():
+    """(подтверждённо свободен, но неизвестен) — невозможное состояние.
+    Два поля вместо одного значения дают шанс рассинхрона; единственная
+    защита — не дать невалидной комбинации существовать."""
+    from app.pricing.engine import PriceQuote
+
+    with pytest.raises(ValueError, match="slot_confirmed_free"):
+        ConcessionRequest(
+            dialog_id="d",
+            quote=PriceQuote(status="ok"),
+            observed_triggers=(),
+            days_until_date=1,
+            slot_confirmed_free=True,
+            slot_availability_known=False,
+            booking_date=SAT,
+        )
 
 
 def test_r6_holiday_is_derived_not_trusted(kb, bath_quote):

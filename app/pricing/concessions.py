@@ -14,7 +14,10 @@ Rules implemented (R1-R12):
         used or skipped — or once max_non_price_attempts_before_price
         real attempts have been made
     R5  one tier is granted at most once per dialog
-    R6  all conditions must hold (slot free, not a holiday, date near enough)
+    R6  all conditions must hold (not a holiday; slot not BUSY). Занятость
+        слота трёхзначна: BUSY -> отказ, FREE -> проходим дальше,
+        UNKNOWN -> неценовые ступени работают как обычно, а ценовая уходит
+        на решение оператору (см. блок «R6 (продолжение)» в `decide`)
     R7  price tiers are gated by OCCUPANCY, not by proximity of the date
         (client answer 2.1). Unknown occupancy does not forbid the
         concession — it routes the decision to a human operator.
@@ -77,9 +80,26 @@ class ConcessionRequest:
         Come from the model via the orchestrator. That is fine: they only
         OPEN a check, they never decide its outcome.
 
-    slot_confirmed_free
+    slot_confirmed_free, slot_availability_known
         MUST come from the booking provider (YCLIENTS). Never from the
         model — a hallucinated free slot would hand out real discounts.
+
+        Вместе они кодируют три состояния `AvailabilityStatus`, а не два:
+            FREE    -> (True,  True)   слот подтверждённо свободен
+            BUSY    -> (False, True)   подтверждённо занят
+            UNKNOWN -> (False, False)  провайдер не смог ответить
+
+        Разница между BUSY и UNKNOWN принципиальна и стоила проекту всей
+        механики дожима: раньше поле было одно, `bool`, и «не знаю»
+        схлопывалось в «занято» — R6 отказывал молча, ценовая уступка не
+        выдавалась НИКОГДА (каталог YCLIENTS у заказчика пуст, все зоны
+        возвращают UNKNOWN). Теперь UNKNOWN не отказ, а вопрос оператору —
+        см. `decide()`, блок «слот неизвестен».
+
+        Комбинация (True, False) — «подтверждённо свободен, но неизвестен» —
+        противоречива и отвергается в `__post_init__`: два поля вместо
+        одного значения дают возможность рассинхрона, и единственная защита
+        от неё — не дать невалидному состоянию существовать вообще.
 
     booking_date
         Comes from the orchestrator but is verified here: holiday status is
@@ -94,6 +114,11 @@ class ConcessionRequest:
     days_until_date: int
     slot_confirmed_free: bool
     booking_date: DateType
+    # True — провайдер броней дал определённый ответ (свободно ИЛИ занято).
+    # False — ответа нет (UNKNOWN). По умолчанию True: старые вызовы, где
+    # поля не было, всегда означали «знаем точно», и менять их смысл задним
+    # числом нельзя.
+    slot_availability_known: bool = True
     # Доля занятых зон на эту дату, 0.0-1.0. Источник — провайдер броней,
     # НИКОГДА не модель: выдуманная загрузка раздавала бы реальные скидки.
     # None означает «посчитать неоткуда» (в YCLIENTS сейчас 0 зон из 10) —
@@ -109,6 +134,14 @@ class ConcessionRequest:
     # policy.conditions.min_touches_before_price, если не сработал
     # price_objection.
     touch_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.slot_confirmed_free and not self.slot_availability_known:
+            raise ValueError(
+                "slot_confirmed_free=True вместе с slot_availability_known=False — "
+                "нельзя одновременно «подтверждённо свободен» и «занятость неизвестна». "
+                "FREE=(True, True), BUSY=(False, True), UNKNOWN=(False, False)."
+            )
 
 
 @dataclass(frozen=True)
@@ -419,8 +452,19 @@ def decide(req: ConcessionRequest, kb: KnowledgeBase) -> ConcessionDecision:
 
     # R6 — conditions that gate every tier. Holiday status is DERIVED here,
     # never taken from the caller.
-    if not req.slot_confirmed_free:
-        return _deny(req, "R6: слот не подтверждён свободным")
+    #
+    # ЗАНЯТО — отказ: торговаться за занятый слот бессмысленно, клиенту
+    # нужно другое время, а не скидка на несуществующую бронь (это забота
+    # инструмента check_availability, он вернёт free_slots).
+    #
+    # НЕИЗВЕСТНО — НЕ отказ. Проверка перенесена ниже, под выбор ступени:
+    # неценовые ступени («перенести на будни», «зона поменьше») уводят
+    # клиента ОТ этого слота, и его занятость для них не важна, а ценовые
+    # уходят на решение оператору. Пока эти два случая были схлопнуты в
+    # одно `if not slot_confirmed_free`, пустой каталог YCLIENTS (все зоны
+    # UNKNOWN) убивал всю лестницу целиком, а не только ценовую её часть.
+    if req.slot_availability_known and not req.slot_confirmed_free:
+        return _deny(req, "R6: слот занят — нужна не скидка, а другое время")
     if policy.conditions.get("not_holiday") and kb.catalog.constants.holidays.contains(req.booking_date):
         return _deny(req, "R6: праздничная дата (определено движком по constants.holidays)")
 
@@ -487,6 +531,27 @@ def decide(req: ConcessionRequest, kb: KnowledgeBase) -> ConcessionDecision:
                 tier=candidate.tier,
                 skipped=tuple(skipped),
             )
+
+    # R6 (продолжение) — занятость слота неизвестна.
+    #
+    # Сюда доходят только ЦЕНОВЫЕ ступени: неценовые уже выданы выше, до
+    # этой проверки, и одобрения не требуют — они не тратят деньги (то же
+    # решение, что и в MODERATION_MODE=concessions_only, см. README).
+    # Ценовая скидка на слот, который может оказаться занятым, — реальный
+    # риск, но отказ здесь означал бы, что при пустом каталоге YCLIENTS
+    # скидка не выдаётся никогда. Поэтому решает человек: он видит
+    # календарь, которого не видит провайдер.
+    #
+    # Проверка стоит ПОСЛЕ R4/R13 намеренно: если ступень и так закрыта по
+    # лестнице или по счётчику касаний, оператора незачем спрашивать —
+    # ответ уже известен без него.
+    if not req.slot_availability_known:
+        return _needs_operator(
+            req,
+            candidate,
+            "Занятость слота неизвестна (каталог YCLIENTS пуст) — нужно ваше решение по скидке",
+            skipped=tuple(skipped),
+        )
 
     # R7 — ЗАГРУЗКА, а не близость даты.
     #

@@ -399,13 +399,14 @@ async def _request_concession(store, dialog_id: str):
 
 async def test_r10_nth_concession_is_still_allowed(session_factory):
     """N-1 уступок уже выдано (другими диалогами) — N-я, для НОВОГО
-    диалога, всё ещё в пределах лимита: R10 её не блокирует.
+    диалога, всё ещё в пределах лимита: R10 её не блокирует, уступка
+    реально ВЫДАЁТСЯ.
 
-    Проверяем именно `daily_limit_exhausted`, а не `result["allowed"]` —
-    `ToolExecutor._slot_known_free()` пока жёстко возвращает False
-    (booking_provider туда не подключён, отдельный, более старый пробел),
-    поэтому реальный ToolExecutor всегда откажет на R6 ПОСЛЕ прохождения
-    R10 — это ожидаемо и не про дневной лимит, который здесь и тестируется.
+    Раньше этот тест проверял `daily_limit_exhausted` вместо
+    `result["allowed"]`, потому что `_slot_known_free()` был захардкожен в
+    False и R6 отказывал сразу после R10 — уступка не выдавалась никогда.
+    После подключения провайдера (UNKNOWN больше не «занято») ассерт
+    вернулся к тому, чем он и должен был быть.
     """
     store = SqlAlchemyDialogStore(session_factory)
     _, _ex, limit = await _request_concession(store, "d-probe")
@@ -418,7 +419,7 @@ async def test_r10_nth_concession_is_still_allowed(session_factory):
 
     decision = ex.concession_events[-1].decision
     assert decision.daily_limit_exhausted is False
-    assert result["allowed"] is False   # из-за R6 (см. докстринг), не из-за R10
+    assert result["allowed"] is True
     assert "R10" not in (decision.denial_reason or "")
 
 
@@ -443,9 +444,7 @@ async def test_r10_nplus1th_concession_is_denied(session_factory):
 
 async def test_r10_resets_the_next_day(session_factory):
     """Вчерашние `limit` уступок не должны блокировать сегодняшний запрос —
-    граница дня по Москве, реальное «вчера», а не смещение от фикстуры.
-    Про `daily_limit_exhausted`, а не `result["allowed"]` — см. докстринг
-    `test_r10_nth_concession_is_still_allowed`."""
+    граница дня по Москве, реальное «вчера», а не смещение от фикстуры."""
     store = SqlAlchemyDialogStore(session_factory)
     _, _ex, limit = await _request_concession(store, "d-probe")
 
@@ -462,7 +461,164 @@ async def test_r10_resets_the_next_day(session_factory):
 
     decision = ex.concession_events[-1].decision
     assert decision.daily_limit_exhausted is False
+    assert result["allowed"] is True
     assert "R10" not in (decision.denial_reason or "")
+
+
+# --------------------------------------------------------------------------
+# R6 — занятость слота: FREE / BUSY / UNKNOWN через живой ToolExecutor
+#
+# Провайдер броней здесь фейковый (сеть в тестах не нужна и вредна), а вот
+# счётчик уступок и запись решений — настоящий Postgres: проверяется, что
+# весь путь «провайдер -> ToolExecutor -> decide -> ConcessionLog» сходится,
+# а не только логика движка в отрыве от хранилища.
+# --------------------------------------------------------------------------
+
+class _FakeBookingProvider:
+    """Отдаёт заранее заданный статус. `calls` — чтобы проверить кеш."""
+
+    def __init__(self, status):
+        self.status = status
+        self.calls: list[dict] = []
+
+    async def check_availability(self, zone_id, date, start_time=None, hours=None):
+        from app.booking.base import Availability
+
+        self.calls.append({"zone_id": zone_id, "date": date, "start_time": start_time, "hours": hours})
+        return Availability(status=self.status, reason="каталог пуст")
+
+
+async def _concession_with_provider(store, dialog_id, provider, *, zone="bath_russian"):
+    from app.agent.tools import ToolExecutor
+    from app.kb.loader import load_catalog
+
+    kb = load_catalog()
+    ex = ToolExecutor(
+        kb, dialog_id,
+        booking_provider=provider,
+        concessions_today_provider=store.count_concessions_today,
+    )
+    await ex.run("calculate_price", {**_CALCULATE_PRICE_ARGS, "zone_id": zone})
+    # Неценовые ступени уже израсходованы — интересует именно ЦЕНОВАЯ, ради
+    # которой всё это и делалось.
+    ex.state = DialogConcessionState(base_price_quoted=True, used_tiers=frozenset({1, 2, 3, 4}))
+    result = await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+    return result, ex
+
+
+async def test_r6_unknown_availability_routes_the_price_tier_to_the_operator(session_factory):
+    """Каталог YCLIENTS пуст -> UNKNOWN. Раньше это схлопывалось в «занято»
+    и R6 отказывал молча; теперь решение уходит человеку."""
+    from app.booking.base import AvailabilityStatus
+
+    store = SqlAlchemyDialogStore(session_factory)
+    provider = _FakeBookingProvider(AvailabilityStatus.UNKNOWN)
+
+    result, ex = await _concession_with_provider(store, "d-unknown", provider)
+
+    decision = ex.concession_events[-1].decision
+    assert result["allowed"] is False
+    assert decision.requires_operator_approval is True
+    assert decision.kind == "price"
+    assert "неизвестна" in decision.denial_reason
+    # И конвейер увидит это как «нужно одобрение» (тот же предикат, что в
+    # app/pipeline.py) — иначе решение никуда бы не поехало.
+    assert ex.concession_events[-1].needs_operator_approval is True
+
+
+async def test_r6_free_slot_passes_the_slot_check_and_stops_at_occupancy(session_factory):
+    """FREE проходит R6 — и упирается в СЛЕДУЮЩЕЕ правило, R7: загрузка на
+    дату по-прежнему неизвестна, потому что `occupancy_ratio` в
+    `ToolExecutor` тоже никем не заполняется (тот же класс необорванного
+    провода, что и `_slot_known_free` до этой правки, только одним правилом
+    ниже — см. «Известные пробелы» в README).
+
+    Итог для прода при пустом каталоге YCLIENTS: ценовая уступка всегда
+    доезжает до оператора и никогда не выдаётся автоматически — это
+    безопасно и ровно та логика, ради которой заводился
+    requires_operator_approval. Проверка, что при ИЗВЕСТНОЙ загрузке
+    уступка реально выдаётся (10 500 -> 7 500 ₽), живёт на уровне движка:
+    tests/test_concessions.py::test_r6_free_slot_with_known_occupancy_grants.
+
+    Главное, что фиксирует этот тест: отказ БОЛЬШЕ НЕ на R6 и не молчаливый.
+    """
+    from app.booking.base import AvailabilityStatus
+
+    store = SqlAlchemyDialogStore(session_factory)
+    provider = _FakeBookingProvider(AvailabilityStatus.FREE)
+
+    result, ex = await _concession_with_provider(store, "d-free", provider)
+
+    decision = ex.concession_events[-1].decision
+    assert result["allowed"] is False
+    assert decision.requires_operator_approval is True     # к человеку, не отказ
+    assert decision.kind == "price"
+    assert "Загрузка" in decision.denial_reason            # R7, не R6
+    assert "слот занят" not in (decision.denial_reason or "")
+
+
+async def test_r6_busy_slot_denies_without_bothering_the_operator(session_factory):
+    """BUSY — отказ, и НЕ на согласование: занятый слот не предмет торга,
+    клиенту нужно другое время."""
+    from app.booking.base import AvailabilityStatus
+
+    store = SqlAlchemyDialogStore(session_factory)
+    provider = _FakeBookingProvider(AvailabilityStatus.BUSY)
+
+    result, ex = await _concession_with_provider(store, "d-busy", provider)
+
+    decision = ex.concession_events[-1].decision
+    assert result["allowed"] is False
+    assert decision.requires_operator_approval is False
+    assert "занят" in decision.denial_reason
+    assert ex.concession_events[-1].needs_operator_approval is False
+
+
+async def test_availability_is_asked_once_per_slot_within_a_turn(session_factory):
+    """check_availability и проверка слота при уступке спрашивают про ОДИН
+    слот — второй сетевой запрос не нужен и опасен: провайдер мог бы
+    ответить иначе, и агент принял бы два решения на разных данных."""
+    from app.agent.tools import ToolExecutor
+    from app.booking.base import AvailabilityStatus
+    from app.kb.loader import load_catalog
+
+    store = SqlAlchemyDialogStore(session_factory)
+    provider = _FakeBookingProvider(AvailabilityStatus.FREE)
+    kb = load_catalog()
+    ex = ToolExecutor(kb, "d-cache", booking_provider=provider,
+                      concessions_today_provider=store.count_concessions_today)
+
+    await ex.run("calculate_price", _CALCULATE_PRICE_ARGS)
+    await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-07-18",
+                                        "start_time": "14:00", "hours": 3})
+    ex.state = DialogConcessionState(base_price_quoted=True, used_tiers=frozenset({1, 2, 3, 4}))
+    await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+
+    assert len(provider.calls) == 1
+
+
+async def test_provider_failure_is_unknown_not_a_crash(session_factory):
+    """Сбой YCLIENTS не должен ронять ход агента: «не знаю» — законный
+    ответ, и он уводит решение к оператору, а не наружу исключением."""
+    from app.agent.tools import ToolExecutor
+    from app.kb.loader import load_catalog
+
+    class _Broken:
+        async def check_availability(self, **kw):
+            raise RuntimeError("YCLIENTS 503")
+
+    store = SqlAlchemyDialogStore(session_factory)
+    kb = load_catalog()
+    ex = ToolExecutor(kb, "d-broken", booking_provider=_Broken(),
+                      concessions_today_provider=store.count_concessions_today)
+    await ex.run("calculate_price", _CALCULATE_PRICE_ARGS)
+    ex.state = DialogConcessionState(base_price_quoted=True, used_tiers=frozenset({1, 2, 3, 4}))
+
+    result = await ex.run("request_concession", {"observed_triggers": ["price_objection"]})
+
+    decision = ex.concession_events[-1].decision
+    assert result["allowed"] is False
+    assert decision.requires_operator_approval is True
 
 
 # ==========================================================================

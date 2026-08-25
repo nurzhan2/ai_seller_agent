@@ -351,6 +351,14 @@ class ToolExecutor:
         # не календарь), но нужна движку уступок — он сам проверяет по ней
         # праздник, а не верит булеву флагу от вызывающего кода.
         self.last_booking_date: Optional[DateType] = None
+        self.last_start_time: Optional[TimeType] = None
+        self.last_hours: Optional[int] = None
+        # Кеш ответов провайдера за один ход: (zone, date, start, hours) ->
+        # Availability. `check_availability` и проверка слота при уступке
+        # спрашивают ПРО ОДИН И ТОТ ЖЕ слот в одном ходу — второй сетевой
+        # запрос к YCLIENTS не нужен и, что важнее, мог бы вернуть другой
+        # ответ, и агент принял бы два решения на разных данных.
+        self._availability_cache: dict[tuple, Any] = {}
         self.granted_offer_templates: list[str] = []
         # Каждое решение decide() за ход — не только выданные. Нужно
         # конвейеру, чтобы решить, требует ли ход одобрения оператора
@@ -430,6 +438,12 @@ class ToolExecutor:
         final = apply_dialog_floor(raw, self.state)
         self.last_quote = final
         self.last_booking_date = date_value
+        # Время и длительность не входят в PriceQuote (котировка описывает
+        # стоимость, а не календарь), но нужны для проверки занятости слота
+        # в `_slot_availability` — спрашивать провайдера про зону и дату без
+        # времени значит спрашивать не про тот слот, который считали.
+        self.last_start_time = request.start_time
+        self.last_hours = request.hours
 
         if final.status == "ok":
             # Регламент Максима: «первое касание — называем цену». Считается
@@ -485,13 +499,15 @@ class ToolExecutor:
         concessions_today = 0
         if self.concessions_today_provider is not None:
             concessions_today = await self.concessions_today_provider()
+        slot_free, slot_known = await self._slot_availability()
         request = ConcessionRequest(
             dialog_id=self.dialog_id,
             quote=self.last_quote,
             observed_triggers=observed_triggers,
             client_constraints=frozenset(args.get("client_constraints") or ()),
             days_until_date=self._days_until(),
-            slot_confirmed_free=self._slot_known_free(),
+            slot_confirmed_free=slot_free,
+            slot_availability_known=slot_known,
             already_used_tiers=tuple(sorted(self.state.used_tiers)),
             concessions_today=concessions_today,
             base_price_quoted=self.state.base_price_quoted,
@@ -554,10 +570,69 @@ class ToolExecutor:
             return 999
         return max((self.last_booking_date - DateType.today()).days, 0)
 
-    def _slot_known_free(self) -> bool:
-        # Занятость подтверждает провайдер броней, а не модель. Пока провайдера
-        # нет (промт №8), считаем неподтверждённым — уступка не выдаётся.
-        return False
+    async def _availability_for(
+        self, zone_id: str, date_value: DateType,
+        start_time: Optional[TimeType], hours: Optional[int],
+    ):
+        """Ответ провайдера про КОНКРЕТНЫЙ слот, с кешем на один ход.
+
+        Возвращает `Availability` или None, если провайдера нет. Сбой
+        провайдера — это UNKNOWN, а не исключение наружу: инструмент,
+        падающий из-за недоступности YCLIENTS, останавливает весь ход
+        агента, а «не знаю» — законный ответ (см. app/booking/base.py).
+        """
+        from app.booking.base import Availability, AvailabilityStatus
+
+        if self.booking_provider is None:
+            return None
+
+        key = (zone_id, date_value, start_time, hours)
+        if key in self._availability_cache:
+            return self._availability_cache[key]
+
+        try:
+            availability = await self.booking_provider.check_availability(
+                zone_id=zone_id, date=date_value, start_time=start_time, hours=hours,
+            )
+        except Exception:
+            logger.exception(
+                "booking provider failed, treating the slot as unknown",
+                extra={"zone_id": zone_id, "date": str(date_value)},
+            )
+            availability = Availability(
+                status=AvailabilityStatus.UNKNOWN, reason="провайдер недоступен"
+            )
+
+        self._availability_cache[key] = availability
+        return availability
+
+    async def _slot_availability(self) -> tuple[bool, bool]:
+        """(slot_confirmed_free, slot_availability_known) для движка уступок.
+
+        Три состояния провайдера раскладываются в два флага так, как их
+        ждёт `ConcessionRequest` (см. его докстринг):
+            FREE    -> (True,  True)
+            BUSY    -> (False, True)
+            UNKNOWN -> (False, False)
+
+        Отсутствие провайдера И отсутствие даты — тоже UNKNOWN, а не
+        «занято»: раньше этот метод был захардкожен в False, что означало
+        «подтверждённо занято», и R6 отказывал раньше всех остальных
+        правил — ценовая уступка не выдавалась НИКОГДА, при том что вся
+        механика вокруг выглядела рабочей.
+        """
+        if self.last_quote is None or self.last_booking_date is None:
+            return False, False
+
+        availability = await self._availability_for(
+            self.last_quote.zone_id or "",
+            self.last_booking_date,
+            self.last_start_time,
+            self.last_hours,
+        )
+        if availability is None or not availability.is_known:
+            return False, False
+        return availability.status.value == "free", True
 
     # -- занятость ----------------------------------------------------------
 
@@ -576,12 +651,17 @@ class ToolExecutor:
         if booking_date is None:
             return {"status": "needs_input", "missing_fields": ["date"]}
 
-        availability = await self.booking_provider.check_availability(
-            zone_id=args.get("zone_id", ""),
-            date=booking_date,
-            start_time=_parse_time(args.get("start_time")),
-            hours=args.get("hours"),
+        # Через тот же кеш, что и проверка слота при уступке: один ход —
+        # один ответ провайдера про один слот, иначе агент мог бы сказать
+        # клиенту «свободно» и тут же выдать скидку по ответу «занято».
+        availability = await self._availability_for(
+            args.get("zone_id", ""),
+            booking_date,
+            _parse_time(args.get("start_time")),
+            args.get("hours"),
         )
+        if availability is None:
+            return unknown
         if not availability.is_known:
             return {**unknown, "reason": availability.reason}
         if availability.status.value == "busy":
