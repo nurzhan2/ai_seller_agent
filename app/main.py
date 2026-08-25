@@ -25,7 +25,7 @@ from app.metrics import dry_run_gauge, render_metrics
 from app.ops.bot import OpsService
 from app.ops.handlers import build_dispatcher
 from app.ops.notifications import DialogCard, dialog_keyboard, render_dialog_card
-from app.ops.state import InMemoryOpsStore
+from app.ops.state import SqlAlchemyOpsStore
 from app.ops.touch_scheduler import SqlAlchemyTouchStore, run_scheduler_pass
 
 logger = logging.getLogger("parmangal")
@@ -189,15 +189,32 @@ async def lifespan(app: FastAPI):
     )
     app.state.booking_provider = booking_provider
 
+    # Источники данных для админки. Страницы /admin/dialogs, /admin/leads,
+    # /admin/concessions и /admin/costs написаны против этих интерфейсов, но
+    # до сих пор ни одна реализация в app.state не клалась — страницы честно
+    # писали «источник не подключён», пока показывать действительно было
+    # нечего. С появлением конвейера надпись стала враньём: данные в БД есть.
+    # Тот же get_sessionmaker(), что и у конвейера, — одна база, один
+    # источник правды, никаких расхождений «пишем сюда, читаем оттуда».
+    from app.admin.queries import SqlAlchemyAdminQueries
+
+    admin_queries = SqlAlchemyAdminQueries(get_sessionmaker())
+    app.state.dialog_provider = admin_queries
+    app.state.lead_provider = admin_queries
+    app.state.concession_provider = admin_queries
+    app.state.cost_provider = admin_queries
+
     # Телеграм-бот оператора — фоновая asyncio-задача в этом же процессе, а
     # не отдельный сервис Railway (второй контейнер — лишние деньги, промт
-    # №13, 3.5). InMemoryOpsStore: состояние модерации (кто что одобрил,
-    # какие чаты у оператора) не переживает перезапуск процесса — известное
-    # ограничение, БД-реализация OpsStore не входит в этот промт.
+    # №13, 3.5). SqlAlchemyOpsStore: состояние модерации (кто что одобрил,
+    # какие чаты у оператора, что ждёт кнопки) живёт в БД и переживает
+    # рестарт контейнера. Раньше здесь стоял InMemoryOpsStore, и каждый
+    # редеплой на Railway молча терял очередь модерации вместе с процессом —
+    # клиент при этом уже написал и ждал ответа, который для него готовили.
     # ops_service заводится всегда (не только при наличии токена бота) — он
     # же нужен воркеру отложенных касаний ниже для очереди на одобрение в
     # DRY_RUN, независимо от того, есть ли кому её показать в Telegram.
-    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    ops_service = OpsService(store=SqlAlchemyOpsStore(get_sessionmaker()), settings=settings)
     app.state.ops_service = ops_service
 
     bot_task: asyncio.Task | None = None
@@ -206,7 +223,12 @@ async def lifespan(app: FastAPI):
         from aiogram import Bot
 
         ops_bot = Bot(token=settings.telegram_bot_token.get_secret_value())
-        dispatcher = build_dispatcher(ops_service)
+        # /stats теперь тоже с данными: до этого stats_provider не
+        # передавался и команда отвечала «Статистика пока недоступна».
+        dispatcher = build_dispatcher(
+            ops_service,
+            stats_provider=lambda: admin_queries.stats(ops_service.store),
+        )
         bot_task = asyncio.create_task(supervised_bot_polling(dispatcher, ops_bot))
         logger.info("telegram operator bot: polling started")
     else:

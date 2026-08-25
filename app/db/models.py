@@ -247,6 +247,36 @@ class Lead(Base):
     )
 
 
+class PendingReplyRow(Base):
+    """Ответ агента, ждущий кнопки оператора в DRY_RUN.
+
+    В БД, а не в памяти процесса: до этого очередь модерации жила в
+    `InMemoryOpsStore`, и рестарт контейнера (любой редеплой на Railway)
+    молча терял всё, что оператор не успел одобрить. Клиент при этом уже
+    написал и ждёт — а ответ, который для него подготовили, исчезал вместе
+    с процессом.
+
+    Одна ожидающая реплика на чат — `chat_id` уникален. Это ровно та
+    семантика, что была у словаря: новый ответ агента вытесняет
+    неодобренный предыдущий, потому что отвечать на позавчерашнюю реплику
+    клиента уже поздно.
+    """
+
+    __tablename__ = "pending_replies"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    text: Mapped[str] = mapped_column(Text)
+    # pending | approved | rejected | edited — строкой, а не Enum: статусы
+    # модерации живут в app/ops/state.py и меняются чаще, чем стоит платить
+    # миграцией за каждое новое значение.
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    decided_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class OperatorAction(Base):
     """Audit trail for the Telegram controls (prompt 6 uses this)."""
 

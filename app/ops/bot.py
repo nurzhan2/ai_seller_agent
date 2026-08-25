@@ -129,9 +129,17 @@ class OpsService:
         return {"sent": True, "message": "Ваш текст отправлен"}
 
     def _count(self, key: str) -> None:
-        store = self.store
-        if isinstance(store, InMemoryOpsStore):
-            store.moderation[key] = store.moderation.get(key, 0) + 1
+        """Счётчик модерации — по утиному типу, а не по `isinstance`.
+
+        Раньше здесь стояла проверка `isinstance(store, InMemoryOpsStore)`, и
+        любая другая реализация стора молча переставала считать одобрения:
+        метрика, по которой принимается решение выключить модерацию
+        (90% чистых одобрений три дня подряд, docs/GO_LIVE.md), обнулилась бы
+        незаметно ровно в тот момент, когда мы перешли на БД.
+        """
+        bump = getattr(self.store, "bump_moderation", None)
+        if bump is not None:
+            bump(key)
 
     # -- рубильник ---------------------------------------------------------
 

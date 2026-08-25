@@ -178,3 +178,63 @@ async def test_supervised_scheduler_propagates_cancellation():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# --------------------------------------------------------------------------
+# Проводка lifespan: что именно попадает в app.state
+# --------------------------------------------------------------------------
+#
+# Эти тесты существуют из-за конкретного бага. Страница /admin/dialogs
+# месяцами показывала «Источник диалогов не подключён», хотя конвейер писал
+# Chat/Message в базу: маршруты читают request.app.state.dialog_provider, а
+# в lifespan его никто не клал. Тесты админки при этом были зелёные — они
+# собирают собственное голое FastAPI-приложение и подставляют фейки, то есть
+# настоящую проводку не трогают вовсе. Поэтому проверка именно тут: поднять
+# РЕАЛЬНОЕ приложение и посмотреть, что оказалось в state.
+
+def _real_app_state():
+    """Поднимает настоящее приложение через его lifespan и отдаёт state.
+
+    Без работающих БД и Redis: lifespan к этому готов (zone_mapping.load()
+    обёрнут в try/except, redis-клиент подключается лениво), и падать здесь
+    нечему — это же свойство проверяется соседними тестами устойчивости.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    app = create_app()
+    with TestClient(app):
+        return app.state
+
+
+def test_lifespan_wires_all_four_admin_providers():
+    """Ровно тот баг: без этих четырёх строк админка показывает
+    «источник не подключён» на данных, которые уже лежат в базе."""
+    from app.admin.queries import SqlAlchemyAdminQueries
+
+    state = _real_app_state()
+
+    for name in ("dialog_provider", "lead_provider", "concession_provider", "cost_provider"):
+        provider = getattr(state, name, None)
+        assert provider is not None, f"app.state.{name} не выставлен — страница админки будет пустой"
+        assert isinstance(provider, SqlAlchemyAdminQueries)
+
+
+def test_lifespan_uses_the_database_backed_ops_store():
+    """Состояние модерации обязано переживать рестарт контейнера: на
+    InMemoryOpsStore каждый редеплой Railway молча терял очередь одобрений."""
+    from app.ops.state import SqlAlchemyOpsStore
+
+    state = _real_app_state()
+
+    assert isinstance(state.ops_service.store, SqlAlchemyOpsStore)
+
+
+def test_lifespan_wires_the_incoming_pipeline_to_the_webhook():
+    """handler=None означает, что вебхук принимает сообщения и молчит."""
+    from app import webhooks
+
+    _real_app_state()
+
+    assert webhooks._handler is not None

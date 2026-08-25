@@ -41,6 +41,7 @@ EXPECTED_TABLES = {
     "zone_service_map",
     "dialog_states",
     "messages",
+    "pending_replies",
 }
 EXPECTED_ENUM_TYPES = {"chat_state", "direction", "author", "send_status"}
 
