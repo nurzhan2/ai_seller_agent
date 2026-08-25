@@ -41,6 +41,13 @@ class Service:
     service_id: str
     title: str
     duration_seconds: Optional[int] = None
+    # НЕ подтверждено заказчиком (в отличие от base_url/заголовков/конверта
+    # в app/booking/yclients_endpoints.py) — только общепринятые для
+    # /book_services поля YCLIENTS. Optional и заполняются защитно
+    # (см. YClientsProvider.get_services): если реальный ответ называет их
+    # иначе, поля просто останутся None, а не подставят чужое число.
+    price_min: Optional[int] = None
+    price_max: Optional[int] = None
 
 
 @dataclass(frozen=True)

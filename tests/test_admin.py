@@ -102,6 +102,44 @@ def test_booking_page_reports_empty_catalog_honestly(settings, kb):
     assert "нет" in html
 
 
+def test_booking_page_does_not_call_it_catalog_coverage(settings, kb):
+    """«Покрытие каталога 0%» читалось как «у заказчика пуст каталог
+    YCLIENTS» — ошибка диагностики, из-за которой пустой zone_service_map
+    (наша связка) путали с пустым каталогом услуг заказчика. Старая
+    формулировка не должна вернуться."""
+    client = make_client(settings, kb)
+    html = client.get("/admin/booking", headers=auth_header()).text
+    assert "Покрытие каталога" not in html
+    assert "связанные с услугами YCLIENTS" in html
+
+
+def test_booking_page_shows_yclients_service_count_separately(settings, kb):
+    """Отдельная строка «сколько услуг видно в YCLIENTS» — чтобы отличить
+    «у заказчика пусто» от «мы просто не связали»."""
+
+    class _FakeProvider:
+        async def get_services(self):
+            return [object(), object(), object()]
+
+    app = FastAPI()
+    app.include_router(admin_router)
+    app.state.kb = kb
+    app.state.zone_mapping = InMemoryZoneMapping()
+    app.state.booking_provider = _FakeProvider()
+    admin_routes.get_settings = lambda: settings
+    client = TestClient(app)
+
+    html = client.get("/admin/booking", headers=auth_header()).text
+    assert "Услуг видно в YCLIENTS" in html
+    assert "3" in html
+
+
+def test_booking_page_without_provider_says_not_connected(settings, kb):
+    client = make_client(settings, kb)
+    html = client.get("/admin/booking", headers=auth_header()).text
+    assert "не подключена" in html
+
+
 def test_prompt_page_renders_system_prompt(settings, kb):
     client = make_client(settings, kb)
     html = client.get("/admin/prompt", headers=auth_header()).text

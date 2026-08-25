@@ -126,6 +126,11 @@ class YClientsProvider:
                 service_id=str(item.get("id")),
                 title=str(item.get("title", "")),
                 duration_seconds=item.get("seance_length"),
+                # price_min/price_max — не подтверждены заказчиком (см.
+                # Service). Читаем защитно: отсутствие поля не должно
+                # уронить список услуг целиком.
+                price_min=item.get("price_min"),
+                price_max=item.get("price_max"),
             )
             for item in data
         ]

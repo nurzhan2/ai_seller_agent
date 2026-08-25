@@ -214,9 +214,22 @@ async def booking(request: Request, _: str = Depends(require_admin)) -> HTMLResp
     mapping = getattr(request.app.state, "zone_mapping", None) or InMemoryZoneMapping()
     report = coverage_report(mapping, [z.id for z in kb.catalog.zones])
 
+    provider = getattr(request.app.state, "booking_provider", None)
+    services_count = len(await provider.get_services()) if provider is not None else None
+
+    # «Покрытие каталога» вводило в заблуждение: 0% читалось как «у
+    # заказчика пуст каталог YCLIENTS», хотя пустая связка — это только
+    # zone_service_map (наша сторона), а не сам каталог услуг заказчика.
+    # Показываем обе цифры отдельно, чтобы это было видно на глаз.
+    if services_count is None:
+        services_line = "<p class='note'>система бронирования не подключена — сколько услуг в YCLIENTS, неизвестно</p>"
+    else:
+        services_line = f"<p>Услуг видно в YCLIENTS: <b>{services_count}</b></p>"
+
     body = [
         f"<p class='note'>{report['note']}</p>",
-        f"<p>Покрытие каталога: <b>{report['coverage']:.0%}</b> "
+        services_line,
+        f"<p>Зоны, связанные с услугами YCLIENTS: <b>{report['coverage']:.0%}</b> "
         f"({len(report['mapped'])} из {report['total_zones']})</p>",
         "<table><tr><th>зона</th><th>заведена в YCLIENTS</th></tr>",
     ]
