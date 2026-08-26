@@ -63,14 +63,64 @@ _FILTER = SecretRedactingFilter()
 # Логгеры, которые печатают URL целиком.
 _RISKY_LOGGERS = ("httpx", "httpcore", "urllib3")
 
+# Атрибуты, которые `LogRecord` несёт всегда, независимо от `extra=`.
+# Строится динамически (не хардкодом списка), чтобы не разъехаться с
+# версией Python — например, `taskName` появился в стандартном наборе
+# только в 3.12. `message`/`asctime` добавляет сам `Formatter.format()`
+# по ходу форматирования, их тоже нужно исключить из "лишних" полей.
+_STANDARD_RECORD_ATTRS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()
+) | {"message", "asctime"}
+
+
+class ExtraFieldsFormatter(logging.Formatter):
+    """Дописывает поля из `extra={...}` в конец строки лога.
+
+    ПОЧЕМУ ЭТО СУЩЕСТВУЕТ. `extra={"chat_id": ...}` используется по всему
+    проекту (app/pipeline.py и далее) как единственный способ привязать
+    диагностику к записи. `logging.basicConfig()` со стандартным форматом
+    эти поля не печатает вообще: они оседают в `record.__dict__`, но в
+    ТЕКСТОВОМ выводе — а значит и в логах Railway — их не видно. Дало
+    реальный сбой: диагностика "pipeline: message without text" писала
+    chat_id/type/top_level_keys в extra и на проде выглядела как голая
+    строка без единого значения — как если бы её не было вовсе.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extras = {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _STANDARD_RECORD_ATTRS
+        }
+        if not extras:
+            return base
+        rendered = " ".join(f"{key}={value}" for key, value in sorted(extras.items()))
+        return f"{base} | {rendered}"
+
+
+LOG_FORMAT = "%(levelname)s:%(name)s:%(message)s"
+
 
 def configure_logging(level: int = logging.INFO) -> None:
-    """Ставится один раз на старте приложения."""
-    logging.basicConfig(level=level)
+    """Ставится один раз на старте приложения.
+
+    Настраивает root-логгер напрямую (не `logging.basicConfig`), чтобы
+    `ExtraFieldsFormatter` гарантированно применился: `basicConfig` молча
+    не делает ничего, если у root-логгера уже есть хендлеры (например, от
+    более раннего вызова в том же процессе или от чужого кода, поднявшего
+    логирование первым) — а нам нужен именно наш форматтер, а не «какой
+    получится».
+    """
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(ExtraFieldsFormatter(LOG_FORMAT))
+    root = logging.getLogger()
+    root.handlers = [stream_handler]
+    root.setLevel(level)
     for name in _RISKY_LOGGERS:
         logging.getLogger(name).addFilter(_FILTER)
-    for handler in logging.getLogger().handlers:
-        handler.addFilter(_FILTER)
+    for h in root.handlers:
+        h.addFilter(_FILTER)
 
 
 @contextmanager
