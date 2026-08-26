@@ -146,11 +146,11 @@ async def test_success_false_envelope_becomes_unknown(mapping, verified):
     assert (await provider.get_free_slots("bath_russian", DAY)).status is AvailabilityStatus.UNKNOWN
 
 
-@pytest.mark.parametrize("status", ep.INTEGRATION_NOT_CONNECTED_STATUSES)
+@pytest.mark.parametrize("status", ep.ACCESS_DENIED_STATUSES)
 @respx.mock
-async def test_integration_not_connected_becomes_unknown(mapping, verified, status):
-    """Токены валидны по формату, но филиал не нажал «Подключить» в
-    личном кабинете YCLIENTS — деградирует так же, как любой другой сбой."""
+async def test_access_denied_becomes_unknown(mapping, verified, status):
+    """401/403 — филиал не подключил интеграцию ИЛИ токену не хватает прав
+    на этот метод; в обоих случаях деградирует так же, как любой сбой."""
     respx.get(times_url()).mock(return_value=httpx.Response(status))
     provider = YClientsProvider(mapping=mapping, company_id="1")
     result = await provider.get_free_slots("bath_russian", DAY)
@@ -158,14 +158,17 @@ async def test_integration_not_connected_becomes_unknown(mapping, verified, stat
 
 
 @respx.mock
-async def test_integration_not_connected_logs_a_distinct_message(mapping, verified, caplog):
-    """Дежурный должен сразу понимать по логу, что чинить нужно подключение
-    интеграции у заказчика, а не искать баг в коде."""
+async def test_access_denied_logs_a_distinct_message_without_overclaiming_cause(mapping, verified, caplog):
+    """Разведка (scripts/inspect_yclients.py) нашла 403 на части методов при
+    200 на соседних того же токена — «интеграция не подключена» была бы
+    ложью в такой ситуации. Лог обязан называть ОБЕ возможные причины, а не
+    только первую, и не деградировать до общего «request failed»."""
     respx.get(times_url()).mock(return_value=httpx.Response(403))
     provider = YClientsProvider(mapping=mapping, company_id="1")
     with caplog.at_level("WARNING", logger="parmangal.yclients"):
         await provider.get_free_slots("bath_russian", DAY)
-    assert "не подключена филиалом" in caplog.text
+    assert "не подключил интеграцию" in caplog.text
+    assert "нет прав на этот конкретный метод" in caplog.text
     assert "request failed" not in caplog.text
 
 
@@ -302,6 +305,49 @@ async def test_get_services_is_empty_when_services_key_is_missing(mapping, verif
     provider = YClientsProvider(mapping=mapping, company_id="1")
 
     assert await provider.get_services() == []
+
+
+# --------------------------------------------------------------------------
+# Сотрудники (get_staff) — у этого заказчика сотрудник = зона комплекса.
+# Устаревший метод /staff/{company_id}, не новый /company/{id}/staff —
+# разведка нашла 200 на первом и 403 на втором для одного токена.
+# --------------------------------------------------------------------------
+
+def staff_url(company="1") -> str:
+    return ep.BASE_URL + ep.STAFF_FULL_LIST_DEPRECATED[1].format(company_id=company)
+
+
+@respx.mock
+async def test_get_staff_parses_the_flat_list(mapping, verified):
+    respx.get(staff_url()).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [
+                    {"id": 100, "name": "Юрта"},
+                    {"id": 101, "name": "Шатёр"},
+                ],
+                "meta": {},
+            },
+        )
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    staff = await provider.get_staff()
+
+    assert [s.staff_id for s in staff] == ["100", "101"]
+    assert staff[0].name == "Юрта"
+
+
+@respx.mock
+async def test_get_staff_is_empty_on_403(mapping, verified):
+    """Если токену когда-нибудь не хватит прав и на этот метод — пусто, а
+    не исключение. Совпадает с общим правилом деградации YClientsProvider."""
+    respx.get(staff_url()).mock(return_value=httpx.Response(403))
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    assert await provider.get_staff() == []
 
 
 # --------------------------------------------------------------------------

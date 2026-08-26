@@ -124,13 +124,17 @@ async def test_run_check_reports_non_200_status(capsys):
 
 
 @respx.mock
-async def test_run_check_flags_integration_not_connected_status(capsys):
+async def test_run_check_flags_403_without_overclaiming_not_connected(capsys):
+    """403 может значить «не подключено» ИЛИ «токену не хватает прав именно
+    на этот метод» (разведка нашла оба случая на одном токене) — вывод
+    обязан называть обе причины, а не только первую."""
     respx.get(ep.BASE_URL + "/company/1/staff").mock(return_value=httpx.Response(403))
     async with _client() as client:
         await run_check(client, HEADERS, Check("staff", "/company/1/staff"))
 
     out = capsys.readouterr().out
-    assert "интеграция не подключена" in out
+    assert "не подключена филиалом" in out
+    assert "нет прав на этот конкретный метод" in out
 
 
 @respx.mock

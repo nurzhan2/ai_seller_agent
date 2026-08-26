@@ -170,8 +170,13 @@ async def run_check(client: httpx.AsyncClient, headers: dict[str, str], check: C
 
     print(f"код ответа: {response.status_code}")
 
-    if response.status_code in ep.INTEGRATION_NOT_CONNECTED_STATUSES:
-        print("  -> похоже на «интеграция не подключена филиалом» (см. yclients_endpoints.py)")
+    if response.status_code in ep.ACCESS_DENIED_STATUSES:
+        print(
+            "  -> 401/403: либо интеграция не подключена филиалом (тогда откажут "
+            "ВСЕ методы), либо у токена просто нет прав на этот конкретный метод "
+            "(тогда часть методов выше могла отвечать 200) — сравните с другими "
+            "проверками в этом прогоне, не считайте одну причину доказанной."
+        )
 
     try:
         payload = response.json()

@@ -51,6 +51,23 @@ class Service:
 
 
 @dataclass(frozen=True)
+class Staff:
+    """Сотрудник YCLIENTS.
+
+    У этого заказчика сотрудник — физически ЗОНА комплекса (Юрта, Шатёр,
+    Купол со стульями и т.п.), не человек: разведка через
+    scripts/inspect_yclients.py показала, что занятость зоны определяется
+    занятостью сотрудника, а не услуги. Поэтому check_availability матчит
+    zone_id именно на staff_id (см. app/booking/mapping.py:ZoneServiceMap),
+    а book_services (услуги) — это варианты брони зона×длительность×день,
+    для самой занятости не используются.
+    """
+
+    staff_id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class BookingRequest:
     zone_id: str
     date: DateType

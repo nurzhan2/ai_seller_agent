@@ -1,7 +1,11 @@
-"""Соответствие зон комплекса и услуг YCLIENTS.
+"""Соответствие зон комплекса и сотрудников/услуг YCLIENTS.
 
-Таблица правится через админку (/admin/catalog), а не в коде: каталог услуг у
-заказчика ещё наполняется, и зоны будут появляться по одной.
+Таблица правится через scripts/sync_yclients_services.py, а не в коде.
+`staff_id` — то, чем check_availability реально проверяет занятость: у
+этого заказчика сотрудник YCLIENTS физически и есть зона (Юрта, Шатёр и
+т.п.), см. app/booking/base.py:Staff. `service_id` — опционален, нужен
+позже для create_booking (варианты брони зона×длительность×день), для
+самой занятости не используется.
 
 Правило деградации: НЕТ МАППИНГА → UNKNOWN, а не падение и не догадка.
 Отсутствующая строка означает ровно «мы не знаем, занято ли», и агент обязан
@@ -54,7 +58,14 @@ class InMemoryZoneMapping:
         return None
 
     def set(self, zone_id: str, **values) -> None:
-        self.rows[zone_id] = {"enabled": True, **values}
+        """Частичное обновление — как и `SqlAlchemyZoneMapping.set()`
+        (setattr по одному полю поверх существующей строки), а не замена
+        строки целиком. Раньше эта реализация делала именно замену: второй
+        `set(zone_id, staff_id=...)` без `service_id` в kwargs стирал бы
+        service_id, заведённый первым вызовом — тот же обходимый вручную
+        сюрприз, которого scripts/sync_yclients_services.py избегает,
+        передавая в kwargs только реально введённые оператором поля."""
+        self.rows[zone_id] = {"enabled": True, **self.rows.get(zone_id, {}), **values}
 
     def mapped_zones(self) -> list[str]:
         return sorted(z for z, r in self.rows.items() if r.get("enabled", True))

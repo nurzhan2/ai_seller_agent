@@ -39,7 +39,8 @@ scripts/          replay.py (--provider), compare_providers.py,
                   register_webhook.py, rotate_avito_keys.py,
                   import_photos.py, export_listings.py,
                   unpack_google_drive_photos.py, anonymize_dialogs.py,
-                  sync_yclients_services.py (связка zone_id <-> service_id),
+                  sync_yclients_services.py (связка zone_id <-> staff_id — у
+                  заказчика сотрудник YCLIENTS физически и есть зона),
                   inspect_yclients.py (только чтение — что реально есть в YCLIENTS)
 railway.toml      сборка на Railway (см. docs/RAILWAY_SETUP.md)
 entrypoint.sh     точка входа контейнера: alembic upgrade head, потом uvicorn

@@ -1,34 +1,41 @@
-"""Связать наши зоны с услугами YCLIENTS — сопоставление названий, вручную.
+"""Связать наши зоны с сотрудниками YCLIENTS — сопоставление названий, вручную.
 
     python -m scripts.sync_yclients_services              # только показать
     python -m scripts.sync_yclients_services --apply       # показать, спросить, записать подтверждённое
 
-ПОЧЕМУ ЭТОТ СКРИПТ СУЩЕСТВУЕТ. Раньше пустой `zone_service_map` читался в
-`/admin/booking` как «каталог услуг у заказчика пуст». Это была ошибка
-диагностики: заказчик подтвердил, что услуги в YCLIENTS заведены. Пустая
-таблица здесь означает только то, что МЫ их не связали с нашими zone_id —
-общего идентификатора между двумя каталогами нет, связать их может только
-человек, сверив названия глазами.
+ПОЧЕМУ СТАФФ, А НЕ УСЛУГА. Первая версия этого скрипта сопоставляла зону с
+service_id — казалось логичным: зона это то, что бронируют, а book_services
+это список того, что можно забронировать. Разведка через
+scripts/inspect_yclients.py показала обратное устройство кабинета заказчика:
 
-ПОЧЕМУ СОПОСТАВЛЕНИЕ НЕ ПРИМЕНЯЕТСЯ МОЛЧА. Названия в YCLIENTS почти
-наверняка сформулированы иначе, чем в нашем каталоге («Баня «Русский
-стиль»» у нас против, например, «русская баня» у заказчика) — точное
-совпадение бесполезно, а порог схожести всегда может ошибиться. Неверная
-связка — не косметическая проблема: `check_availability` начнёт проверять
-занятость ЧУЖОЙ зоны, и агент скажет клиенту, что время свободно, когда на
-самом деле занята другая баня, а выбранная клиентом просто ни разу не
-проверялась. Поэтому каждая пара подтверждается человеком по отдельности,
-и без --apply скрипт вообще ничего не пишет.
+  * staff (9 объектов) — это и есть ЗОНЫ комплекса (Юрта, Шатёр, Купол со
+    стульями и т.д.). Занятость зоны в YCLIENTS определяется занятостью
+    СОТРУДНИКА — book_times спрашивает про staff_id, не про service_id
+    (см. app/booking/yclients.py:get_free_slots, BOOK_TIMES).
+  * book_services (35 объектов) — это варианты брони: зона × длительность ×
+    тип дня («Баня Гараж на 3 часа в будние дни»). Для проверки занятости
+    не нужны вообще; понадобятся позже, при создании самой брони
+    (create_booking шлёт services=[...] — см. app/booking/yclients.py).
 
-staff_id/company_id — тоже НЕ автоматически. У YCLIENTS нет эндпоинта
-списка сотрудников/ресурсов в утверждённой спецификации
-(app/booking/yclients_endpoints.py) — их можно только ввести вручную,
-посмотрев в личном кабинете YCLIENTS. Без staff_id `get_free_slots` уйдёт
-на служебный `staff_id="0"` (см. app/booking/yclients.py) — скорее всего
-не тот ресурс, поэтому шаг 4 (проверка check_availability сразу после
-записи) существует не для галочки: если он вернул не FREE/BUSY, а
-UNKNOWN — staff_id почти наверняка не тот или пуст, чинить нужно СЕЙЧАС,
-а не после жалобы живого клиента.
+Поэтому связка зона -> staff_id — это то, что делает работать
+check_availability. service_id в zone_service_map по-прежнему можно
+указать (используется потом при бронировании), но матчится и подтверждается
+здесь только staff_id: 35 услуг на 9-10 зон не сопоставляются 1:1
+автоматически, это трёхмерная задача (зона, длительность, день), а не
+задача этого скрипта.
+
+Зон у нас 10, сотрудников у заказчика 9 — какая-то зона гарантированно
+останется без пары, скрипт обязан явно её показать, а не смолчать.
+
+ПОЧЕМУ СОПОСТАВЛЕНИЕ НЕ ПРИМЕНЯЕТСЯ МОЛЧА. Имена сотрудников в YCLIENTS
+почти наверняка сформулированы иначе, чем в нашем каталоге, а порог
+схожести всегда может ошибиться. Неверная связка — не косметическая
+проблема: check_availability начнёт проверять занятость ЧУЖОЙ зоны, и агент
+скажет клиенту, что время свободно, когда на самом деле занята другая баня.
+Поэтому каждая пара подтверждается человеком по отдельности, и без --apply
+скрипт вообще ничего не пишет. Отдельная проверка (см.
+_find_duplicate_staff_assignments) ловит ещё более опасный случай — один и
+тот же сотрудник предложен сразу для двух разных зон.
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ from dataclasses import dataclass
 from datetime import date as DateType, timedelta
 from typing import Optional
 
-from app.booking.base import Service
+from app.booking.base import Service, Staff
 from app.booking.mapping import SqlAlchemyZoneMapping
 from app.booking.yclients import YClientsProvider
 from app.config import get_settings
@@ -91,46 +98,62 @@ def _similarity(a: str, b: str) -> float:
 
 @dataclass(frozen=True)
 class Candidate:
-    service: Service
+    staff: Staff
     score: float
 
 
-def best_candidates(zone_names: list[str], services: list[Service], limit: int = 3) -> list[Candidate]:
-    """Лучшие `limit` услуг для зоны, по максимуму схожести среди всех имён
-    зоны (name и display_name_alt — заказчик иногда называет зону иначе,
-    чем она записана у нас, см. app/kb/loader.py:Zone)."""
+def best_candidates(zone_names: list[str], staff_list: list[Staff], limit: int = 3) -> list[Candidate]:
+    """Лучшие `limit` сотрудников для зоны, по максимуму схожести среди всех
+    имён зоны (name и display_name_alt — заказчик иногда называет зону
+    иначе, чем она записана у нас, см. app/kb/loader.py:Zone)."""
     scored = [
-        Candidate(service=s, score=max(_similarity(name, s.title) for name in zone_names))
-        for s in services
+        Candidate(staff=s, score=max(_similarity(name, s.name) for name in zone_names))
+        for s in staff_list
     ]
     scored = [c for c in scored if c.score >= MIN_SCORE]
     scored.sort(key=lambda c: c.score, reverse=True)
     return scored[:limit]
 
 
-def _money(candidate: Service) -> str:
-    if candidate.price_min is None and candidate.price_max is None:
+def _money(service: Service) -> str:
+    if service.price_min is None and service.price_max is None:
         return "цена неизвестна"
-    if candidate.price_min == candidate.price_max or candidate.price_max is None:
-        return f"{candidate.price_min} ₽"
-    return f"{candidate.price_min}–{candidate.price_max} ₽"
+    if service.price_min == service.price_max or service.price_max is None:
+        return f"{service.price_min} ₽"
+    return f"{service.price_min}–{service.price_max} ₽"
 
 
-def _duration(candidate: Service) -> str:
-    if candidate.duration_seconds is None:
+def _duration(service: Service) -> str:
+    if service.duration_seconds is None:
         return "длительность неизвестна"
-    minutes = candidate.duration_seconds // 60
+    minutes = service.duration_seconds // 60
     return f"{minutes} мин" if minutes < 60 else f"{minutes / 60:g} ч"
 
 
+def print_staff_table(staff_list: list[Staff]) -> None:
+    """Пункт 1 задачи: полный список сотрудников — это и есть зоны в
+    кабинете заказчика, показываем все, не только совпавшие."""
+    print(f"\nСотрудники в YCLIENTS ({len(staff_list)}) — физически это зоны комплекса:")
+    if not staff_list:
+        print("  (пусто — проверьте scripts/inspect_yclients.py, раздел staff)")
+        return
+    print(f"  {'staff_id':<12} название")
+    for s in staff_list:
+        print(f"  {s.staff_id:<12} {s.name}")
+
+
 def print_services_table(services: list[Service]) -> None:
-    print(f"\nУслуги в YCLIENTS ({len(services)}):")
+    """Пункт 3 задачи: полный список услуг — отдельно от сопоставления зон,
+    только для того, чтобы понять, как варианты брони (зона×длительность×
+    день) соотносятся с зонами. Автоматически ни на что не матчится."""
+    print(f"\nУслуги в YCLIENTS ({len(services)}) — варианты брони "
+          f"(зона × длительность × тип дня), не сотрудники:")
     if not services:
         print("  (пусто — см. примечание в /admin/booking: это состояние YCLIENTS, не наша связка)")
         return
-    print(f"  {'service_id':<12} {'название':<40} {'длительность':<16} цена")
+    print(f"  {'service_id':<12} {'название':<48} {'длительность':<16} цена")
     for s in services:
-        print(f"  {s.service_id:<12} {s.title[:40]:<40} {_duration(s):<16} {_money(s)}")
+        print(f"  {s.service_id:<12} {s.title[:48]:<48} {_duration(s):<16} {_money(s)}")
 
 
 def _zone_names(zone) -> list[str]:
@@ -152,42 +175,81 @@ def _prompt(question: str) -> Optional[str]:
 
 
 def propose_mapping(
-    kb: KnowledgeBase, services: list[Service], existing: dict[str, dict],
+    kb: KnowledgeBase, staff_list: list[Staff], existing: dict[str, dict],
 ) -> dict[str, Candidate]:
     """Кандидат на КАЖДУЮ зону, у которой ещё нет связки. Возвращает только
     зоны, для которых нашёлся хоть один кандидат выше MIN_SCORE."""
     proposals: dict[str, Candidate] = {}
-    print("\nПредлагаемое сопоставление (зона -> услуга YCLIENTS):")
+    print("\nПредлагаемое сопоставление (зона -> сотрудник YCLIENTS = зона в кабинете):")
     for zone in kb.catalog.zones:
         if zone.id in existing:
             continue
-        candidates = best_candidates(_zone_names(zone), services)
+        candidates = best_candidates(_zone_names(zone), staff_list)
         if not candidates:
-            print(f"  {zone.id:<20} {zone.name:<35} — нет похожей услуги (заведите вручную)")
+            print(f"  {zone.id:<20} {zone.name:<35} — нет похожего сотрудника (заведите вручную)")
             continue
         top = candidates[0]
         proposals[zone.id] = top
-        print(f"  {zone.id:<20} {zone.name:<35} -> [{top.service.service_id}] "
-              f"{top.service.title}  (схожесть {top.score:.0%})")
+        print(f"  {zone.id:<20} {zone.name:<35} -> [{top.staff.staff_id}] "
+              f"{top.staff.name}  (схожесть {top.score:.0%})")
         for alt in candidates[1:]:
-            print(f"  {'':<20} {'':<35}    вариант: [{alt.service.service_id}] "
-                  f"{alt.service.title}  (схожесть {alt.score:.0%})")
+            print(f"  {'':<20} {'':<35}    вариант: [{alt.staff.staff_id}] "
+                  f"{alt.staff.name}  (схожесть {alt.score:.0%})")
     return proposals
+
+
+def _find_duplicate_staff_assignments(proposals: dict[str, Candidate]) -> dict[str, list[str]]:
+    """Один и тот же сотрудник предложен сразу для двух зон — опаснее, чем
+    зона без пары: значит check_availability будет проверять занятость
+    ОДНОГО физического места для двух разных зон каталога."""
+    by_staff: dict[str, list[str]] = {}
+    for zone_id, candidate in proposals.items():
+        by_staff.setdefault(candidate.staff.staff_id, []).append(zone_id)
+    return {sid: zones for sid, zones in by_staff.items() if len(zones) > 1}
+
+
+def print_unmatched_and_conflicts(
+    kb: KnowledgeBase, proposals: dict[str, Candidate], existing: dict[str, dict],
+) -> None:
+    """Пункт 1 задачи: явно показать зону без пары. У заказчика 9
+    сотрудников на 10 зон — минимум одна зона гарантированно останется
+    здесь, это не баг скрипта."""
+    matched = set(existing) | set(proposals)
+    unmatched = [z for z in kb.catalog.zones if z.id not in matched]
+    if unmatched:
+        print(f"\nБез пары ({len(unmatched)}) — сотрудника не нашлось совсем:")
+        for zone in unmatched:
+            print(f"  {zone.id} — {zone.name}")
+    else:
+        print("\nБез пары зон не осталось.")
+
+    conflicts = _find_duplicate_staff_assignments(proposals)
+    if conflicts:
+        print("\n⚠ ОДИН СОТРУДНИК ПРЕДЛОЖЕН СРАЗУ ДЛЯ НЕСКОЛЬКИХ ЗОН — это ошибка "
+              "совпадения имён, не настоящая связка. Проверьте вручную:")
+        for staff_id, zone_ids in conflicts.items():
+            names = ", ".join(zone_ids)
+            print(f"  staff_id={staff_id} -> {names}")
 
 
 async def confirm_and_apply(
     kb: KnowledgeBase, proposals: dict[str, Candidate], mapping: SqlAlchemyZoneMapping,
 ) -> None:
+    """service_id НЕ спрашивается автоматически (см. докстринг модуля —
+    35 услуг это зона×длительность×день, не 1:1 с зоной) и не перезаписывается
+    пустым: если оператор ничего не ввёл, ключ просто не передаётся в
+    mapping.set(), а не затирается на None — иначе повторный прогон этого
+    скрипта стирал бы service_id, заведённый отдельно в прошлый раз."""
     print("\nПодтверждение по каждой зоне (Enter — принять предложенное, "
-          "или впишите свой service_id, «n» — пропустить зону):")
+          "или впишите свой staff_id, «n» — пропустить зону):")
     for zone in kb.catalog.zones:
         candidate = proposals.get(zone.id)
         if candidate is None:
             continue
 
         answer = _prompt(
-            f"\n{zone.id} ({zone.name}) -> [{candidate.service.service_id}] "
-            f"{candidate.service.title}. Принять? [Y/n/service_id]: "
+            f"\n{zone.id} ({zone.name}) -> [{candidate.staff.staff_id}] "
+            f"{candidate.staff.name}. Принять? [Y/n/staff_id]: "
         )
         if answer is None:
             print(f"  пропущено (нет интерактивного ввода): {zone.id}")
@@ -195,33 +257,36 @@ async def confirm_and_apply(
         if answer.lower() == "n":
             print(f"  пропущено: {zone.id}")
             continue
-        service_id = answer if answer and answer.lower() != "y" else candidate.service.service_id
+        staff_id = answer if answer and answer.lower() != "y" else candidate.staff.staff_id
 
-        staff_id = _prompt(
-            "  staff_id в YCLIENTS для этой зоны (можно посмотреть в личном "
-            "кабинете; Enter — оставить пустым, тогда будет использован "
-            "служебный «0», который почти наверняка НЕ тот ресурс): "
+        values: dict[str, str] = {"staff_id": staff_id}
+
+        service_id = _prompt(
+            "  service_id для брони (необязательно сейчас — см. таблицу услуг "
+            "выше; используется при создании брони, не при проверке занятости; "
+            "Enter — пропустить): "
         )
+        if service_id:
+            values["service_id"] = service_id
+
         company_id = _prompt(
             f"  company_id (Enter — взять из настроек, {get_settings().yclients_company_id or 'не задан'}): "
         )
+        values["company_id"] = company_id or get_settings().yclients_company_id or None
 
-        await mapping.set(
-            zone.id,
-            service_id=service_id,
-            staff_id=staff_id or None,
-            company_id=company_id or get_settings().yclients_company_id or None,
-        )
-        print(f"  записано: {zone.id} -> service_id={service_id}"
-              f"{', staff_id=' + staff_id if staff_id else ' (staff_id пуст!)'}")
+        await mapping.set(zone.id, **values)
+        print(f"  записано: {zone.id} -> staff_id={staff_id}"
+              f"{', service_id=' + service_id if service_id else ' (service_id пока не задан)'}")
 
 
 async def verify_live(provider: YClientsProvider, kb: KnowledgeBase, mapping: SqlAlchemyZoneMapping,
                        check_date: DateType) -> None:
-    """Пункт 4: реальный check_availability на только что записанных
-    зонах. UNKNOWN здесь — не абстрактный риск, а сигнал «что-то из
-    только что введённого не так», и его нужно увидеть сразу, а не после
-    жалобы клиента."""
+    """Пункт 4 общей задачи: реальный check_availability на только что
+    записанных зонах. UNKNOWN здесь — не абстрактный риск, а сигнал «что-то
+    из только что введённого не так», и его нужно увидеть сразу, а не после
+    жалобы клиента. check_availability уже спрашивает занятость по staff_id
+    (см. app/booking/yclients.py:get_free_slots, BOOK_TIMES) — эта функция
+    только показывает результат, ничего не меняя в самом запросе."""
     mapped_zone_ids = mapping.mapped_zones()
     if not mapped_zone_ids:
         print("\nНечего проверять — ни одна зона не связана.")
@@ -234,7 +299,7 @@ async def verify_live(provider: YClientsProvider, kb: KnowledgeBase, mapping: Sq
         label = f"{zone_id} ({zone.name})" if zone else zone_id
         if availability.status.value == "unknown":
             print(f"  ⚠ {label}: UNKNOWN — {availability.reason or 'причина не указана'}. "
-                  f"Связка не работает, проверьте service_id/staff_id.")
+                  f"Связка не работает, проверьте staff_id (и company_id).")
         else:
             print(f"  ✓ {label}: {availability.status.value.upper()}"
                   f"{' — свободные слоты: ' + ', '.join(availability.free_slots) if availability.free_slots else ''}")
@@ -268,20 +333,25 @@ async def main() -> int:
         mapping=zone_mapping,
     )
 
+    # Пункт 1: полный список сотрудников (= зон) — до какого-либо матчинга.
+    staff_list = await provider.get_staff()
+    print_staff_table(staff_list)
+    if not staff_list:
+        print("\nСписок сотрудников пуст — проверьте scripts/inspect_yclients.py "
+              "(раздел staff) и права токена на STAFF_FULL_LIST_DEPRECATED.")
+        return 1
+
+    # Пункт 3: полный список услуг — отдельно, только для обзора человеком.
     services = await provider.get_services()
     print_services_table(services)
-    if not services:
-        print("\nСписок услуг пуст — проверьте, подключена ли интеграция филиалом "
-              "в личном кабинете YCLIENTS (см. app/booking/yclients_endpoints.py).")
-        return 1
 
     existing = {zid: zone_mapping.get(zid) for zid in zone_mapping.mapped_zones()}
     if existing:
-        print(f"\nУже связаны ({len(existing)}): {', '.join(sorted(existing))}")
+        summary = ", ".join(f"{zid}(staff_id={row.get('staff_id')})" for zid, row in sorted(existing.items()))
+        print(f"\nУже связаны ({len(existing)}): {summary}")
 
-    proposals = propose_mapping(kb, services, existing)
-    if not proposals:
-        print("\nВсе зоны уже связаны, либо для оставшихся не нашлось похожей услуги.")
+    proposals = propose_mapping(kb, staff_list, existing)
+    print_unmatched_and_conflicts(kb, proposals, existing)
 
     if not args.apply:
         print("\n--apply не указан: ничего не записано. "

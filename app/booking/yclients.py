@@ -31,6 +31,7 @@ from app.booking.base import (
     BookingResult,
     PaymentLink,
     Service,
+    Staff,
 )
 from app.booking.mapping import InMemoryZoneMapping
 
@@ -72,24 +73,30 @@ class YClientsProvider:
     async def _request(self, spec: tuple[str, str], path: str, **kwargs) -> Optional[dict]:
         """Возвращает data из конверта или None при любом сбое.
 
-        Интеграция подключается филиалом вручную в личном кабинете YCLIENTS —
-        пока филиал не нажал «Подключить», формально верные токены всё равно
-        получат отказ в доступе (типично 401/403). Это состояние ловится
-        отдельно и пишется в лог понятной строкой, а не общим «request
-        failed»: дежурный должен сразу понимать, что чинить нужно не код, а
-        подключение интеграции у заказчика.
+        401/403 ловится отдельно и пишется в лог понятной строкой, а не
+        общим «request failed» — но БЕЗ утверждения единственной причины.
+        Разведка (scripts/inspect_yclients.py, 2026-08-26) на одном токене
+        получила 200 на часть методов и 403 на другие того же филиала —
+        то есть 401/403 значит либо «филиал не подключил интеграцию»
+        (тогда отказ на ВСЕХ методах), либо «у токена нет прав именно на
+        этот метод» (тогда часть методов отвечает 200, как здесь). Раньше
+        лог называл только первую причину — вводило в заблуждение, если
+        соседний метод только что отработал нормально.
         """
         ep.assert_spec_verified()
         method = spec[0]
         client = self._client or httpx.AsyncClient(base_url=ep.BASE_URL, timeout=self._timeout)
         try:
             response = await client.request(method, path, headers=self._headers(), **kwargs)
-            if response.status_code in ep.INTEGRATION_NOT_CONNECTED_STATUSES:
+            if response.status_code in ep.ACCESS_DENIED_STATUSES:
                 logger.warning(
-                    "yclients: интеграция не подключена филиалом (или токены отозваны) — "
-                    "status=%s. Это не ошибка кода: филиал должен нажать «Подключить» "
-                    "в личном кабинете YCLIENTS.",
+                    "yclients: доступ отклонён (status=%s) на %s. Либо филиал не "
+                    "подключил интеграцию в личном кабинете YCLIENTS (тогда откажут "
+                    "все методы), либо у токена просто нет прав на этот конкретный "
+                    "метод (тогда соседние методы могут отвечать 200 нормально) — "
+                    "не считать автоматически первым без проверки других методов.",
                     response.status_code,
+                    path,
                 )
                 return None
             response.raise_for_status()
@@ -141,6 +148,30 @@ class YClientsProvider:
                 price_max=item.get("price_max"),
             )
             for item in services
+        ]
+
+    # -- сотрудники (= зоны у этого заказчика) ------------------------------
+
+    async def get_staff(self) -> list[Staff]:
+        """Список сотрудников — физически зон комплекса, см. Staff.
+
+        Осознанно устаревший метод STAFF_FULL_LIST_DEPRECATED, а не новый
+        STAFF_FULL_LIST: разведка (scripts/inspect_yclients.py) показала
+        200 на /staff/{company_id} и 403 на /company/{company_id}/staff для
+        одного и того же токена — разные уровни прав, а не «нет доступа
+        вообще» (см. ep.ACCESS_DENIED_STATUSES и _request()).
+        """
+        if not ep.SPEC_VERIFIED:
+            return []
+        data = await self._request(
+            ep.STAFF_FULL_LIST_DEPRECATED,
+            ep.STAFF_FULL_LIST_DEPRECATED[1].format(company_id=self.company_id),
+        )
+        if not isinstance(data, list):
+            return []
+        return [
+            Staff(staff_id=str(item.get("id")), name=str(item.get("name") or item.get("title") or ""))
+            for item in data
         ]
 
     # -- занятость ---------------------------------------------------------
