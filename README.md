@@ -38,7 +38,9 @@ app/db/           модели SQLAlchemy, включая персистентн
 scripts/          replay.py (--provider), compare_providers.py,
                   register_webhook.py, rotate_avito_keys.py,
                   import_photos.py, export_listings.py,
-                  unpack_google_drive_photos.py, anonymize_dialogs.py
+                  unpack_google_drive_photos.py, anonymize_dialogs.py,
+                  sync_yclients_services.py (связка zone_id <-> service_id),
+                  inspect_yclients.py (только чтение — что реально есть в YCLIENTS)
 railway.toml      сборка на Railway (см. docs/RAILWAY_SETUP.md)
 entrypoint.sh     точка входа контейнера: alembic upgrade head, потом uvicorn
 tests/            753 теста

@@ -256,6 +256,55 @@ async def test_booking_blocks_occupied_hours_not_paid_hours(mapping, verified):
 
 
 # --------------------------------------------------------------------------
+# Каталог услуг (get_services) — envelope book_services это ОБЪЕКТ
+# {categories, services}, а не плоский список (developers.yclients.com,
+# "Онлайн-запись" -> "Получить список услуг доступных для бронирования").
+# Раньше get_services() ждал список и получал [] на любом настоящем ответе.
+# --------------------------------------------------------------------------
+
+def services_url(company="1") -> str:
+    return ep.BASE_URL + ep.SERVICES[1].format(company_id=company)
+
+
+@respx.mock
+async def test_get_services_parses_the_real_envelope_shape(mapping, verified):
+    respx.get(services_url()).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "categories": [{"id": 1, "title": "Бани"}],
+                    "services": [
+                        {"id": 10, "title": "Русская баня", "price_min": 2500, "price_max": 3500},
+                        {"id": 11, "title": "Баня Гараж", "price_min": 3000, "price_max": 3000},
+                    ],
+                },
+                "meta": {},
+            },
+        )
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    services = await provider.get_services()
+
+    assert [s.service_id for s in services] == ["10", "11"]
+    assert services[0].title == "Русская баня"
+    assert services[0].price_min == 2500
+
+
+@respx.mock
+async def test_get_services_is_empty_when_services_key_is_missing(mapping, verified):
+    """Не роняем список, если форма ответа отличается — просто пусто."""
+    respx.get(services_url()).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": {}, "meta": {}})
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    assert await provider.get_services() == []
+
+
+# --------------------------------------------------------------------------
 # Оплата
 # --------------------------------------------------------------------------
 

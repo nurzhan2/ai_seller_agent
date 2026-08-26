@@ -119,7 +119,15 @@ class YClientsProvider:
         data = await self._request(
             ep.SERVICES, ep.SERVICES[1].format(company_id=self.company_id)
         )
-        if not isinstance(data, list):
+        # По официальной документации book_services (developers.yclients.com,
+        # раздел "Онлайн-запись" -> "Получить список услуг доступных для
+        # бронирования", проверено 2026-08-24) data — ОБЪЕКТ вида
+        # {"categories": [...], "services": [...]}, а не плоский список.
+        # Раньше здесь ждали список: isinstance(data, list) было False на
+        # ЛЮБОМ настоящем ответе, и метод молча возвращал [] — то есть
+        # "услуг 0" получалось даже если у заказчика всё заведено верно.
+        services = data.get("services") if isinstance(data, dict) else None
+        if not isinstance(services, list):
             return []
         return [
             Service(
@@ -132,7 +140,7 @@ class YClientsProvider:
                 price_min=item.get("price_min"),
                 price_max=item.get("price_max"),
             )
-            for item in data
+            for item in services
         ]
 
     # -- занятость ---------------------------------------------------------
