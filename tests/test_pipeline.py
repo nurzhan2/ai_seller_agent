@@ -57,6 +57,42 @@ def _payload(
     return {"payload": {"value": value}}
 
 
+def _image_payload(
+    chat_id: str = "chat-1",
+    message_id: str = "msg-img-1",
+    author_id: str = "buyer-9",
+    item_id: str | None = "item-1",
+) -> dict:
+    """Фото без подписи — по общеизвестной (не подтверждённой спеком) форме
+    мессенджер-вебхука Авито: type="image", content.image вместо content.text."""
+    value: dict = {
+        "id": message_id,
+        "chat_id": chat_id,
+        "author_id": author_id,
+        "type": "image",
+        "content": {"image": {"sizes": {"140x105": "https://example.com/photo.jpg"}}},
+    }
+    if item_id is not None:
+        value["item_id"] = item_id
+    return {"payload": {"value": value}}
+
+
+def _unrecognized_typeless_payload(chat_id: str = "chat-1", message_id: str = "msg-sys-1") -> dict:
+    """Ни текста, ни распознанного типа — системное событие или структура,
+    отличная от ожидаемой. Не должно ни звать агента, ни отвечать шаблоном:
+    только лог с диагностикой (см. test_textless_payload_of_unknown_type_*)."""
+    return {
+        "payload": {
+            "value": {
+                "id": message_id,
+                "chat_id": chat_id,
+                "author_id": "buyer-9",
+                "type": "call_missed",
+            }
+        }
+    }
+
+
 class _FakeAgentLoop:
     """Записывает, с чем его позвали, и отдаёт заранее заданный результат."""
 
@@ -400,6 +436,121 @@ async def test_reply_without_text_still_resets_the_timer():
     _c, touch = await store.load_dialog_state("chat-1")
     assert touch.next_touch_due_at is None
     assert agent.calls == []      # но и агента дёргать не на что
+
+
+# --------------------------------------------------------------------------
+# Сообщение без текста: диагностика в логе, фото — не молчание
+# --------------------------------------------------------------------------
+
+async def test_image_without_text_gets_a_canned_reply_not_silence():
+    """Худший вариант — молчание в ответ на активность клиента. Не ход
+    агента (LLM не звали, текста для него нет) — фиксированная строка,
+    но доставленная тем же путём, что и обычный ответ (DRY_RUN → очередь
+    модерации)."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_image_payload())
+    await _settle()
+
+    assert agent.calls == []      # не ход LLM — шаблон
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is not None
+    assert "Вижу фото" in pending.text
+
+
+async def test_image_without_text_still_resets_the_touch_timer():
+    store = InMemoryDialogStore()
+    pipeline, store, agent, _ = _build(store=store)
+    await store.save_dialog_state(
+        "chat-1",
+        DialogConcessionState(base_price_quoted=True),
+        TouchState(touch_count=1, next_touch_due_at=NOW + timedelta(minutes=30)),
+    )
+
+    await pipeline.handle_message(_image_payload())
+    await _settle()
+
+    _c, touch = await store.load_dialog_state("chat-1")
+    assert touch.next_touch_due_at is None
+
+
+async def test_image_message_respects_human_takeover():
+    """Оператор ведёт чат — автоматический «вижу фото» не должен встревать
+    поверх живого человека, ровно как и обычный ход агента."""
+    store = InMemoryDialogStore()
+    pipeline, store, agent, ops_service = _build(store=store)
+    await store.get_or_create_chat("chat-1")
+    store.chats["chat-1"] = store.chats["chat-1"].__class__(
+        chat_id="chat-1", is_human_takeover=True
+    )
+
+    await pipeline.handle_message(_image_payload())
+    await _settle()
+
+    assert agent.calls == []
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_image_message_respects_the_reply_limit():
+    """Тот же предохранитель от зацикливания, что и у обычных ходов —
+    шаблонный ответ на фото тоже считается ответом агента."""
+    settings = _settings(max_agent_replies_per_chat=1)
+    pipeline, store, agent, ops_service = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(message_id="m-0", text="вопрос"))
+    await _settle()
+    assert len(agent.calls) == 1
+
+    await pipeline.handle_message(_image_payload(message_id="m-img"))
+    await _settle()
+
+    # Лимит уже исчерпан обычным ходом — шаблонный ответ на фото поверх
+    # него не проскакивает мимо той же проверки.
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is None or "Вижу фото" not in pending.text
+
+
+async def test_textless_payload_logs_type_and_top_level_keys(caplog):
+    """Ради этого лог и появился: раньше "message without text" не говорил,
+    ЧТО пришло. Теперь тип и структура видны прямо в тексте сообщения — не
+    только в extra, который обычный текстовый вывод logging не показывает."""
+    pipeline, store, agent, _ = _build()
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_image_payload())
+    await _settle()
+
+    assert "message without text" in caplog.text
+    assert "type=image" in caplog.text
+    assert "chat_id" in caplog.text
+
+
+async def test_textless_payload_masks_a_phone_number_in_the_log(caplog):
+    """Без персональных данных — телефон не должен доехать до лога, даже
+    если окажется под неожиданным ключом (структура не text — гарантий
+    формы у нас нет, см. app/channels/avito_payloads.py)."""
+    payload = _image_payload()
+    payload["payload"]["value"]["author_phone"] = "+7 999 123-45-67"
+    pipeline, store, agent, _ = _build()
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(payload)
+    await _settle()
+
+    assert "999" not in caplog.text
+    assert "123-45-67" not in caplog.text
+
+
+async def test_textless_payload_of_unknown_type_is_logged_but_not_answered():
+    """Ни текста, ни распознанного «это фото» — не ход агента, не шаблон,
+    только диагностика в логе (уже проверена отдельным тестом выше)."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_unrecognized_typeless_payload())
+    await _settle()
+
+    assert agent.calls == []
+    assert await ops_service.store.get_pending("chat-1") is None
 
 
 async def test_quoting_a_price_schedules_the_next_touch():

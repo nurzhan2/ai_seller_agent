@@ -345,6 +345,79 @@ def test_chat_id_extraction_tolerates_envelope_shapes():
 
 
 # --------------------------------------------------------------------------
+# Тип сообщения и диагностика вебхука без текста
+# --------------------------------------------------------------------------
+
+def test_message_type_extraction_tolerates_envelope_shapes():
+    assert pl.extract_message_type({"payload": {"value": {"type": "image"}}}) == "image"
+    assert pl.extract_message_type({"value": {"type": "call"}}) == "call"
+    assert pl.extract_message_type({"junk": 1}) is None
+
+
+def test_is_image_message_true_on_explicit_type():
+    payload = {"payload": {"value": {"type": "image", "content": {}}}}
+    assert pl.is_image_message(payload) is True
+
+
+def test_is_image_message_falls_back_to_content_structure():
+    """Тип не пришёл (или назван иначе, чем мы предположили) — content с
+    ключом "image" всё равно достаточно, чтобы не принять фото за
+    нераспознанное системное событие."""
+    payload = {"payload": {"value": {"content": {"image": {"sizes": {}}}}}}
+    assert pl.is_image_message(payload) is True
+
+
+def test_is_image_message_false_for_text():
+    payload = {"payload": {"value": {"type": "text", "content": {"text": "привет"}}}}
+    assert pl.is_image_message(payload) is False
+
+
+def test_is_image_message_false_for_unrelated_type():
+    payload = {"payload": {"value": {"type": "call_missed"}}}
+    assert pl.is_image_message(payload) is False
+
+
+def test_describe_payload_reports_type_and_top_level_keys():
+    payload = {"payload": {"value": {"type": "image", "content": {"image": {}}}}}
+    description = pl.describe_payload_for_logging(payload)
+    assert description["message_type"] == "image"
+    assert description["top_level_keys"] == ["payload"]
+
+
+def test_describe_payload_masks_phone_regardless_of_key_name():
+    """Реальная форма нетекстовых вебхуков не подтверждена — телефон может
+    оказаться под именем поля, которое мы не предусмотрели. Маскировка по
+    значению (не только по ключу) — единственная гарантия."""
+    payload = {"payload": {"value": {"type": "call", "unexpected_field": "+7 999 123-45-67"}}}
+    description = pl.describe_payload_for_logging(payload)
+    dumped = str(description["sanitized"])
+    assert "999" not in dumped
+    assert "123-45-67" not in dumped
+
+
+def test_describe_payload_masks_underscore_prefixed_name_fields():
+    """author_name/buyer_name — реальные имена полей в этом проекте (см.
+    app/db/models.py:Chat.buyer_name). \\b на границе "_" не сработал бы —
+    маскировка по ключу здесь ищет подстроку, а не целое слово."""
+    payload = {"payload": {"value": {"author_name": "Иван Иванов"}}}
+    description = pl.describe_payload_for_logging(payload)
+    assert description["sanitized"]["payload"]["value"]["author_name"] == "***"
+
+
+def test_describe_payload_preserves_deep_image_urls():
+    """Реальная глубина фото-контента (content.image.sizes."WxH") не
+    должна срезаться предохранителем от патологической вложенности."""
+    payload = {
+        "payload": {"value": {"type": "image", "content": {
+            "image": {"sizes": {"140x105": "https://example.com/a.jpg"}}
+        }}}
+    }
+    description = pl.describe_payload_for_logging(payload)
+    sizes = description["sanitized"]["payload"]["value"]["content"]["image"]["sizes"]
+    assert sizes == {"140x105": "https://example.com/a.jpg"}
+
+
+# --------------------------------------------------------------------------
 # Settings hygiene
 # --------------------------------------------------------------------------
 

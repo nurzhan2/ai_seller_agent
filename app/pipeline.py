@@ -20,6 +20,15 @@
     5. если чат у оператора — на этом всё, агента не трогаем вообще;
     6. кладём сообщение в окно debounce.
 
+БЕЗ ТЕКСТА (шаг 3 сохранить нечего) — отдельная ветка, не шаги 3-6: лог с
+диагностикой сырого payload (тип, ключи, санитизированный content — см.
+`_log_textless_payload`, `app/channels/avito_payloads.py:
+describe_payload_for_logging`) и, если это фото (`is_image_message`),
+шаблонный ответ мимо `AgentLoop` — прямо в `_deliver`, чтобы клиент не
+получил тишину (см. `_handle_image_without_text`). Таймер касаний (шаг 4)
+сбрасывается всегда, до этой развилки — активность клиента реальна
+независимо от того, распознали мы содержимое или нет.
+
 `_on_debounce_flush` (по истечении окна, на склеенный текст):
     7. ПЕРЕПРОВЕРЯЕМ право агента отвечать: окно длится десятки секунд, и
        оператор мог забрать чат ровно в этот промежуток;
@@ -62,17 +71,21 @@ requires_operator_approval). DRY_RUN остаётся отдельным ава�
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from app.agent.debounce import Debouncer
+from app.agent.loop import TurnResult
 from app.agent.touch_tracking import TouchState, record_first_touch, reset_timer_on_reply
 from app.channels.avito_payloads import (
+    describe_payload_for_logging,
     extract_chat_id,
     extract_item_id,
     extract_message_id,
     extract_text,
+    is_image_message,
     is_outgoing_echo,
 )
 from app.db.models import SendStatus
@@ -90,6 +103,16 @@ from app.ops.notifications import (
 from app.ops.state import PendingReply
 
 logger = logging.getLogger("parmangal.pipeline")
+
+# Не LLM-ответ, а фиксированная строка: клиент прислал фото (известный
+# пробел — оно не скачивается и не попадает в Message.image_ids, см.
+# README), но молчание в ответ на активность клиента — худший вариант.
+# Идёт мимо AgentLoop.run_turn прямо в _deliver, тем же путём модерации/
+# dry_run/автономной отправки, что и обычный ход агента.
+IMAGE_WITHOUT_TEXT_REPLY = (
+    "Вижу фото, но пока не могу его посмотреть — опишите, пожалуйста, "
+    "что вас интересует, и я отвечу."
+)
 
 
 async def _no_delay() -> None:
@@ -175,7 +198,13 @@ class MessagePipeline:
             # Картинка/системное событие без текста: сохранять нечего, но
             # клиент проявил активность — таймер напоминаний всё равно сбросить.
             await self._reset_touch_timer(chat_id)
-            logger.info("pipeline: message without text", extra={"chat_id": chat_id})
+            self._log_textless_payload(payload, chat_id)
+
+            if chat.is_human_takeover:
+                logger.info("pipeline: chat is with a human, agent skipped", extra={"chat_id": chat_id})
+                return
+            if is_image_message(payload):
+                await self._handle_image_without_text(chat)
             return
 
         saved = await self.store.save_incoming(chat_id, text, avito_message_id=message_id)
@@ -202,6 +231,40 @@ class MessagePipeline:
             return   # таймер и так не тикал — лишняя запись в БД не нужна
         await self.store.save_dialog_state(chat_id, concession, updated)
         logger.info("pipeline: touch timer reset on client reply", extra={"chat_id": chat_id})
+
+    def _log_textless_payload(self, payload: dict, chat_id: str) -> None:
+        """Раньше лог "message without text" не говорил, ЧТО пришло —
+        фото (известный пробел, см. README) или структура, отличная от
+        ожидаемой (системное событие, другой тип). Диагностика — прямо в
+        тексте сообщения лога, а не только в extra: extra-поля не попадают
+        в обычный текстовый вывод logging.basicConfig, только в structured-
+        коллекторы, если они когда-нибудь появятся. describe_payload_for_
+        logging маскирует имена/телефоны сама (см. app/channels/
+        avito_payloads.py) — здесь их только сериализуют."""
+        description = describe_payload_for_logging(payload)
+        dumped = json.dumps(description["sanitized"], ensure_ascii=False)
+        logger.info(
+            "pipeline: message without text — type=%s top_level_keys=%s payload=%s",
+            description["message_type"], description["top_level_keys"], dumped[:2000],
+            extra={"chat_id": chat_id},
+        )
+
+    async def _handle_image_without_text(self, chat: Any) -> None:
+        """Клиент прислал фото — молчание хуже шаблонного ответа. Не ход
+        агента (нет текста, чтобы дать модели), поэтому TurnResult собран
+        вручную и отправлен через тот же _deliver, что и обычный ход: та
+        же модерация/dry_run/автономная отправка, тот же учёт лимита
+        ответов (_count_agent_reply — внутри _deliver и _queue_for_
+        moderation)."""
+        allowed, reason = await self.ops_service.should_agent_reply(chat.chat_id)
+        if not allowed:
+            logger.info(
+                "pipeline: agent stays silent on image",
+                extra={"chat_id": chat.chat_id, "reason": reason},
+            )
+            return
+        result = TurnResult(text=IMAGE_WITHOUT_TEXT_REPLY)
+        await self._deliver(chat, result, client_text="[фото]", gate=None, fallback_text=None)
 
     # -- шаг 7-10: ход агента ----------------------------------------------
 
