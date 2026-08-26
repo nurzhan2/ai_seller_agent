@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import date as DateType, timedelta
 from typing import Optional
@@ -47,7 +49,6 @@ from app.config import get_settings
 from app.db.session import get_sessionmaker
 from app.kb.loader import KnowledgeBase, load_catalog
 from app.logging_setup import configure_logging
-from app.media.photo_import import normalize_name
 
 # Та же грубая «основа слова», что и в app/agent/tools.py::_stems, для
 # сравнения тем FAQ — 4 первых символа покрывают русские падежи и склонения
@@ -61,8 +62,23 @@ _STEM_LENGTH = 4
 MIN_SCORE = 0.3
 
 
+def _normalize_name(name: str) -> str:
+    """Регистр, «ё», дефисы/подчёркивания/лишние пробелы — не важны.
+
+    Та же логика, что и app/media/photo_import.py::normalize_name, но
+    продублирована, а не импортирована: app/media/ подпадает под шаблон
+    "media" в .gitignore/.dockerignore (для реальных фото зон) и поэтому
+    не гарантированно доступен ни в git-чекауте, ни в образе — скрипт для
+    Railway Console не может зависеть от модуля, который может там не
+    оказаться.
+    """
+    text = unicodedata.normalize("NFKC", name).lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
+    return " ".join(text.split())
+
+
 def _stems(text: str) -> set[str]:
-    return {w[:_STEM_LENGTH] for w in normalize_name(text).split() if len(w) >= _STEM_LENGTH}
+    return {w[:_STEM_LENGTH] for w in _normalize_name(text).split() if len(w) >= _STEM_LENGTH}
 
 
 def _similarity(a: str, b: str) -> float:

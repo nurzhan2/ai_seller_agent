@@ -1,7 +1,7 @@
 .git
 tests
 docs
-media
+/media
 .venv
 venv
 __pycache__
