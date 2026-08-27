@@ -60,11 +60,19 @@ def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
     if item_id is None:
         return bool(getattr(settings, "avito_allow_chats_without_item", True))
 
-    allowed = getattr(settings, "avito_allowed_items", None) or []
+    # item_id приводится к строке ЗДЕСЬ, а не только у вызывающих. В API
+    # Авито это число (спек: "item_id": {"type": "integer"}), у нас везде
+    # строка — и сравнение строки с числом не совпадает молча, то есть
+    # заблокированное объявление тихо становится разрешённым. Сейчас все
+    # вызывающие передают строку (`extract_item_id` -> `_first_scalar` и
+    # колонка `Chat.item_id`), но полагаться на это по всей цепочке —
+    # ровно тот вид допущения, который однажды перестаёт выполняться.
+    item_id = str(item_id)
+    allowed = [str(i) for i in (getattr(settings, "avito_allowed_items", None) or [])]
     if allowed:
         return item_id in allowed
 
-    blocked = getattr(settings, "avito_blocked_items", None) or []
+    blocked = [str(i) for i in (getattr(settings, "avito_blocked_items", None) or [])]
     return item_id not in blocked
 
 

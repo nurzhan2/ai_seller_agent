@@ -233,3 +233,69 @@ def test_cost_guard_uses_decimal_not_float():
     guard.add(Decimal("0.1"))
     guard.add(Decimal("0.1"))
     assert guard.add(Decimal("0.1")) is True, "0.1*3 должно быть ровно 0.3"
+
+
+# --------------------------------------------------------------------------
+# /admin/dialogs: видно, отвечает ли агент в чате прямо сейчас
+# --------------------------------------------------------------------------
+
+class _FakeDialogProvider:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def list_dialogs(self):
+        return self.rows
+
+
+def _dialogs_client(settings, rows):
+    app = FastAPI()
+    app.include_router(admin_router)
+    app.state.kb = None
+    app.state.zone_mapping = InMemoryZoneMapping()
+    app.state.dialog_provider = _FakeDialogProvider(rows)
+    admin_routes.get_settings = lambda: settings
+    return TestClient(app)
+
+
+def test_dialogs_marks_a_blocklisted_chat_as_blocked():
+    """Ровно вопрос, с которого начался разбор: агент в этом диалоге
+    отвечает или уже нет?"""
+    settings = Settings(admin_user=ADMIN_USER, admin_password=ADMIN_PASSWORD)
+    client = _dialogs_client(settings, [{"chat_id": "c-1", "item_id": "8172444564", "messages": 15}])
+
+    html = client.get("/admin/dialogs", headers=auth_header()).text
+
+    assert "заблокирован фильтром" in html
+
+
+def test_dialogs_marks_a_normal_chat_as_answered():
+    settings = Settings(admin_user=ADMIN_USER, admin_password=ADMIN_PASSWORD)
+    client = _dialogs_client(settings, [{"chat_id": "c-1", "item_id": "9999-обычное", "messages": 3}])
+
+    html = client.get("/admin/dialogs", headers=auth_header()).text
+
+    assert "агент отвечает" in html
+
+
+def test_dialogs_shows_the_effective_filter_so_config_drift_is_visible():
+    """Список прямо на странице — чтобы не выяснять по косвенным
+    признакам, применился ли конфиг."""
+    settings = Settings(admin_user=ADMIN_USER, admin_password=ADMIN_PASSWORD)
+    client = _dialogs_client(settings, [])
+
+    html = client.get("/admin/dialogs", headers=auth_header()).text
+
+    assert "8172444564" in html and "чёрный список" in html
+
+
+def test_dialogs_warns_when_the_allowlist_overrides_the_blocklist():
+    """Пока AVITO_ALLOWED_ITEMS задан, чёрный список не применяется —
+    это должно быть видно, а не выясняться по поведению."""
+    settings = Settings(
+        admin_user=ADMIN_USER, admin_password=ADMIN_PASSWORD, avito_allowed_items="item-1",
+    )
+    client = _dialogs_client(settings, [])
+
+    html = client.get("/admin/dialogs", headers=auth_header()).text
+
+    assert "БЕЛЫЙ список" in html

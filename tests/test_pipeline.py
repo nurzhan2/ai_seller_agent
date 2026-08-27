@@ -1571,3 +1571,68 @@ def test_moderation_mode_defaults_to_concessions_only():
     """Подтверждение оператора только для ценовых уступок — значение по
     умолчанию, а не то, что надо не забыть выставить на стенде."""
     assert Settings().moderation_mode == "concessions_only"
+
+
+# --------------------------------------------------------------------------
+# Диагностика: чёрный список реально применяется, отбрасывания видны в логе
+#
+# Повод: на /admin/dialogs нашлись диалоги по объявлениям 8172444564 и
+# 7980739861 — оба в чёрном списке по умолчанию, а переписка в них есть.
+# --------------------------------------------------------------------------
+
+async def test_blocklist_default_applies_without_any_env_var():
+    """Переменную можно не задавать вовсе: пять id зашиты в Settings.
+    Если этот тест падает, значит дефолт не подхватывается — ровно та
+    гипотеза, которую проверяли по живым диалогам."""
+    settings = _settings()   # никаких avito_* переменных
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="8172444564", text="Квартира продаётся?"))
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_blocklist_applies_when_avito_sends_item_id_as_a_number():
+    """В спеке Авито item_id — integer. Сравнение числа со строкой не
+    совпало бы молча, и запрещённое объявление стало бы разрешённым."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    payload = _payload(text="Квартира продаётся?")
+    payload["payload"]["value"]["item_id"] = 8172444564    # именно число
+
+    await pipeline.handle_message(payload)
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_blocklist_is_checked_before_the_chat_is_created():
+    """Порядок важен: проверка ДО get_or_create_chat. Иначе диалог по
+    запрещённому объявлению всё равно окажется в базе и в /admin/dialogs,
+    даже если ответа клиент не получит."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="7980739861"))
+    await _settle()
+
+    assert store.chats == {}
+    assert store.messages == {}
+
+
+async def test_echo_drop_is_logged(caplog):
+    """Единственное место, где сообщение исчезало БЕЗ следа в логе. При
+    неверном AVITO_USER_ID сюда уходили бы все входящие подряд, и снаружи
+    это неотличимо от «вебхуки не приходят»."""
+    pipeline, store, agent, _ = _build()
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload(author_id=OUR_USER_ID))
+    await _settle()
+
+    assert agent.calls == []
+    assert "эхо" in caplog.text

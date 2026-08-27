@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from app.booking.mapping import InMemoryZoneMapping, coverage_report
+from app.channels.outbound_gate import is_listing_allowed
 from app.config import get_settings
 from app.kb.editor import human_value
 from app.kb.loader import KnowledgeBase, audit_readiness, global_blockers, load_catalog
@@ -261,23 +262,59 @@ def _listing_cell(row: dict) -> str:
     return f"{escape(str(title))} <span class='note'>({escape(str(item_id))})</span>"
 
 
+def _filter_cell(row: dict, settings: Any) -> str:
+    """Отвечает ли агент в этом чате ПРЯМО СЕЙЧАС, по текущему фильтру.
+
+    Статус считается на лету от актуальных настроек, а не хранится: диалог
+    мог накопить переписку ДО того, как объявление попало в чёрный список,
+    и тогда старые сообщения в нём — не признак того, что фильтр не
+    работает. Колонка отвечает ровно на вопрос «будет ли агент отвечать
+    здесь дальше», а «когда он отвечал» видно по соседней колонке со
+    временем последнего сообщения.
+    """
+    if is_listing_allowed(row.get("item_id"), settings):
+        return "<span class='yes'>агент отвечает</span>"
+    return "<span class='no'>заблокирован фильтром</span>"
+
+
 @router.get("/dialogs", response_class=HTMLResponse)
 async def dialogs(request: Request, _: str = Depends(require_admin)) -> HTMLResponse:
     provider = getattr(request.app.state, "dialog_provider", None)
     if provider is None:
         return _page("Диалоги", "<p class='note'>Источник диалогов не подключён.</p>")
+    settings = get_settings()
     rows = await provider.list_dialogs()
+
+    if settings.avito_allowed_items:
+        filter_note = (
+            f"Фильтр: БЕЛЫЙ список ({len(settings.avito_allowed_items)} шт.) — "
+            "он в приоритете, чёрный не применяется."
+        )
+    else:
+        blocked = ", ".join(settings.avito_blocked_items) or "пусто"
+        filter_note = f"Фильтр: чёрный список ({len(settings.avito_blocked_items)} шт.): {blocked}"
+
     body = [
+        f"<p class='note'>{escape(filter_note)} Статус считается по текущим "
+        "настройкам: переписка могла накопиться до того, как объявление "
+        "попало под запрет — смотрите время последнего сообщения.</p>",
         "<table><tr><th>чат</th><th>объявление</th><th>зона</th>"
-        "<th>режим</th><th>сообщений</th></tr>"
+        "<th>фильтр</th><th>режим</th><th>сообщений</th><th>последнее</th></tr>",
     ]
     for row in rows:
         mode = "оператор" if row.get("is_human_takeover") else "ИИ"
+        # strftime только если это действительно datetime: страница
+        # диагностическая, и уронить её 500-й из-за формата даты — потерять
+        # ровно тот инструмент, ради которого её и открыли.
+        last = row.get("last_msg_at")
+        last_text = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else (str(last) if last else "—")
         body.append(
             f"<tr><td>{escape(str(row.get('chat_id')))}</td>"
             f"<td>{_listing_cell(row)}</td>"
             f"<td>{escape(str(row.get('zone_id') or '—'))}</td>"
-            f"<td>{mode}</td><td>{row.get('messages', 0)}</td></tr>"
+            f"<td>{_filter_cell(row, settings)}</td>"
+            f"<td>{mode}</td><td>{row.get('messages', 0)}</td>"
+            f"<td>{escape(last_text)}</td></tr>"
         )
     body.append("</table>")
     return _page("Диалоги", "".join(body))

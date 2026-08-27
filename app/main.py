@@ -183,6 +183,27 @@ async def lifespan(app: FastAPI):
 
     if settings.dry_run:
         logger.warning("DRY_RUN включён — сообщения клиентам в Авито не уходят")
+
+    # Фактический фильтр объявлений — В ЛОГ ПРИ СТАРТЕ. Иначе «применился ли
+    # конфиг» приходится выяснять по косвенным признакам: в диалогах видно,
+    # что агент отвечал по запрещённому объявлению, а из чего именно
+    # состоял список в тот момент — уже нет.
+    if settings.avito_allowed_items:
+        logger.warning(
+            "Фильтр объявлений: БЕЛЫЙ список (%d шт.), он в приоритете — "
+            "чёрный список НЕ применяется. Разрешены только: %s",
+            len(settings.avito_allowed_items), ", ".join(settings.avito_allowed_items),
+        )
+    else:
+        logger.info(
+            "Фильтр объявлений: чёрный список (%d шт.): %s",
+            len(settings.avito_blocked_items),
+            ", ".join(settings.avito_blocked_items) or "пусто — запрещённых нет",
+        )
+    logger.info(
+        "Чаты без объявления (обращения из профиля, u2u/a2u): %s",
+        "агент отвечает" if settings.avito_allow_chats_without_item else "агент молчит",
+    )
     if not ep.SPEC_VERIFIED:
         logger.warning(
             "Схема Avito API не подтверждена — исходящие запросы к Авито заблокированы. "
