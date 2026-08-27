@@ -154,6 +154,27 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
             f"Ответов агента: {flags.agent_reply_count}"
         )
 
+    @dp.message(Command("reset"))
+    async def on_reset(message: Message) -> None:
+        """Сбросить счётчик ответов агента в одном чате.
+
+        До этой команды исчерпанный лимит снимался только правкой в базе.
+        Лимит на все чаты она НЕ трогает — для этого
+        AGENT_MAX_REPLIES_PER_CHAT.
+        """
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "Использование: /reset <chat_id>\n"
+                "Сбрасывает счётчик ответов агента в этом чате. "
+                "Узнать счётчик: /chat <chat_id>"
+            )
+            return
+        result = await service.reset_reply_count(parts[1].strip(), message.from_user.id)
+        await message.answer(result["message"])
+
     @dp.message(F.reply_to_message)
     async def on_reply(message: Message) -> None:
         """Ответ реплаем на карточку диалога уходит клиенту в Авито."""
@@ -267,6 +288,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("resume", "Снять агента с паузы"),
     ("provider", "LLM-провайдер"),
     ("chat", "Статус чата по id"),
+    ("reset", "Сбросить счётчик ответов в чате"),
 )
 
 

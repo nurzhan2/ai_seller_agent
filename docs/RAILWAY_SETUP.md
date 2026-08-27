@@ -87,7 +87,10 @@ YCLIENTS, когда клиент подтвердил зону, дату, вр�
 `AVITO_MAX_CONCURRENCY`, `AVITO_TIMEOUT_SECONDS`, `AVITO_MAX_RETRIES`,
 `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_AFTER_ERRORS`, `LLM_DIALOG_MODEL`,
 `LLM_CLASSIFIER_MODEL`, `LLM_BASE_URL`, `DEEPSEEK_ENABLE_THINKING`,
-`YCLIENTS_*`, `MAX_AGENT_REPLIES_PER_CHAT`,
+`YCLIENTS_*`, `AGENT_MAX_REPLIES_PER_CHAT` (сколько ответов агент даёт
+в одном чате, дефолт 25; старое имя `MAX_AGENT_REPLIES_PER_CHAT` тоже
+работает — сбросить счётчик одного чата, не меняя лимит: `/reset <chat_id>`
+в боте оператора),
 `DEBOUNCE_WINDOW_SECONDS`, `DAILY_COST_LIMIT_RUB` — есть безопасные значения
 по умолчанию в `app/config.py`, трогать только осознанно. Полный список с
 комментариями — `.env.example`.

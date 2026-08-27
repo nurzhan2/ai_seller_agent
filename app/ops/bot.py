@@ -212,6 +212,36 @@ class OpsService:
         )
         return f"Провайдер переключён: {previous} → {provider}."
 
+    async def reset_reply_count(self, chat_id: str, user_id: int) -> dict:
+        """Обнулить счётчик ответов агента в одном чате.
+
+        До этого исчерпанный лимит можно было снять только руками в базе:
+        счётчик живёт в двух местах сразу (`chats.agent_reply_count` и
+        `ChatFlags` в OpsStore — см. app/pipeline.py:_count_agent_reply), и
+        обнулить надо оба. `SqlAlchemyOpsStore.set_flags` пишет в ту же
+        колонку `chats`, что читает админка, поэтому одного вызова хватает —
+        но именно поэтому обнулять надо через стор, а не UPDATE мимо него.
+
+        Сам лимит НЕ меняется: это разовое «дай доработать этот диалог», а
+        не «подними планку всем» (для второго — AGENT_MAX_REPLIES_PER_CHAT).
+        """
+        flags = await self.store.get_flags(chat_id)
+        previous = flags.agent_reply_count
+        if previous == 0:
+            return {"changed": False, "message": f"Счётчик чата {chat_id} и так пуст"}
+
+        flags.agent_reply_count = 0
+        await self.store.set_flags(chat_id, flags)
+        await self.store.log_action(chat_id, user_id, "reset_reply_count", {"was": previous})
+        limit = self.settings.max_agent_replies_per_chat
+        return {
+            "changed": True,
+            "message": (
+                f"Счётчик чата {chat_id} сброшен: было {previous}, стало 0. "
+                f"Агент снова отвечает (лимит {limit})."
+            ),
+        }
+
     async def should_agent_reply(self, chat_id: str) -> tuple[bool, str]:
         """Единая точка решения «отвечает ли агент».
 

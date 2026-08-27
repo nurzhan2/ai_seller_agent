@@ -454,3 +454,105 @@ async def test_approved_reply_to_an_allowed_chat_is_delivered():
     await service.approve("chat-1", ALLOWED_USER)
 
     assert client.sent == [("chat-1", "Здравствуйте! Свободно.")]
+
+
+# --------------------------------------------------------------------------
+# /reset — сброс счётчика ответов в одном чате
+#
+# До этой команды исчерпанный лимит снимался только правкой в базе руками.
+# --------------------------------------------------------------------------
+
+async def test_reset_lets_the_agent_reply_again(service):
+    """Главное свойство: после сброса should_agent_reply снова пропускает."""
+    flags = await service.store.get_flags("chat-1")
+    flags.agent_reply_count = service.settings.max_agent_replies_per_chat
+    await service.store.set_flags("chat-1", flags)
+    allowed, reason = await service.should_agent_reply("chat-1")
+    assert allowed is False and "лимит" in reason
+
+    result = await service.reset_reply_count("chat-1", ALLOWED_USER)
+
+    assert result["changed"] is True
+    allowed, _ = await service.should_agent_reply("chat-1")
+    assert allowed is True
+
+
+async def test_reset_reports_the_previous_count(service):
+    flags = await service.store.get_flags("chat-1")
+    flags.agent_reply_count = 25
+    await service.store.set_flags("chat-1", flags)
+
+    result = await service.reset_reply_count("chat-1", ALLOWED_USER)
+
+    assert "было 25" in result["message"]
+
+
+async def test_reset_on_a_fresh_chat_changes_nothing(service):
+    result = await service.reset_reply_count("chat-never-seen", ALLOWED_USER)
+
+    assert result["changed"] is False
+
+
+async def test_reset_does_not_touch_the_limit_itself(service):
+    """Разовое «дай доработать этот диалог», а не «подними планку всем»."""
+    before = service.settings.max_agent_replies_per_chat
+    flags = await service.store.get_flags("chat-1")
+    flags.agent_reply_count = before
+    await service.store.set_flags("chat-1", flags)
+
+    await service.reset_reply_count("chat-1", ALLOWED_USER)
+
+    assert service.settings.max_agent_replies_per_chat == before
+
+
+async def test_reset_does_not_clear_takeover(service):
+    """Сброс счётчика — не «верни чат агенту»: если оператор забрал чат,
+    он остаётся у оператора."""
+    await service.takeover("chat-1", ALLOWED_USER)
+    flags = await service.store.get_flags("chat-1")
+    flags.agent_reply_count = 25
+    await service.store.set_flags("chat-1", flags)
+
+    await service.reset_reply_count("chat-1", ALLOWED_USER)
+
+    allowed, reason = await service.should_agent_reply("chat-1")
+    assert allowed is False and "оператора" in reason
+
+
+async def test_reset_is_written_to_the_action_log(service):
+    flags = await service.store.get_flags("chat-1")
+    flags.agent_reply_count = 25
+    await service.store.set_flags("chat-1", flags)
+
+    await service.reset_reply_count("chat-1", ALLOWED_USER)
+
+    logged = [a for a in service.store.actions if a["action"] == "reset_reply_count"]
+    assert len(logged) == 1
+    assert logged[0]["user_id"] == ALLOWED_USER
+    assert logged[0]["payload"]["was"] == 25
+    # В статистику модерации сброс НЕ попадает — он не одобрение и не отказ.
+    assert service.store.moderation == {"approved": 0, "edited": 0, "rejected": 0}
+
+
+# --------------------------------------------------------------------------
+# Лимит ответов — настройка, а не константа
+# --------------------------------------------------------------------------
+
+def test_reply_limit_reads_the_new_env_name(monkeypatch):
+    monkeypatch.setenv("AGENT_MAX_REPLIES_PER_CHAT", "7")
+    assert Settings().max_agent_replies_per_chat == 7
+
+
+def test_reply_limit_still_reads_the_old_env_name(monkeypatch):
+    """MAX_AGENT_REPLIES_PER_CHAT описан в docs/RAILWAY_SETUP.md и может быть
+    уже выставлен — перестать его слушать значит незаметно вернуть лимит к
+    25 там, где его осознанно меняли."""
+    monkeypatch.delenv("AGENT_MAX_REPLIES_PER_CHAT", raising=False)
+    monkeypatch.setenv("MAX_AGENT_REPLIES_PER_CHAT", "3")
+    assert Settings().max_agent_replies_per_chat == 3
+
+
+def test_reply_limit_defaults_to_25(monkeypatch):
+    monkeypatch.delenv("AGENT_MAX_REPLIES_PER_CHAT", raising=False)
+    monkeypatch.delenv("MAX_AGENT_REPLIES_PER_CHAT", raising=False)
+    assert Settings().max_agent_replies_per_chat == 25

@@ -10,7 +10,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated, Literal, Optional
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -148,7 +148,22 @@ class Settings(BaseSettings):
     # Аварийный рубильник (/pause). Не в .env — переключается из Telegram.
     agent_paused: bool = False
     # После этого числа ответов чат уходит оператору насовсем.
-    max_agent_replies_per_chat: int = 25
+    #
+    # Читается из ДВУХ переменных: `AGENT_MAX_REPLIES_PER_CHAT` (основная) и
+    # `MAX_AGENT_REPLIES_PER_CHAT` (как было раньше — она уже описана в
+    # docs/RAILWAY_SETUP.md и может быть выставлена на стендах, молча
+    # перестать её слушать значит незаметно вернуть лимит к 25 там, где его
+    # осознанно меняли). Первое совпадение выигрывает, порядок — как в
+    # AliasChoices.
+    #
+    # Сбросить счётчик конкретного чата, не трогая лимит: /reset <chat_id>
+    # в операторском боте (app/ops/handlers.py).
+    max_agent_replies_per_chat: int = Field(
+        default=25,
+        validation_alias=AliasChoices(
+            "AGENT_MAX_REPLIES_PER_CHAT", "MAX_AGENT_REPLIES_PER_CHAT"
+        ),
+    )
     debounce_window_seconds: float = 10.0
     daily_cost_limit_rub: Decimal = Decimal("3000")
 

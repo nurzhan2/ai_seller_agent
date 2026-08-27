@@ -46,7 +46,11 @@ CLASSIFIER_MODEL = "claude-haiku-4-5-20251001"
 MAX_TOOL_ITERATIONS = 5
 MAX_TOKENS = 1024
 HISTORY_WINDOW = 30
-MAX_AGENT_REPLIES_PER_CHAT = 25
+# MAX_AGENT_REPLIES_PER_CHAT здесь НЕТ намеренно. Константа с таким именем
+# лежала в этом файле и не использовалась ни разу — из-за неё лимит
+# выглядел захардкоженным, хотя решение принимает
+# OpsService.should_agent_reply по настройке
+# Settings.max_agent_replies_per_chat (AGENT_MAX_REPLIES_PER_CHAT).
 
 # Цены за миллион токенов, рубли. Один источник для /admin/costs и для
 # оценки стоимости хода — объединяет таблицы обоих провайдеров, чтобы
