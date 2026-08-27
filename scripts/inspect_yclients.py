@@ -56,6 +56,7 @@ path-параметры, но заголовок операции в докум�
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import sys
@@ -199,10 +200,82 @@ async def run_check(client: httpx.AsyncClient, headers: dict[str, str], check: C
     print(_summarize_data(payload.get("data")))
 
 
+async def check_slots(zone_id: str, day: str) -> int:
+    """Живая проверка занятости ОДНОЙ зоны на одну дату: сырой ответ
+    book_times и то, во что его превратил наш разбор.
+
+    Существует потому, что «HTTP 200, а занятость unknown» иначе
+    приходится выяснять по логам прода: здесь обе стороны видно рядом —
+    что реально прислал YCLIENTS и что из этого получил агент.
+    """
+    from datetime import date as _date
+
+    from app.booking.mapping import SqlAlchemyZoneMapping
+    from app.booking.yclients import YClientsProvider
+    from app.db.session import get_sessionmaker
+
+    settings = get_settings()
+    try:
+        booking_day = _date.fromisoformat(day)
+    except ValueError:
+        print(f"Дата {day!r} не в формате YYYY-MM-DD.", file=sys.stderr)
+        return 1
+
+    mapping = SqlAlchemyZoneMapping(get_sessionmaker())
+    await mapping.load()
+    row = mapping.get(zone_id)
+    if row is None:
+        print(f"Зона {zone_id} не связана в zone_service_map — занятость спрашивать не у кого.\n"
+              "Связать: python -m scripts.sync_yclients_services --apply", file=sys.stderr)
+        return 1
+    print(f"zone={zone_id}  staff_id={row.get('staff_id')}  "
+          f"company_id={row.get('company_id') or settings.yclients_company_id}  date={day}")
+
+    headers = {
+        ep.AUTH_HEADER: ep.AUTH_TEMPLATE.format(
+            partner_token=settings.yclients_partner_token.get_secret_value(),
+            user_token=settings.yclients_user_token.get_secret_value(),
+        ),
+        "Accept": ep.ACCEPT_HEADER,
+    }
+    path = ep.BOOK_TIMES[1].format(
+        company_id=row.get("company_id") or settings.yclients_company_id,
+        staff_id=row.get("staff_id", "0"),
+        date=booking_day.isoformat(),
+    )
+    async with httpx.AsyncClient(base_url=ep.BASE_URL, timeout=15.0) as client:
+        await run_check(client, headers, Check("book_times — сырой ответ", path))
+
+    provider = YClientsProvider(
+        partner_token=settings.yclients_partner_token.get_secret_value(),
+        user_token=settings.yclients_user_token.get_secret_value(),
+        company_id=settings.yclients_company_id,
+        mapping=mapping,
+    )
+    availability = await provider.check_availability(zone_id, booking_day)
+    print(f"\nНаш разбор: {availability.status.value.upper()}")
+    print(f"  свободные времена: {', '.join(availability.free_slots) or '—'}")
+    print(f"  причина: {availability.reason or '—'}")
+    if availability.status.value == "unknown":
+        print("\n  UNKNOWN означает, что ответ не удалось разобрать или запрос не удался —\n"
+              "  сырой ответ выше показывает, что именно пришло.")
+    return 0
+
+
 async def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     configure_logging()
+
+    # Разбор аргументов ДО проверки токенов: иначе `--help` не работает без
+    # настроенного окружения, а это первое, что запускают, чтобы вспомнить
+    # синтаксис.
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--slots-zone", help="проверить занятость одной зоны, напр. bath_russian")
+    parser.add_argument("--slots-date", help="дата для --slots-zone, YYYY-MM-DD")
+    args = parser.parse_args()
 
     settings = get_settings()
     if not settings.yclients_partner_token.get_secret_value():
@@ -211,6 +284,12 @@ async def main() -> int:
     if not settings.yclients_company_id:
         print("YCLIENTS_COMPANY_ID не задан — нечего инспектировать.", file=sys.stderr)
         return 1
+
+    if args.slots_zone:
+        if not args.slots_date:
+            print("--slots-zone требует --slots-date YYYY-MM-DD", file=sys.stderr)
+            return 1
+        return await check_slots(args.slots_zone, args.slots_date)
 
     headers = {
         ep.AUTH_HEADER: ep.AUTH_TEMPLATE.format(

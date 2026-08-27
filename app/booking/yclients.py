@@ -40,6 +40,62 @@ logger = logging.getLogger("parmangal.yclients")
 SLOTS_CACHE_KEY = "yclients:slots:{zone_id}:{date}"
 SLOTS_CACHE_TTL = 60
 
+# Ключи, под которыми у YCLIENTS может лежать список сеансов, если data —
+# объект, а не массив. По документации book_times отдаёт МАССИВ объектов
+# {time, seance_length, datetime}, и это основной путь; но соседний
+# book_staff_seances в той же документации отдаёт объект
+# {seance_date, seances: [...]}, поэтому вложенный список тоже разбирается —
+# ошибиться формой здесь означает молча превратить рабочий ответ в unknown.
+_SEANCE_LIST_KEYS = ("seances", "times", "slots", "data")
+
+
+def _parse_seances(data: Any) -> Optional[tuple[str, ...]]:
+    """Времена сеансов из data. None — формат не распознан (НЕ «пусто»).
+
+    Пустой кортеж и None различаются намеренно: первое значит «ответ понят,
+    сеансов нет» (это BUSY), второе — «ответ не понят» (это UNKNOWN).
+    Свалить их в одно значило бы сказать клиенту «занято» там, где мы на
+    самом деле не разобрали ответ.
+    """
+    if isinstance(data, dict):
+        for key in _SEANCE_LIST_KEYS:
+            nested = data.get(key)
+            if isinstance(nested, list):
+                data = nested
+                break
+        else:
+            return None
+    if not isinstance(data, list):
+        return None
+
+    slots: list[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            value = item.get("time")
+            if value:
+                slots.append(str(value))
+        elif isinstance(item, str) and item:
+            # На случай, если придёт плоский список времён.
+            slots.append(item)
+    return tuple(slots)
+
+
+def _slots_to_availability(slots: tuple[str, ...]) -> Availability:
+    """Три состояния, а не два: есть сеансы -> FREE, нет -> BUSY.
+
+    Раньше пустой список возвращался как FREE без слотов — то есть
+    «свободно, но предложить нечего». Агент на это отвечал клиенту
+    «свободно» и замолкал. Пусто на успешном ответе означает ровно
+    «на эту дату записаться не к чему» — для клиента это «занято», и
+    именно с этим агент может работать: предложить другое время или дату.
+    """
+    if slots:
+        return Availability(AvailabilityStatus.FREE, free_slots=slots)
+    return Availability(
+        AvailabilityStatus.BUSY,
+        reason="на эту дату свободных сеансов нет",
+    )
+
 
 class YClientsProvider:
     def __init__(
@@ -109,6 +165,16 @@ class YClientsProvider:
         finally:
             if self._client is None:
                 await client.aclose()
+
+        # Сырой ответ в лог. Повод: book_times отдавал HTTP 200, а занятость
+        # становилась unknown — по коду ответа отличить «пришло пусто»,
+        # «пришло success:false» и «пришло не то, чего мы ждём» было
+        # невозможно, а тела ответа в логе не было вовсе. Здесь нет
+        # персональных данных: book_times/book_services возвращают время и
+        # услуги, не клиентов. Обрезано, чтобы один ответ не занял пол-лога.
+        logger.info(
+            "yclients %s -> %s", path, json.dumps(payload, ensure_ascii=False)[:1500],
+        )
 
         if isinstance(payload, dict) and payload.get("success") is False:
             logger.warning(
@@ -221,7 +287,9 @@ class YClientsProvider:
 
         cached = await self._cache_get(zone_id, date)
         if cached is not None:
-            return Availability(AvailabilityStatus.FREE, free_slots=tuple(cached))
+            # Пустой список в кеше — это «на эту дату сеансов нет», а не
+            # «кеша нет»: раньше он возвращался как FREE без слотов.
+            return _slots_to_availability(tuple(cached))
 
         data = await self._request(
             ep.BOOK_TIMES,
@@ -232,11 +300,24 @@ class YClientsProvider:
             ),
         )
         if data is None:
+            # ЕДИНСТВЕННЫЙ путь к UNKNOWN: запрос не удался (сеть, 4xx/5xx,
+            # success:false в теле). «Успешно, но сеансов нет» сюда НЕ
+            # попадает — см. ниже.
             return Availability(AvailabilityStatus.UNKNOWN, reason="сервис недоступен")
 
-        slots = tuple(str(item.get("time")) for item in data if item.get("time"))
+        slots = _parse_seances(data)
+        if slots is None:
+            # Ответ успешный, но формы, которой мы не знаем. Честнее сказать
+            # «не знаю», чем принять неразобранное за «свободных сеансов
+            # нет» — второе агент озвучит клиенту как «занято».
+            logger.warning(
+                "yclients book_times: не удалось разобрать data (%s) — %s",
+                type(data).__name__, json.dumps(data, ensure_ascii=False)[:500],
+            )
+            return Availability(AvailabilityStatus.UNKNOWN, reason="неизвестный формат ответа")
+
         await self._cache_set(zone_id, date, list(slots))
-        return Availability(AvailabilityStatus.FREE, free_slots=slots)
+        return _slots_to_availability(slots)
 
     # -- кеш ---------------------------------------------------------------
 

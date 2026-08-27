@@ -424,3 +424,171 @@ async def test_agent_tool_reports_busy_with_alternatives(kb, mapping, verified):
     assert result["status"] == "busy"
     assert "18:00" in result["free_slots"]
     assert "не заканчивай разговор отказом" in result["instruction"]
+
+
+# --------------------------------------------------------------------------
+# Реальная структура ответа book_times
+#
+# Повод: HTTP 200 от YCLIENTS превращался в unknown, и агент уходил к
+# менеджеру там, где мог сказать «занято, есть такие-то варианты».
+# Структура — из официальной документации YCLIENTS (раздел «Получить список
+# сеансов доступных для бронирования»): data — МАССИВ объектов с полями
+# time ("17:30"), seance_length (секунды), datetime (ISO8601).
+# --------------------------------------------------------------------------
+
+REAL_BOOK_TIMES_RESPONSE = {
+    "success": True,
+    "data": [
+        {"time": "12:00", "seance_length": 3600, "datetime": "2026-08-29T12:00:00+03:00"},
+        {"time": "13:00", "seance_length": 3600, "datetime": "2026-08-29T13:00:00+03:00"},
+        {"time": "18:00", "seance_length": 3600, "datetime": "2026-08-29T18:00:00+03:00"},
+    ],
+    "meta": [],
+}
+
+
+@respx.mock
+async def test_real_book_times_response_is_parsed_into_free_slots(mapping, verified):
+    respx.get(times_url()).mock(return_value=httpx.Response(200, json=REAL_BOOK_TIMES_RESPONSE))
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.FREE
+    assert result.free_slots == ("12:00", "13:00", "18:00")
+
+
+@respx.mock
+async def test_successful_response_with_no_seances_is_busy_not_unknown(mapping, verified):
+    """Главная правка: «успешно, но сеансов нет» — это ЗАНЯТО, а не «не
+    знаю». Раньше пустой список возвращался как FREE без слотов, то есть
+    «свободно, но предложить нечего», и агент замолкал."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": [], "meta": []})
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.BUSY
+    assert result.is_known is True          # мы ЗНАЕМ, что занято
+    assert result.free_slots == ()
+
+
+@respx.mock
+async def test_success_false_body_is_unknown_even_on_http_200(mapping, verified):
+    """200 в HTTP ещё не значит успех: конверт v2.0 несёт success отдельно.
+    Это единственный оставшийся путь к unknown — реальный сбой запроса."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(
+            200, json={"success": False, "data": None, "meta": {"message": "staff not found"}}
+        )
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.UNKNOWN
+
+
+@respx.mock
+async def test_unrecognised_shape_is_unknown_not_busy(mapping, verified):
+    """Неразобранный ответ НЕ должен выдаваться за «занято»: сказать
+    клиенту «занято» на основании непонятого ответа хуже, чем «уточню»."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": {"unexpected": 1}, "meta": []})
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.UNKNOWN
+    assert "формат" in (result.reason or "")
+
+
+@respx.mock
+async def test_nested_seances_object_is_also_parsed(mapping, verified):
+    """Соседний метод той же документации (book_staff_seances) отдаёт
+    объект {seance_date, seances: [...]}. Ошибиться формой здесь значит
+    молча превратить рабочий ответ в unknown — разбираем оба варианта."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(200, json={
+            "success": True,
+            "data": {"seance_date": 1492041600, "seances": [{"time": "10:00"}]},
+            "meta": [],
+        })
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.FREE
+    assert result.free_slots == ("10:00",)
+
+
+@respx.mock
+async def test_check_availability_on_a_free_day_without_time_reports_free(mapping, verified):
+    respx.get(times_url()).mock(return_value=httpx.Response(200, json=REAL_BOOK_TIMES_RESPONSE))
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.check_availability("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.FREE
+    assert "18:00" in result.free_slots
+
+
+@respx.mock
+async def test_check_availability_with_no_seances_reports_busy(mapping, verified):
+    """Сквозь весь путь: агент получает «занято» и может предложить
+    альтернативы, а не эскалировать."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": [], "meta": []})
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+
+    result = await provider.check_availability("bath_russian", DAY, start_time=time(14, 0))
+
+    assert result.status is AvailabilityStatus.BUSY
+
+
+@respx.mock
+async def test_agent_tool_says_busy_and_offers_alternatives_on_an_empty_day(kb, mapping, verified):
+    """То, ради чего всё это: инструмент агента отдаёт busy с инструкцией
+    предложить варианты — вместо unknown с «уточню у менеджера»."""
+    respx.get(times_url()).mock(
+        return_value=httpx.Response(200, json={"success": True, "data": [], "meta": []})
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY - timedelta(days=1))
+
+    result = await ex.run(
+        "check_availability",
+        {"zone_id": "bath_russian", "date": DAY.isoformat(), "start_time": "14:00"},
+    )
+
+    assert result["status"] == "busy"
+    assert "find_next_available" in result["instruction"]
+
+
+@respx.mock
+async def test_find_next_available_skips_empty_days_and_returns_ascending(kb, mapping, verified):
+    """Дни без сеансов теперь BUSY, а не FREE-без-слотов — поиск обязан их
+    пропускать и отдавать даты по возрастанию."""
+    empty = {"success": True, "data": [], "meta": []}
+    for offset in range(14):
+        day = DAY + timedelta(days=offset)
+        # Свободны только +1 и +3, остальные пустые.
+        body = REAL_BOOK_TIMES_RESPONSE if offset in (1, 3) else empty
+        respx.get(times_url(day=day)).mock(return_value=httpx.Response(200, json=body))
+
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY)
+
+    result = await ex.run(
+        "find_next_available",
+        {"zone_id": "bath_russian", "from_date": DAY.isoformat(), "limit": 3},
+    )
+
+    dates = [entry["date"] for entry in result["dates"]]
+    assert dates == [(DAY + timedelta(days=1)).isoformat(), (DAY + timedelta(days=3)).isoformat()]
+    assert dates == sorted(dates)
