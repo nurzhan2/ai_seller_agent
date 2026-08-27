@@ -113,6 +113,22 @@ class SqlAlchemyTouchStore:
 
 
 Sender = Callable[[str, str], Awaitable[None]]
+# chat_id -> можно ли вообще писать в этот чат (белый список объявлений).
+CanSend = Callable[[str], Awaitable[bool]]
+
+
+def _disarmed(state: TouchState) -> TouchState:
+    """Тот же счётчик касаний, но без срока следующего.
+
+    Счётчик не обнуляем: он — история («сколько раз мы этого клиента уже
+    трогали»), и переписывать её из-за фильтра неправильно. Гасим ровно
+    то, из-за чего диалог продолжает всплывать в `list_due`.
+    """
+    return TouchState(
+        touch_count=state.touch_count,
+        last_touch_at=state.last_touch_at,
+        next_touch_due_at=None,
+    )
 
 
 async def run_scheduler_pass(
@@ -124,6 +140,7 @@ async def run_scheduler_pass(
     *,
     delay_minutes: int,
     max_count: int,
+    can_send: Optional[CanSend] = None,
 ) -> list[str]:
     """Один проход. Возвращает chat_id всех диалогов, которым реально
     отправили касание за этот проход.
@@ -132,12 +149,30 @@ async def run_scheduler_pass(
     молча": диалоги остаются due (next_touch_due_at не трогается), поэтому
     следующий проход воркера (после открытия окна) их подхватит сам —
     никакого отдельного пересчёта "когда открыть окно" не нужно.
+
+    `can_send` — белый список объявлений (`OutboundGate.is_allowed`).
+    Проверяется ЗДЕСЬ, а не только внутри `send`, по двум причинам: гейт
+    молча вернул бы «заблокировано», а воркер всё равно записал бы касание
+    как отправленное и сдвинул счётчик; и таймер такого чата надо не
+    пропустить, а ПОГАСИТЬ — иначе он остаётся due навсегда и воркер
+    спотыкается о него каждую минуту до конца времён. Гашение здесь же
+    работает и как разовая уборка: чаты, попавшие в таблицу касаний до
+    появления фильтра (именно так туда попал u2u-чат из инцидента),
+    вычищаются сами при первой же попытке их коснуться.
     """
     if not is_within_working_hours(now, working_window):
         return []
 
     touched: list[str] = []
     for dialog in await store.list_due(now, max_count):
+        if can_send is not None and not await can_send(dialog.chat_id):
+            await store.save(dialog.chat_id, _disarmed(dialog.state))
+            logger.info(
+                "touch scheduler: касание отменено — чат вне белого списка объявлений, "
+                "таймер погашен",
+                extra={"chat_id": dialog.chat_id},
+            )
+            continue
         outcome = advance_touch(dialog.state, now, delay_minutes, max_count)
         text = templates[outcome.template_key]
         try:

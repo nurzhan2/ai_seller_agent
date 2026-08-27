@@ -101,6 +101,7 @@ async def supervised_touch_scheduler(
     max_count: int,
     interval_seconds: int,
     now_fn: Any = lambda: datetime.now(timezone.utc),
+    can_send: Any = None,
 ) -> None:
     """Периодический проход воркера отложенных касаний.
 
@@ -125,6 +126,7 @@ async def supervised_touch_scheduler(
                 store, current.concessions.policy.touch_templates,
                 current.catalog.constants.working_window, send, now_fn(),
                 delay_minutes=delay_minutes, max_count=max_count,
+                can_send=can_send,
             )
         except asyncio.CancelledError:
             raise
@@ -283,8 +285,22 @@ async def lifespan(app: FastAPI):
     # Два отдельных означали бы два пула соединений и два независимых кеша
     # access-токена — второй обновлял бы токен, не зная про первый.
     avito_client = AvitoClient(settings=settings, redis=redis_client)
+
+    # dialog_store создаётся ЗДЕСЬ, а не ниже вместе с конвейером: он нужен
+    # гейту исходящих, а гейт — воркеру касаний, который стартует раньше.
+    from app.channels.outbound_gate import OutboundGate
+    from app.dialog_store import SqlAlchemyDialogStore
+
+    dialog_store = SqlAlchemyDialogStore(get_sessionmaker())
+    # Единственная дверь наружу. Дальше по коду в качестве «клиента Авито»
+    # передаётся ИМЕННО гейт, а не avito_client — чтобы новый путь отправки
+    # физически не мог обойти белый список объявлений (см. докстринг
+    # app/channels/outbound_gate.py: касание уже однажды ушло клиенту,
+    # которому агент писать не должен).
+    outbound = OutboundGate(avito_client, settings, dialog_store.get_chat_item_id)
+
     touch_store = SqlAlchemyTouchStore(get_sessionmaker())
-    touch_sender = build_touch_sender(settings, ops_service, ops_bot, avito_client)
+    touch_sender = build_touch_sender(settings, ops_service, ops_bot, outbound)
     touch_task = asyncio.create_task(
         supervised_touch_scheduler(
             # Функция, а не снимок: рабочее окно правится из Telegram на
@@ -294,6 +310,10 @@ async def lifespan(app: FastAPI):
             delay_minutes=settings.touch_reminder_delay_minutes,
             max_count=settings.touch_max_count,
             interval_seconds=settings.touch_scheduler_interval_seconds,
+            # Отдельно от гейта внутри touch_sender: воркеру нужно не просто
+            # не отправить, а погасить таймер — иначе чат остаётся due
+            # навсегда. См. run_scheduler_pass.
+            can_send=outbound.is_allowed,
         )
     )
     logger.info("touch scheduler: started")
@@ -304,14 +324,12 @@ async def lifespan(app: FastAPI):
     # а вебхук обязан оставаться тонким: принял, дедуплицировал, ответил 200.
     from app.agent.loop import AgentLoop
     from app.agent.providers.factory import build_provider, resolve_models
-    from app.dialog_store import SqlAlchemyDialogStore
     from app.pipeline import MessagePipeline
 
     dialog_model, classifier_model = resolve_models(settings)
-    # Одна переменная, а не инлайн в MessagePipeline(store=...): её
-    # count_concessions_today нужен ещё и AgentLoop — R10 (дневной лимит
-    # уступок) без него никогда не видит реальное число, только 0.
-    dialog_store = SqlAlchemyDialogStore(get_sessionmaker())
+    # dialog_store уже создан выше (нужен гейту исходящих). Он же идёт и
+    # сюда: его count_concessions_today нужен AgentLoop — R10 (дневной
+    # лимит уступок) без него никогда не видит реальное число, только 0.
     agent_loop = AgentLoop(
         client=build_provider(settings),
         kb=app.state.kb,
@@ -326,7 +344,7 @@ async def lifespan(app: FastAPI):
         ops_service=ops_service,
         settings=settings,
         kb=app.state.kb,
-        avito_client=avito_client,
+        avito_client=outbound,
         ops_bot=ops_bot,
         # Пауза «как живой человек» перед реальной отправкой — не в DRY_RUN,
         # там ответ и так ждёт кнопки оператора (см. MessagePipeline.delay_fn).

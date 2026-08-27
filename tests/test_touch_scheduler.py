@@ -175,3 +175,93 @@ async def test_state_reloaded_after_restart_is_picked_up_by_a_fresh_store():
 
     assert touched == ["chat-1"]
     assert sent == [("chat-1", TEMPLATES[TEMPLATE_SOFT])]
+
+
+# --------------------------------------------------------------------------
+# Белый список объявлений (инцидент: касание ушло в чат u2u-…)
+# --------------------------------------------------------------------------
+
+def _blocker(*blocked: str):
+    """can_send, запрещающий перечисленные чаты."""
+    async def can_send(chat_id: str) -> bool:
+        return chat_id not in blocked
+
+    return can_send
+
+
+async def test_touch_is_not_sent_to_a_blocked_chat():
+    """Главный сценарий инцидента: в 09:00 третье касание ушло в чат
+    u2u-2QuAfvI4HoxsE7IKKDN3SA, которому агент писать не должен."""
+    chat = "u2u-2QuAfvI4HoxsE7IKKDN3SA"
+    store = InMemoryTouchStore(dialogs={
+        chat: TouchState(touch_count=2, last_touch_at=NOW - timedelta(minutes=30), next_touch_due_at=NOW),
+    })
+    send, sent = _sender()
+
+    touched = await run_scheduler_pass(
+        store, TEMPLATES, WINDOW, send, NOW, delay_minutes=30, max_count=3,
+        can_send=_blocker(chat),
+    )
+
+    assert sent == []
+    assert touched == []
+
+
+async def test_blocked_chat_gets_its_timer_disarmed_not_just_skipped():
+    """Пропустить мало: диалог остался бы due и всплывал в каждом проходе
+    воркера до конца времён. Гасим срок — и это же чистит чаты, попавшие в
+    таблицу касаний до появления фильтра."""
+    chat = "u2u-old"
+    store = InMemoryTouchStore(dialogs={
+        chat: TouchState(touch_count=2, last_touch_at=NOW - timedelta(minutes=30), next_touch_due_at=NOW),
+    })
+    send, sent = _sender()
+
+    await run_scheduler_pass(
+        store, TEMPLATES, WINDOW, send, NOW, delay_minutes=30, max_count=3,
+        can_send=_blocker(chat),
+    )
+
+    assert store.dialogs[chat].next_touch_due_at is None
+    # Счётчик — история, а не следствие фильтра: его не переписываем.
+    assert store.dialogs[chat].touch_count == 2
+
+    # Второй проход по тому же стору диалог уже не находит.
+    touched_again = await run_scheduler_pass(
+        store, TEMPLATES, WINDOW, send, NOW, delay_minutes=30, max_count=3,
+        can_send=_blocker(chat),
+    )
+    assert touched_again == []
+
+
+async def test_allowed_chats_are_untouched_by_the_filter():
+    """Фильтр не должен задевать соседей: в одном проходе заблокированный
+    и разрешённый чат обрабатываются независимо."""
+    store = InMemoryTouchStore(dialogs={
+        "blocked": TouchState(touch_count=1, last_touch_at=NOW - timedelta(minutes=30), next_touch_due_at=NOW),
+        "allowed": TouchState(touch_count=1, last_touch_at=NOW - timedelta(minutes=30), next_touch_due_at=NOW),
+    })
+    send, sent = _sender()
+
+    touched = await run_scheduler_pass(
+        store, TEMPLATES, WINDOW, send, NOW, delay_minutes=30, max_count=3,
+        can_send=_blocker("blocked"),
+    )
+
+    assert touched == ["allowed"]
+    assert sent == [("allowed", TEMPLATES[TEMPLATE_SOFT])]
+    assert store.dialogs["allowed"].touch_count == 2
+    assert store.dialogs["blocked"].touch_count == 1
+
+
+async def test_without_can_send_everything_works_as_before():
+    """Обратная совместимость: параметр не передан — поведение прежнее."""
+    store = InMemoryTouchStore(dialogs={
+        "chat-1": TouchState(touch_count=1, last_touch_at=NOW - timedelta(minutes=30), next_touch_due_at=NOW),
+    })
+    send, sent = _sender()
+
+    touched = await run_scheduler_pass(store, TEMPLATES, WINDOW, send, NOW, delay_minutes=30, max_count=3)
+
+    assert touched == ["chat-1"]
+    assert sent == [("chat-1", TEMPLATES[TEMPLATE_SOFT])]

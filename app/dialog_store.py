@@ -91,6 +91,11 @@ class DialogStore(Protocol):
 
     async def bump_agent_reply_count(self, chat_id: str) -> None: ...
 
+    # Только чтение, БЕЗ создания чата: нужен `OutboundGate`, чтобы решить,
+    # имеем ли мы право писать в этот чат. `get_or_create_chat` тут не
+    # годится — проверка перед отправкой не должна заводить строку в базе.
+    async def get_chat_item_id(self, chat_id: str) -> Optional[str]: ...
+
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None: ...
@@ -232,6 +237,10 @@ class InMemoryDialogStore:
             ai_enabled=existing.ai_enabled,
             agent_reply_count=existing.agent_reply_count + 1,
         )
+
+    async def get_chat_item_id(self, chat_id: str) -> Optional[str]:
+        existing = self.chats.get(chat_id)
+        return existing.item_id if existing else None
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         return self.item_zones.get(item_id)
@@ -460,6 +469,24 @@ class SqlAlchemyDialogStore:
                 return
             chat.agent_reply_count = (chat.agent_reply_count or 0) + 1
             await session.commit()
+
+    async def get_chat_item_id(self, chat_id: str) -> Optional[str]:
+        """Объявление чата — для `OutboundGate` перед отправкой клиенту.
+
+        Отдельный SELECT, а не `get_or_create_chat`: проверка права писать
+        не должна заводить строку в базе для чата, которого мы, возможно,
+        и знать не хотим.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Chat
+
+        async with self._session_factory() as session:
+            return (
+                await session.execute(
+                    select(Chat.item_id).where(Chat.chat_id == chat_id)
+                )
+            ).scalar_one_or_none()
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         """Реализация `ItemZoneLookup` — какому объявлению какая зона

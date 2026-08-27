@@ -387,3 +387,70 @@ def test_digest_lists_leads_and_unanswered_topics():
 def test_callback_parsing():
     assert parse_callback("approve:c-123") == ("approve", "c-123")
     assert parse_callback("takeover:abc") == ("takeover", "abc")
+
+
+# --------------------------------------------------------------------------
+# Белый список объявлений на пути «одобрено оператором»
+#
+# ВАЖНО ПРО ПРОД: `send_to_avito` у OpsService сегодня НЕ подключён в
+# app/main.py (см. там же), то есть одобрение в Telegram фактически не
+# доставляет ответ клиенту — утечь по этому пути пока нечему. Тесты ниже
+# закрывают его на будущее: когда доставку включат, она обязана идти через
+# OutboundGate, а не мимо него.
+# --------------------------------------------------------------------------
+
+async def test_approved_reply_to_a_blocked_chat_is_not_delivered():
+    from app.channels.outbound_gate import ListingNotAllowed, OutboundGate
+
+    class _Client:
+        def __init__(self):
+            self.sent: list[tuple[str, str]] = []
+
+        async def send_message(self, chat_id, text):
+            self.sent.append((chat_id, text))
+            return {"ok": True}
+
+    async def lookup(chat_id: str):
+        return None            # чат по профилю: объявления нет
+
+    client = _Client()
+    gate = OutboundGate(client, Settings(avito_allowed_items="item-1"), lookup)
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True),
+        send_to_avito=gate.send_message,
+    )
+    await service.queue_reply("u2u-chat", "Здравствуйте! Свободно.")
+
+    with pytest.raises(ListingNotAllowed):
+        await service.approve("u2u-chat", ALLOWED_USER)
+
+    assert client.sent == []
+
+
+async def test_approved_reply_to_an_allowed_chat_is_delivered():
+    from app.channels.outbound_gate import OutboundGate
+
+    class _Client:
+        def __init__(self):
+            self.sent: list[tuple[str, str]] = []
+
+        async def send_message(self, chat_id, text):
+            self.sent.append((chat_id, text))
+            return {"ok": True}
+
+    async def lookup(chat_id: str):
+        return "item-1"
+
+    client = _Client()
+    gate = OutboundGate(client, Settings(avito_allowed_items="item-1"), lookup)
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True),
+        send_to_avito=gate.send_message,
+    )
+    await service.queue_reply("chat-1", "Здравствуйте! Свободно.")
+
+    await service.approve("chat-1", ALLOWED_USER)
+
+    assert client.sent == [("chat-1", "Здравствуйте! Свободно.")]

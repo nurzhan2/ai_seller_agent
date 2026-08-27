@@ -647,6 +647,46 @@ async def test_missing_item_id_passes_when_the_allowlist_is_empty():
     assert len(agent.calls) == 1
 
 
+async def test_no_touch_timer_is_armed_for_a_blocked_listing():
+    """Пункт 4: чат вне белого списка не должен попадать в таблицу касаний
+    вообще. Проверка стоит до создания диалога, поэтому и таймеру взяться
+    неоткуда — но именно это и надо зафиксировать тестом: тот u2u-чат из
+    инцидента попал в таблицу до появления фильтра, и повториться это не
+    должно."""
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="item-vacancy", text="Вакансия актуальна?"))
+    await _settle()
+
+    _concession, touch = await store.load_dialog_state("chat-1")
+    assert touch.next_touch_due_at is None
+    assert touch.touch_count == 0
+
+
+async def test_a_blocked_listing_cannot_arm_a_timer_even_after_a_price_turn():
+    """Тот же инвариант, но через путь, который реально ставит таймер:
+    таймер заводится только после названной цены (_advance_touch_after_reply).
+    Ход агента для заблокированного чата не начинается вовсе, значит и
+    цены нет, и таймера."""
+    agent = _FakeAgentLoop(
+        TurnResult(
+            text="Баня в субботу — 7 000 ₽ за 2 часа.",
+            quote_statuses=["ok"],
+            concession_state=DialogConcessionState(base_price_quoted=True, touch_count=1),
+        )
+    )
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings, agent=agent)
+
+    await pipeline.handle_message(_payload(item_id="item-glamping-sale"))
+    await _settle()
+
+    assert agent.calls == []
+    _concession, touch = await store.load_dialog_state("chat-1")
+    assert touch.next_touch_due_at is None
+
+
 async def test_blocked_listing_is_logged_with_the_item_id(caplog):
     settings = _settings(avito_allowed_items="item-1")
     pipeline, store, agent, _ = _build(settings=settings)
