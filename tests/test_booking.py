@@ -8,7 +8,7 @@ UNKNOWN, а не в FREE и не в исключение. Провайдер, к
 from __future__ import annotations
 
 import json
-from datetime import date, time
+from datetime import date, time, timedelta
 from decimal import Decimal
 
 import httpx
@@ -396,7 +396,11 @@ def test_empty_mapping_reports_zero_coverage(kb):
 
 async def test_agent_tool_degrades_to_unknown(kb, mapping):
     provider = YClientsProvider(mapping=mapping)
-    ex = ToolExecutor(kb, "d1", booking_provider=provider)
+    # today_fn зафиксирован ДО DAY: без него check_availability отклонит
+    # DAY как прошедшую дату, как только реальные часы обгонят её, и тест
+    # перестанет проверять деградацию провайдера — начнёт зелено падать по
+    # совсем другой причине.
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY - timedelta(days=1))
     result = await ex.run(
         "check_availability", {"zone_id": "bath_russian", "date": "2026-07-18", "start_time": "14:00"}
     )
@@ -412,7 +416,7 @@ async def test_agent_tool_reports_busy_with_alternatives(kb, mapping, verified):
         )
     )
     provider = YClientsProvider(mapping=mapping, company_id="1")
-    ex = ToolExecutor(kb, "d1", booking_provider=provider)
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY - timedelta(days=1))
     result = await ex.run(
         "check_availability",
         {"zone_id": "bath_russian", "date": "2026-07-18", "start_time": "14:00"},

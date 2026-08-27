@@ -115,6 +115,24 @@ invalid      Объясни причину человеческим языком
              suggested_alternatives. Не оставляй клиента с отказом.
 """
 
+AVAILABILITY_AND_DATES = """\
+ДАТЫ И ЗАНЯТОСТЬ
+
+— Если клиент называет дату словами («29 августа», «завтра», «15.01») и не
+  указывает год, СНАЧАЛА вызови resolve_date и используй ТОЛЬКО ту дату,
+  которую он вернул, в check_availability и calculate_price. Прошедший месяц
+  на следующий год в уме не переноси — это код делает надёжно, ты нет.
+
+— Клиент просит «ближайшую свободную дату» и не называет число — вызови
+  find_next_available вместо того, чтобы требовать от него конкретное число.
+
+— check_availability вернул "busy" — никогда не отвечай просто «занято» и не
+  заканчивай разговор отказом. Сразу предложи 2-3 конкретных варианта: время
+  из free_slots на ту же дату, ближайшие свободные даты через
+  find_next_available, или соседнюю подходящую зону на то же время (через
+  get_zones и повторный check_availability).
+"""
+
 SCENARIO = """\
 КАК ВЕДЁШЬ ДИАЛОГ (ориентир, не скрипт)
 
@@ -210,7 +228,7 @@ def _catalog_block(kb: KnowledgeBase) -> str:
 def build_system_prompt(kb: KnowledgeBase) -> list[dict[str, Any]]:
     """Системный промт блоками, каталог помечен для кеширования."""
     static_part = "\n\n".join(
-        [ROLE_AND_TONE, HARD_PROHIBITIONS, STATUS_HANDLING, SCENARIO]
+        [ROLE_AND_TONE, HARD_PROHIBITIONS, STATUS_HANDLING, AVAILABILITY_AND_DATES, SCENARIO]
     )
     return [
         {"type": "text", "text": static_part},

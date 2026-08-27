@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -586,8 +586,15 @@ async def test_availability_is_asked_once_per_slot_within_a_turn(session_factory
     store = SqlAlchemyDialogStore(session_factory)
     provider = _FakeBookingProvider(AvailabilityStatus.FREE)
     kb = load_catalog()
+    # today_fn зафиксирован ДО даты из _CALCULATE_PRICE_ARGS (2026-07-18):
+    # без этого проверку "дата в прошлом" в check_availability рано или
+    # поздно (когда реальные часы обгонят захардкоженную дату) начнёт
+    # срабатывать раньше вызова провайдера, и assert ниже стал бы зелёным
+    # по случайной причине — провайдер вызван request_concession, а не
+    # check_availability, чей вызов как раз и проверяет этот тест.
     ex = ToolExecutor(kb, "d-cache", booking_provider=provider,
-                      concessions_today_provider=store.count_concessions_today)
+                      concessions_today_provider=store.count_concessions_today,
+                      today_fn=lambda: date(2026, 7, 1))
 
     await ex.run("calculate_price", _CALCULATE_PRICE_ARGS)
     await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-07-18",

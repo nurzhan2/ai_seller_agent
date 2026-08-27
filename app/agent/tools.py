@@ -15,10 +15,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, is_dataclass
-from datetime import date as DateType, datetime, time as TimeType
+from datetime import date as DateType, datetime, time as TimeType, timedelta
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
+from app.agent.dates import resolve_relative_date
 from app.config import get_settings
 from app.kb.loader import KnowledgeBase
 from app.pricing.concessions import (
@@ -56,6 +57,53 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "date": {"type": "string", "description": "Дата в формате YYYY-MM-DD"},
             },
+        },
+    },
+    {
+        "name": "resolve_date",
+        "description": (
+            "Превратить дату, названную клиентом словами («29 августа», «завтра», "
+            "«15.01»), в формат YYYY-MM-DD. ОБЯЗАТЕЛЬНО вызывай этот инструмент "
+            "перед check_availability и calculate_price, если клиент не написал "
+            "дату сразу цифрами ISO — год в уме не считай, если он не назван: "
+            "код сам возьмёт ближайшую будущую дату. Используй в этих инструментах "
+            "ТОЛЬКО дату, которую вернул resolve_date, не переписывай её. Если "
+            "получил error — фраза не распознана, переспроси у клиента число."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Фраза клиента с датой, дословно"},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "find_next_available",
+        "description": (
+            "Найти ближайшие свободные даты для зоны — вызывай, когда клиент "
+            "просит «ближайшую свободную» и не называет число, или когда "
+            "запрошенная дата занята и клиент готов рассмотреть другую. Ищет "
+            "вперёд не дальше 14 дней и возвращает первые несколько дат с "
+            "хотя бы одним свободным временем. Не заменяет check_availability "
+            "на выбранной дате — подтверди ей перед тем, как называть цену."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "zone_id": {"type": "string", "description": "Идентификатор зоны из get_zones"},
+                "hours": {"type": "integer", "description": "Сколько часов нужно"},
+                "guests": {"type": "integer", "description": "Количество гостей"},
+                "from_date": {
+                    "type": "string",
+                    "description": "С какой даты искать, YYYY-MM-DD. Обычно не указывать — по умолчанию сегодня.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Сколько дат вернуть (по умолчанию 3)",
+                },
+            },
+            "required": ["zone_id"],
         },
     },
     {
@@ -126,7 +174,9 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "check_availability",
         "description": (
-            "Проверить занятость зоны на дату и время. Если вернулся status "
+            "Проверить занятость зоны на дату и время. Дата — строго YYYY-MM-DD; "
+            "если клиент назвал её словами, сначала вызови resolve_date и передай "
+            "сюда его результат, а не свои вычисления. Если вернулся status "
             "\"unknown\" — свободно или нет, мы не знаем: скажи «уточню у менеджера» "
             "и вызови escalate_to_human. Не выдумывай, что свободно."
         ),
@@ -267,6 +317,14 @@ def quote_to_dict(q: PriceQuote) -> dict:
 # Исполнение инструментов
 # --------------------------------------------------------------------------
 
+# find_next_available: горизонт поиска и он же потолок числа запросов к
+# YCLIENTS за один вызов инструмента (один запрос на день горизонта) — не
+# выстрелить сотней обращений за один ход, как просили при разборе живого
+# диалога.
+FIND_NEXT_AVAILABLE_HORIZON_DAYS = 14
+FIND_NEXT_AVAILABLE_DEFAULT_LIMIT = 3
+
+
 def _parse_date(value: Optional[str]) -> Optional[DateType]:
     if not value:
         return None
@@ -323,6 +381,7 @@ class ToolExecutor:
         booking_provider: Any = None,
         concessions_blocked: bool = False,
         concessions_today_provider: Any = None,
+        today_fn: Callable[[], DateType] = DateType.today,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
@@ -344,6 +403,15 @@ class ToolExecutor:
         # request_concession не вызывает decide() вообще, ни при каких
         # условиях не предлагая клиенту скидку в этом ходе.
         self.concessions_blocked = concessions_blocked
+        # Только для resolve_date/find_next_available и валидации "дата в
+        # прошлом" в check_availability — сделано инъекцией специально ради
+        # тестируемости («29 августа» должно резолвиться по фиксированному
+        # today, а не по реальным часам машины, где бы тесты ни запускались).
+        # _days_until()/_tool_request_concession ниже по файлу по-прежнему
+        # берут DateType.today() напрямую — не трогаю их в этой задаче:
+        # это отдельная зона риска (движок уступок), не связанная с датами
+        # бронирования.
+        self._today_fn = today_fn
         self.escalated = False
         self.escalation_reason: Optional[str] = None
         self.last_quote: Optional[PriceQuote] = None
@@ -634,6 +702,25 @@ class ToolExecutor:
             return False, False
         return availability.status.value == "free", True
 
+    # -- даты -----------------------------------------------------------------
+
+    async def _tool_resolve_date(self, args: dict) -> dict:
+        resolution = resolve_relative_date(args.get("text") or "", today=self._today_fn())
+        if resolution is None:
+            return {
+                "error": "не удалось распознать дату",
+                "instruction": "Переспроси у клиента дату конкретнее — например, «какого числа?».",
+            }
+        if resolution.date < self._today_fn():
+            # Год назван явно и уже прошёл ("29 августа 2025") — это не тот
+            # случай, где код домысливает год сам, поэтому ошибка, а не
+            # молчаливый перенос на будущее: клиент мог просто опечататься.
+            return {
+                "error": "указанная дата уже прошла",
+                "instruction": "Скажи клиенту, что эта дата уже прошла, и уточни другую.",
+            }
+        return {"date": resolution.date.isoformat()}
+
     # -- занятость ----------------------------------------------------------
 
     async def _tool_check_availability(self, args: dict) -> dict:
@@ -650,6 +737,20 @@ class ToolExecutor:
         booking_date = _parse_date(args.get("date"))
         if booking_date is None:
             return {"status": "needs_input", "missing_fields": ["date"]}
+
+        # Живой баг: агент сам досчитал «29 августа» до прошлого года и
+        # ушёл в YCLIENTS за 2025-08-29 — 422, UNKNOWN, эскалация. Прошлая
+        # дата — ошибка инструмента, а не повод спрашивать провайдера то,
+        # что и так не имеет смысла спрашивать.
+        if booking_date < self._today_fn():
+            return {
+                "error": "дата уже прошла",
+                "instruction": (
+                    "Эта дата в прошлом. Не спрашивай занятость — переспроси у "
+                    "клиента дату ещё раз (если он назвал её словами без года, "
+                    "например «29 августа», сначала вызови resolve_date)."
+                ),
+            }
 
         # Через тот же кеш, что и проверка слота при уступке: один ход —
         # один ответ провайдера про один слот, иначе агент мог бы сказать
@@ -669,11 +770,94 @@ class ToolExecutor:
                 "status": "busy",
                 "free_slots": list(availability.free_slots),
                 "instruction": (
-                    "Это время занято. Сразу предложи свободное время из free_slots "
-                    "или другую зону — не заканчивай разговор отказом."
+                    "Это время занято. Если free_slots не пусто — предложи время "
+                    "из него на эту же дату. Если клиент не привязан жёстко к этой "
+                    "дате (или free_slots пусто) — вызови find_next_available и "
+                    "предложи 2-3 ближайшие свободные даты, или соседнюю подходящую "
+                    "зону на то же время — не заканчивай разговор отказом."
                 ),
             }
         return {"status": "free", "free_slots": list(availability.free_slots)}
+
+    async def _tool_find_next_available(self, args: dict) -> dict:
+        """Идёт по датам вперёд не дальше FIND_NEXT_AVAILABLE_HORIZON_DAYS —
+        это же и потолок числа запросов к провайдеру за один вызов
+        инструмента, чтобы не выстрелить сотней обращений к YCLIENTS.
+        `_availability_for` использует тот же per-ход кеш, что и
+        check_availability, поэтому переспрос той же (zone, date) дважды за
+        ход не платит вторым сетевым запросом.
+
+        "Свободна" здесь значит "у get_free_slots на эту дату есть хотя бы
+        один слот" — НЕ "подтверждено окно нужной длины `hours`": сам
+        YClientsProvider.get_free_slots не проверяет непрерывность слотов на
+        `hours` часов (см. app/booking/yclients.py), так что и этот
+        инструмент не может обещать больше, чем знает провайдер. Финальное
+        подтверждение — за check_availability на выбранной дате и времени.
+        """
+        if self.booking_provider is None:
+            return {
+                "dates": [],
+                "instruction": (
+                    "Занятость неизвестна. Скажи, что уточнишь у менеджера, "
+                    "и вызови escalate_to_human."
+                ),
+            }
+
+        zone_id = args.get("zone_id", "")
+        guests = args.get("guests")
+        zone = next((z for z in self.kb.catalog.zones if z.id == zone_id), None)
+        if zone is not None and guests:
+            capacity = zone.capacity.value if zone.capacity.is_resolved() else None
+            if capacity is not None and guests > capacity:
+                return {
+                    "dates": [],
+                    "instruction": (
+                        f"Зона не вмещает {guests} человек (вместимость {capacity}). "
+                        "Предложи другую зону через get_zones, а не даты этой."
+                    ),
+                }
+
+        from_date = _parse_date(args.get("from_date")) or self._today_fn()
+        if from_date < self._today_fn():
+            from_date = self._today_fn()
+
+        limit = args.get("limit") or FIND_NEXT_AVAILABLE_DEFAULT_LIMIT
+        limit = max(1, min(int(limit), FIND_NEXT_AVAILABLE_HORIZON_DAYS))
+        hours = args.get("hours")
+
+        found: list[dict] = []
+        current = from_date
+        for _ in range(FIND_NEXT_AVAILABLE_HORIZON_DAYS):
+            if len(found) >= limit:
+                break
+            availability = await self._availability_for(zone_id, current, None, hours)
+            if (
+                availability is not None
+                and availability.is_known
+                and availability.status.value == "free"
+                and availability.free_slots
+            ):
+                found.append({"date": current.isoformat(), "free_slots": list(availability.free_slots)})
+            current += timedelta(days=1)
+
+        if not found:
+            return {
+                "dates": [],
+                "instruction": (
+                    f"За {FIND_NEXT_AVAILABLE_HORIZON_DAYS} дней вперёд свободных дат "
+                    "не нашлось. Скажи об этом клиенту и предложи уточнить у "
+                    "менеджера или рассмотреть другую зону."
+                ),
+            }
+        return {
+            "dates": found,
+            "instruction": (
+                "Даты идут по возрастанию. \"Свободна\" здесь значит, что на эту "
+                "дату вообще есть открытые слоты — прежде чем называть цену или "
+                "фиксировать выбор клиента, подтверди конкретное время через "
+                "check_availability."
+            ),
+        }
 
     # -- фото ---------------------------------------------------------------
 
