@@ -82,6 +82,29 @@ def extract_item_id(payload: dict) -> Optional[str]:
     )
 
 
+_ITEM_ID_PATHS: tuple[tuple[str, ...], ...] = (
+    ("payload", "value", "item_id"),
+    ("payload", "value", "itemId"),
+    ("value", "item_id"),
+    ("item_id",),
+)
+
+
+def extract_item_id_raw(payload: dict) -> Any:
+    """item_id КАК ПРИШЁЛ, без приведения к строке — только для логов.
+
+    `extract_item_id` намеренно возвращает строку (в БД и в фильтре везде
+    строки), и из его результата уже не видно, что Авито прислал число.
+    А «строка против числа» — первая гипотеза, когда фильтр объявлений не
+    сработал, и проверять её по коду вместо лога значит гадать.
+    """
+    for path in _ITEM_ID_PATHS:
+        value = _dig(payload, path)
+        if value is not None:
+            return value
+    return None
+
+
 def extract_chat_type(payload: dict) -> Optional[str]:
     """Тип чата: "u2i" (по объявлению), "u2u"/"a2u" (по профилю).
 

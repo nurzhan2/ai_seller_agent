@@ -52,7 +52,13 @@ describe_payload_for_logging`) и, если это фото (`is_image_message`)
     дубликат по message_id (Redis), обработчик не подключён;
   * эхо нашего же сообщения — `is_outgoing_echo`, шаг 1 ниже;
   * вебхук без chat_id;
-  * объявление под запретом — шаг 1a ниже.
+  * объявление под запретом — шаг 1a ниже;
+  * дубликат по message_id уже в БД (второй рубеж дедупликации).
+
+Плюс ЖУРНАЛ ПРИЁМА в самом начале `_handle_message`: одна строка на
+каждое входящее (chat_id, item_id с его типом, chat_type, message_id) ДО
+всех проверок. Без неё «событие не дошло» и «дошло и отброшено»
+неразличимы — в базе в обоих случаях пусто.
 
 Отдельно: сообщение БЕЗ ТЕКСТА чат создаёт, но строку в `messages` не
 пишет (сохранять нечего) — такой диалог в базе будет с нулём сообщений.
@@ -105,6 +111,7 @@ from app.channels.avito_payloads import (
     extract_chat_type,
     extract_item_id,
     extract_item_id_from_chat,
+    extract_item_id_raw,
     extract_message_id,
     extract_text,
     is_image_message,
@@ -201,6 +208,20 @@ class MessagePipeline:
             )
 
     async def _handle_message(self, payload: dict) -> None:
+        # ЖУРНАЛ ПРИЁМА: одна строка на КАЖДОЕ входящее, до всех проверок.
+        # Без неё нельзя отличить «событие не дошло» от «дошло и молча
+        # отброшено»: в базе в обоих случаях пусто. Именно этот вопрос —
+        # «приходят ли вебхуки по объявлениям комплекса вообще» — иначе
+        # не имеет ответа. `raw_item_id` печатается с типом: item_id в API
+        # число, у нас строка, и «строка против числа» — первое, что
+        # проверяют, когда фильтр «не сработал».
+        raw_item_id = extract_item_id_raw(payload)
+        logger.info(
+            "pipeline: входящее chat_id=%s item_id=%r(%s) chat_type=%s msg_id=%s",
+            extract_chat_id(payload), raw_item_id, type(raw_item_id).__name__,
+            extract_chat_type(payload), extract_message_id(payload),
+        )
+
         our_user_id = getattr(self.settings, "avito_user_id", "") or ""
         if is_outgoing_echo(payload, our_user_id):
             # Авито шлёт вебхук и на наши собственные сообщения. Без этой
@@ -253,6 +274,16 @@ class MessagePipeline:
             # Второй рубеж дедупликации (первый — Redis в app/webhooks.py).
             # Уже обработанное сообщение не должно ни сбрасывать таймер, ни
             # доходить до агента второй раз.
+            #
+            # Лог обязателен: это последнее место, где сообщение исчезало
+            # беззвучно. Если Авито когда-нибудь переиспользует message_id
+            # (или Redis отдаст ложный промах), сюда уйдут живые сообщения,
+            # и без строки в логе это выглядит как «клиент написал, а агент
+            # молчит» без единого следа.
+            logger.info(
+                "pipeline: отброшен дубликат по message_id (уже есть в БД)",
+                extra={"chat_id": chat_id, "message_id": message_id},
+            )
             return
         messages_total.labels(direction="incoming", status="received").inc()
 

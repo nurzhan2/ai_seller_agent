@@ -14,6 +14,22 @@ from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
+# Объявления заказчика, не относящиеся к комплексу. Отдельной константой, а
+# не литералом в Field, чтобы валидатор ниже мог вернуть ИМЕННО их на пустое
+# значение переменной, и чтобы список был виден в одном месте.
+DEFAULT_BLOCKED_ITEMS: tuple[str, ...] = (
+    "8204183112",   # вакансия менеджера
+    "8076244626",   # продажа глэмпинга
+    "8076019723",   # арендный бизнес
+    "7980739861",   # продажа банного комплекса
+    "8172444564",   # квартира-студия
+)
+
+# Явное «фильтра нет»: только этим словом, не пустой строкой (см. коммент
+# у avito_blocked_items — пустая строка означает «дефолты»).
+BLOCKLIST_DISABLED = "none"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -54,17 +70,19 @@ class Settings(BaseSettings):
     # Пять id зашиты значением по умолчанию сознательно. Это не про
     # «конфигурация в коде»: если переменную забудут выставить на новом
     # стенде, посторонние объявления снова начнут получать прайс на бани —
-    # ровно тот баг, ради которого фильтр и появился. Переопределяется
-    # переменной окружения как обычно, в том числе пустым значением
-    # (`AVITO_BLOCKED_ITEMS=` — не блокировать ничего).
+    # ровно тот баг, ради которого фильтр и появился.
+    #
+    # ПУСТОЕ ЗНАЧЕНИЕ = ДЕЙСТВУЮТ ДЕФОЛТЫ, а не «не блокировать ничего».
+    # Раньше было наоборот, и это молча ломало фильтр: `.env.example` несёт
+    # строку `AVITO_BLOCKED_ITEMS=` (её естественно скопировать в Railway
+    # целиком), пустая строка превращалась в пустой список, дефолты не
+    # применялись — и агент снова отвечал по вакансии и квартире-студии.
+    # Ошибка настройки должна оставлять фильтр включённым, а не выключать
+    # его беззвучно.
+    #
+    # Отключить фильтр целиком, если это правда нужно: `AVITO_BLOCKED_ITEMS=none`.
     avito_blocked_items: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: [
-            "8204183112",   # вакансия менеджера
-            "8076244626",   # продажа глэмпинга
-            "8076019723",   # арендный бизнес
-            "7980739861",   # продажа банного комплекса
-            "8172444564",   # квартира-студия
-        ]
+        default_factory=lambda: list(DEFAULT_BLOCKED_ITEMS)
     )
     # Обращения из профиля продавца (chat_type u2u/a2u) приходят без
     # item_id — по спеку Авито объявления у таких чатов нет в принципе
@@ -200,7 +218,39 @@ class Settings(BaseSettings):
     # Максимум напоминаний на диалог — дальше молчим, а не долбим клиента.
     touch_max_count: int = 3
 
-    @field_validator("avito_allowed_items", "avito_blocked_items", mode="before")
+    @field_validator("avito_blocked_items", mode="before")
+    @classmethod
+    def _parse_blocked_items(cls, value: object) -> object:
+        """Пустое значение -> дефолтные пять id, а НЕ пустой список.
+
+        Прямая причина живого бага: `.env.example` несёт строку
+        `AVITO_BLOCKED_ITEMS=` — её естественно скопировать в переменные
+        Railway целиком. Пустая строка превращалась в пустой список, дефолты
+        не применялись, и агент снова отвечал по вакансии и квартире-студии,
+        хотя в коде они «зашиты». Снаружи это выглядело как «фильтр не
+        работает», хотя фильтр работал ровно так, как его настроили.
+
+        Ошибка настройки теперь оставляет фильтр ВКЛЮЧЁННЫМ. Выключить
+        осознанно: `AVITO_BLOCKED_ITEMS=none`.
+        """
+        if value is None:
+            return list(DEFAULT_BLOCKED_ITEMS)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return list(DEFAULT_BLOCKED_ITEMS)
+            if stripped.lower() == BLOCKLIST_DISABLED:
+                return []
+        elif isinstance(value, (list, tuple)) and not value:
+            return list(DEFAULT_BLOCKED_ITEMS)
+        # Разбор строки/списка — тот же, что у белого списка. Вызываем явно,
+        # а не полагаемся на второй валидатор: порядок «before»-валидаторов
+        # в pydantic не тот, о котором легко думать, и «none» успевал
+        # превратиться в список из одного элемента ['none'] раньше, чем
+        # доходил сюда.
+        return cls._split_item_ids(value)
+
+    @field_validator("avito_allowed_items", mode="before")
     @classmethod
     def _split_item_ids(cls, value: object) -> object:
         """`123,456` из переменной окружения, либо готовый JSON-список.

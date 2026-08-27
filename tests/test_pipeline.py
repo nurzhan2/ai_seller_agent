@@ -1636,3 +1636,111 @@ async def test_echo_drop_is_logged(caplog):
 
     assert agent.calls == []
     assert "эхо" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Пустая переменная НЕ должна выключать чёрный список
+#
+# Прямая причина живого бага: `.env.example` несёт строку
+# `AVITO_BLOCKED_ITEMS=` — её естественно скопировать в переменные Railway
+# целиком. Пустая строка превращалась в пустой список, дефолты не
+# применялись, и агент отвечал по квартире-студии и продаже банного
+# комплекса, хотя оба id «зашиты» в коде.
+# --------------------------------------------------------------------------
+
+async def test_empty_blocklist_env_still_blocks_the_default_five(monkeypatch):
+    monkeypatch.setenv("AVITO_BLOCKED_ITEMS", "")
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="8172444564", text="Квартира продаётся?"))
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_blocklist_survives_a_whitespace_only_env(monkeypatch):
+    monkeypatch.setenv("AVITO_BLOCKED_ITEMS", "   ")
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="7980739861"))
+    await _settle()
+
+    assert agent.calls == []
+
+
+async def test_blocklist_can_still_be_disabled_explicitly(monkeypatch):
+    """Выключить фильтр по-прежнему можно — но ТОЛЬКО осознанно, словом."""
+    monkeypatch.setenv("AVITO_BLOCKED_ITEMS", "none")
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="8172444564"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+# --------------------------------------------------------------------------
+# Журнал приёма: одна строка на каждое входящее, до всех проверок
+# --------------------------------------------------------------------------
+
+async def test_every_incoming_is_logged_before_any_check(caplog):
+    """Иначе «событие не дошло» неотличимо от «дошло и молча отброшено» —
+    в базе в обоих случаях пусто."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload(item_id="8172444564", chat_id="c-1"))
+    await _settle()
+
+    assert "входящее" in caplog.text
+    assert "c-1" in caplog.text
+    assert "8172444564" in caplog.text
+
+
+async def test_intake_log_shows_the_item_id_type(caplog):
+    """item_id в API Авито — число, у нас строка. «Строка против числа» —
+    первая гипотеза, когда фильтр не сработал; пусть тип будет виден
+    сразу, а не выясняется ещё одним заходом."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+    payload = _payload(chat_id="c-1")
+    payload["payload"]["value"]["item_id"] = 8172444564      # число, как шлёт Авито
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(payload)
+    await _settle()
+
+    assert "(int)" in caplog.text
+
+
+async def test_intake_log_fires_even_for_an_echo(caplog):
+    """Эхо отбрасывается раньше всего — но запись о приёме должна остаться,
+    иначе при неверном AVITO_USER_ID пропадут вообще все входящие."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload(author_id=OUR_USER_ID, chat_id="c-echo"))
+    await _settle()
+
+    assert "входящее" in caplog.text and "c-echo" in caplog.text
+    assert "эхо" in caplog.text
+
+
+async def test_duplicate_message_drop_is_logged(caplog):
+    """Последнее место, где сообщение исчезало беззвучно."""
+    settings = _settings()
+    pipeline, store, agent, _ = _build(settings=settings)
+    await pipeline.handle_message(_payload(message_id="dup-1"))
+    await _settle()
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload(message_id="dup-1"))
+    await _settle()
+
+    assert "дубликат" in caplog.text

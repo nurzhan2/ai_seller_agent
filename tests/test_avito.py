@@ -491,3 +491,51 @@ def test_allowed_items_are_strings_even_when_given_as_numbers():
     молча — фильтр просто блокировал бы всё подряд."""
     assert Settings(avito_allowed_items=[111, 222]).avito_allowed_items == ["111", "222"]
     assert Settings(avito_allowed_items='["111", "222"]').avito_allowed_items == ["111", "222"]
+
+
+# --------------------------------------------------------------------------
+# Чёрный список: пустое значение = дефолты, а не «ничего не блокировать»
+# --------------------------------------------------------------------------
+
+def test_blocklist_empty_env_falls_back_to_defaults():
+    """`.env.example` несёт строку `AVITO_BLOCKED_ITEMS=` — скопированная
+    целиком, она превращала список в пустой и молча выключала фильтр."""
+    from app.config import DEFAULT_BLOCKED_ITEMS
+
+    assert Settings(avito_blocked_items="").avito_blocked_items == list(DEFAULT_BLOCKED_ITEMS)
+    assert Settings(avito_blocked_items="   ").avito_blocked_items == list(DEFAULT_BLOCKED_ITEMS)
+    assert Settings().avito_blocked_items == list(DEFAULT_BLOCKED_ITEMS)
+
+
+def test_blocklist_is_disabled_only_by_an_explicit_word():
+    assert Settings(avito_blocked_items="none").avito_blocked_items == []
+    assert Settings(avito_blocked_items="NONE").avito_blocked_items == []
+
+
+def test_blocklist_accepts_an_explicit_list():
+    assert Settings(avito_blocked_items="111, 222").avito_blocked_items == ["111", "222"]
+
+
+def test_blocklist_values_are_strings_not_numbers():
+    """item_id в API Авито — число; сравнение строки с числом молча не
+    совпадёт никогда, то есть запрещённое объявление станет разрешённым."""
+    parsed = Settings(avito_blocked_items=[8172444564, 7980739861]).avito_blocked_items
+    assert parsed == ["8172444564", "7980739861"]
+    assert all(isinstance(item, str) for item in parsed)
+
+
+def test_default_blocklist_holds_the_five_known_foreign_listings():
+    from app.config import DEFAULT_BLOCKED_ITEMS
+
+    assert set(DEFAULT_BLOCKED_ITEMS) == {
+        "8204183112", "8076244626", "8076019723", "7980739861", "8172444564",
+    }
+
+
+def test_raw_item_id_keeps_the_original_type_for_logs():
+    """extract_item_id приводит к строке — из его результата уже не видно,
+    что Авито прислал число. Для лога нужен исходный вид."""
+    payload = {"payload": {"value": {"item_id": 8172444564}}}
+    assert pl.extract_item_id_raw(payload) == 8172444564
+    assert pl.extract_item_id(payload) == "8172444564"
+    assert pl.extract_item_id_raw({"junk": 1}) is None

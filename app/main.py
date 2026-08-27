@@ -219,11 +219,23 @@ async def lifespan(app: FastAPI):
             "чёрный список НЕ применяется. Разрешены только: %s",
             len(settings.avito_allowed_items), ", ".join(settings.avito_allowed_items),
         )
-    else:
+    elif settings.avito_blocked_items:
+        # Тип каждого элемента печатается намеренно: item_id в API Авито —
+        # число, у нас везде строка, и «строка против числа» — первая
+        # гипотеза при разборе «фильтр не сработал». Пусть будет видно
+        # сразу, а не выясняется ещё одним заходом.
         logger.info(
             "Фильтр объявлений: чёрный список (%d шт.): %s",
             len(settings.avito_blocked_items),
-            ", ".join(settings.avito_blocked_items) or "пусто — запрещённых нет",
+            ", ".join(
+                f"{item!r}({type(item).__name__})" for item in settings.avito_blocked_items
+            ),
+        )
+    else:
+        logger.warning(
+            "Фильтр объявлений ВЫКЛЮЧЕН (AVITO_BLOCKED_ITEMS=none) — агент "
+            "отвечает по ЛЮБОМУ объявлению аккаунта, включая вакансии и "
+            "продажу бизнеса.",
         )
     logger.info(
         "Чаты без объявления (обращения из профиля, u2u/a2u): %s",
