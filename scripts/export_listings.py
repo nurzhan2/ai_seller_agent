@@ -22,9 +22,38 @@ import csv
 import sys
 from pathlib import Path
 
-from app.channels.avito_items import AvitoItemsClient
+from app.channels.avito_items import AvitoItemsClient, Listing
 
 DEFAULT_OUT = Path("docs/avito_listings.csv")
+
+
+async def seed_item_zone_map(listings: list[Listing]) -> int:
+    """Записать item_id + заголовок в item_zone_map, вернуть число строк.
+
+    ТОЛЬКО заголовок: zone_id и category — решение человека о том, какая
+    зона стоит за объявлением (у гриль-домика их шесть, у бани «Гараж» —
+    две), и перетирать это выгрузкой из Авито нельзя. У существующих строк
+    обновляется одно поле title, остальные не трогаются.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import ItemZoneMap
+    from app.db.session import get_sessionmaker
+
+    session_factory = get_sessionmaker()
+    async with session_factory() as session:
+        existing = {
+            row.item_id: row
+            for row in (await session.execute(select(ItemZoneMap))).scalars().all()
+        }
+        for listing in listings:
+            row = existing.get(listing.item_id)
+            if row is None:
+                session.add(ItemZoneMap(item_id=listing.item_id, title=listing.title))
+            else:
+                row.title = listing.title
+        await session.commit()
+    return len(listings)
 
 
 async def main() -> int:
@@ -36,6 +65,11 @@ async def main() -> int:
     parser.add_argument(
         "--status", default="active",
         help="статусы через запятую: active,removed,old,blocked,rejected (по умолчанию active)",
+    )
+    parser.add_argument(
+        "--seed-map", action="store_true",
+        help="дополнительно записать item_id и заголовок в item_zone_map "
+             "(zone_id/category не трогаются — это ручной маппинг)",
     )
     args = parser.parse_args()
 
@@ -57,6 +91,11 @@ async def main() -> int:
 
     print(f"Объявлений: {len(listings)}")
     print(f"Файл: {args.out}")
+
+    if args.seed_map:
+        seeded = await seed_item_zone_map(listings)
+        print(f"В item_zone_map записано заголовков: {seeded} "
+              "(zone_id/category не изменялись)")
     return 0
 
 

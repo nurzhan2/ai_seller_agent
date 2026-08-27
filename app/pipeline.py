@@ -9,6 +9,12 @@
 
 `handle_message` (синхронная часть, на каждое входящее):
     1. отбрасываем эхо наших же сообщений — иначе агент отвечает сам себе;
+    1a. ОПРЕДЕЛЯЕМ item_id и сверяем со списком разрешённых объявлений
+       (`AVITO_ALLOWED_ITEMS`). Чужое объявление — выходим НЕМЕДЛЕННО, до
+       создания `Chat`: в аккаунте заказчика есть вакансия менеджера,
+       продажа глэмпинга и квартира-студия, и диалога по ним не должно
+       остаться ни в базе, ни в карточках оператора. Пустой список
+       разрешает всё (см. `_listing_is_allowed`);
     2. находим/заводим `Chat`, подтягиваем item_id и zone_id;
     3. сохраняем входящее в `Message`;
     4. СБРАСЫВАЕМ таймер касаний — до всех проверок «отвечает ли агент».
@@ -82,7 +88,9 @@ from app.agent.touch_tracking import TouchState, record_first_touch, reset_timer
 from app.channels.avito_payloads import (
     describe_payload_for_logging,
     extract_chat_id,
+    extract_chat_type,
     extract_item_id,
+    extract_item_id_from_chat,
     extract_message_id,
     extract_text,
     is_image_message,
@@ -189,10 +197,17 @@ class MessagePipeline:
             logger.warning("pipeline: webhook without a chat_id, dropped")
             return
 
+        item_id = await self._resolve_item_id(payload, chat_id)
+        if not self._listing_is_allowed(item_id, chat_id):
+            # Ничего не сохраняем и не создаём: диалога по чужому объявлению
+            # у нас быть не должно вообще — ни в базе, ни в карточках
+            # оператора. Возврат ДО get_or_create_chat именно поэтому.
+            return
+
         text = (extract_text(payload) or "").strip()
         message_id = extract_message_id(payload)
 
-        chat = await self.store.get_or_create_chat(chat_id, item_id=extract_item_id(payload))
+        chat = await self.store.get_or_create_chat(chat_id, item_id=item_id)
 
         if not text:
             # Картинка/системное событие без текста: сохранять нечего, но
@@ -223,6 +238,88 @@ class MessagePipeline:
             return
 
         await self.debouncer.submit(chat_id, text)
+
+    async def _resolve_item_id(self, payload: dict, chat_id: str) -> Optional[str]:
+        """item_id из вебхука, а если его там нет — из чата отдельным запросом.
+
+        Почему его иногда нет: по спеку (WebhookMessage) item_id «актуально
+        только для чатов с типом u2i» и объявлен nullable. То есть у чатов
+        u2u/a2u — начатых с профиля продавца, а не с объявления — объявления
+        нет в принципе, и дозапрашивать его бессмысленно: get_chat вернёт
+        контекст не типа "item". Поэтому запрос делается ТОЛЬКО когда чат
+        по объявлению (или когда тип чата не удалось прочитать вовсе —
+        тогда одна попытка лучше, чем молча потерянный item_id).
+        """
+        item_id = extract_item_id(payload)
+        if item_id is not None:
+            return item_id
+
+        chat_type = extract_chat_type(payload)
+        if chat_type in ("u2u", "a2u"):
+            logger.info(
+                "pipeline: чат не по объявлению (chat_type=%s) — item_id не существует, "
+                "get_chat не запрашиваем",
+                chat_type, extra={"chat_id": chat_id},
+            )
+            return None
+        if self.avito_client is None:
+            logger.info(
+                "pipeline: item_id нет в вебхуке (chat_type=%s), запросить неоткуда — "
+                "нет avito_client",
+                chat_type, extra={"chat_id": chat_id},
+            )
+            return None
+
+        try:
+            chat = await self.avito_client.get_chat(chat_id)
+        except Exception:
+            # Не роняем ход из-за одного недостающего поля: дальше сработает
+            # либо фильтр по списку (если он задан), либо обычная работа без
+            # подсказки о зоне — ровно как было до фолбэка.
+            logger.exception(
+                "pipeline: get_chat не ответил, item_id остался неизвестным",
+                extra={"chat_id": chat_id},
+            )
+            return None
+
+        recovered = extract_item_id_from_chat(chat)
+        logger.info(
+            "pipeline: item_id не пришёл в вебхуке (chat_type=%s), из get_chat получено: %s",
+            chat_type, recovered or "тоже ничего",
+            extra={"chat_id": chat_id},
+        )
+        return recovered
+
+    def _listing_is_allowed(self, item_id: Optional[str], chat_id: str) -> bool:
+        """Фильтр по AVITO_ALLOWED_ITEMS. Пустой список — разрешено всё.
+
+        В аккаунте заказчика 22 объявления, и 5 из них не про комплекс
+        (вакансия, продажа глэмпинга, арендный бизнес, продажа банного
+        комплекса, квартира-студия). Ответ про бани человеку, спросившему
+        про вакансию, — худший исход, чем молчание, поэтому неизвестный
+        item_id при заданном списке тоже блокируется.
+        """
+        allowed = getattr(self.settings, "avito_allowed_items", None) or []
+        if not allowed:
+            return True
+
+        if item_id is None:
+            logger.info(
+                "pipeline: пропущено — item_id неизвестен, а список разрешённых "
+                "объявлений задан (%d шт.). Молчим: ответить по чужому объявлению "
+                "хуже, чем не ответить",
+                len(allowed), extra={"chat_id": chat_id},
+            )
+            return False
+
+        if item_id not in allowed:
+            logger.info(
+                "pipeline: пропущено — объявление %s не в списке разрешённых (%d шт.)",
+                item_id, len(allowed), extra={"chat_id": chat_id, "item_id": item_id},
+            )
+            return False
+
+        return True
 
     async def _reset_touch_timer(self, chat_id: str) -> None:
         concession, touch = await self.store.load_dialog_state(chat_id)

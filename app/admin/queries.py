@@ -59,7 +59,7 @@ class SqlAlchemyAdminQueries:
     async def list_dialogs(self, limit: int = PAGE_LIMIT) -> list[dict]:
         from sqlalchemy import func, select
 
-        from app.db.models import Chat, Message
+        from app.db.models import Chat, ItemZoneMap, Message
 
         async with self._session_factory() as session:
             # Счётчик сообщений подзапросом, а не отдельным запросом на каждый
@@ -70,10 +70,16 @@ class SqlAlchemyAdminQueries:
                 .group_by(Message.chat_id)
                 .subquery()
             )
+            # Заголовок объявления — тем же запросом, outerjoin: у чата может
+            # не быть item_id (чат по профилю, а не по объявлению — см.
+            # app/pipeline.py:_resolve_item_id), а у объявления может не быть
+            # строки в item_zone_map. И то, и другое — «—» в таблице, а не
+            # пропавший диалог.
             rows = (
                 await session.execute(
-                    select(Chat, counts.c.n)
+                    select(Chat, counts.c.n, ItemZoneMap.title)
                     .outerjoin(counts, counts.c.chat_id == Chat.chat_id)
+                    .outerjoin(ItemZoneMap, ItemZoneMap.item_id == Chat.item_id)
                     .order_by(Chat.last_msg_at.desc().nullslast(), Chat.id.desc())
                     .limit(limit)
                 )
@@ -84,6 +90,7 @@ class SqlAlchemyAdminQueries:
                 "chat_id": chat.chat_id,
                 "zone_id": chat.zone_id,
                 "item_id": chat.item_id,
+                "item_title": title,
                 "buyer_name": chat.buyer_name,
                 "state": chat.state.value if chat.state is not None else None,
                 "is_human_takeover": chat.is_human_takeover,
@@ -91,7 +98,7 @@ class SqlAlchemyAdminQueries:
                 "messages": n or 0,
                 "last_msg_at": chat.last_msg_at,
             }
-            for chat, n in rows
+            for chat, n, title in rows
         ]
 
     # -- /admin/leads ------------------------------------------------------

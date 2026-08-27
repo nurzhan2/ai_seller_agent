@@ -168,6 +168,72 @@ async def test_dialog_store_creates_a_chat_and_resolves_the_zone(seeded):
     assert chat.zone_id == "bath_russian"   # подтянулась из item_zone_map
 
 
+async def test_item_zone_map_allows_many_listings_per_zone(session_factory):
+    """Многие-к-одному на уровне схемы: item_id уникален, zone_id — нет.
+    У заказчика гриль-домик представлен шестью объявлениями, баня «Гараж» —
+    двумя, и каждое обязано разрешаться в свою зону. Тест именно на БД, а не
+    только на резолвере: если кто-нибудь однажды повесит unique на zone_id,
+    сломается вся связка объявлений, и заметить это лучше здесь."""
+    async with session_factory() as session:
+        for i in range(6):
+            session.add(ItemZoneMap(item_id=f"grill-{i}", zone_id="grill_house"))
+        for i in range(2):
+            session.add(ItemZoneMap(item_id=f"garage-{i}", zone_id="bath_garage"))
+        await session.commit()
+
+    store = SqlAlchemyDialogStore(session_factory)
+    for i in range(6):
+        assert (await store.get(f"grill-{i}")).zone_id == "grill_house"
+    for i in range(2):
+        assert (await store.get(f"garage-{i}")).zone_id == "bath_garage"
+
+    # И через реальный путь конвейера: чат по каждому из объявлений
+    # получает ту же зону.
+    chat_a = await store.get_or_create_chat("c-grill-a", item_id="grill-0")
+    chat_b = await store.get_or_create_chat("c-grill-b", item_id="grill-5")
+    assert chat_a.zone_id == chat_b.zone_id == "grill_house"
+
+
+async def test_list_dialogs_shows_the_listing_title(seeded):
+    """/admin/dialogs: оператору видно, из какого объявления пришёл клиент.
+    Заголовок берётся из item_zone_map, куда его кладёт
+    `python -m scripts.export_listings --seed-map`."""
+    from sqlalchemy import select
+
+    from app.admin.queries import SqlAlchemyAdminQueries
+
+    async with seeded() as session:
+        row = (await session.execute(
+            select(ItemZoneMap).where(ItemZoneMap.item_id == "item-1")
+        )).scalar_one()
+        row.title = "Баня «Русский стиль» на дровах"
+        await session.commit()
+
+    dialogs = await SqlAlchemyAdminQueries(seeded).list_dialogs()
+
+    entry = next(d for d in dialogs if d["chat_id"] == "c-1")
+    assert entry["item_id"] == "item-1"
+    assert entry["item_title"] == "Баня «Русский стиль» на дровах"
+
+
+async def test_list_dialogs_survives_a_chat_without_a_listing(seeded):
+    """Чат по профилю продавца (u2i отсутствует) — item_id пуст, строки в
+    item_zone_map нет. Диалог всё равно обязан быть в списке, а не выпасть
+    из-за join'а."""
+    from app.admin.queries import SqlAlchemyAdminQueries
+    from app.db.models import Chat
+
+    async with seeded() as session:
+        session.add(Chat(chat_id="c-no-item", last_msg_at=NOW))
+        await session.commit()
+
+    dialogs = await SqlAlchemyAdminQueries(seeded).list_dialogs()
+
+    entry = next(d for d in dialogs if d["chat_id"] == "c-no-item")
+    assert entry["item_id"] is None
+    assert entry["item_title"] is None
+
+
 async def test_dialog_store_does_not_wipe_item_id_on_a_later_webhook(seeded):
     """Вебхук без item_id не должен стирать связь с объявлением."""
     store = SqlAlchemyDialogStore(seeded)

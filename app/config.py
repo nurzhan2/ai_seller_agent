@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     # см. комментарий в app/channels/avito_endpoints.py.
     avito_webhook_secret: SecretStr = SecretStr("")
     avito_webhook_secret_min_length: int = 32
+    # Объявления, по которым агенту РАЗРЕШЕНО отвечать. В аккаунте заказчика
+    # есть объявления, не относящиеся к комплексу: вакансия менеджера,
+    # продажа глэмпинга, арендный бизнес, продажа банного комплекса,
+    # квартира-студия. Без этого списка человек, спросивший про вакансию,
+    # получал прайс на бани.
+    #
+    # ПУСТОЙ СПИСОК = РАЗРЕШЕНО ВСЁ. Это сознательный выбор в пользу
+    # «не сломать при незаданной переменной»: на всех стендах, где
+    # AVITO_ALLOWED_ITEMS не выставлена, поведение остаётся прежним.
+    # Обратная трактовка (пусто = запретить всё) превратила бы забытую
+    # переменную в молчащего агента, что заметно далеко не сразу.
+    #
+    # NoDecode — по той же причине, что и у telegram_allowed_users ниже:
+    # без него pydantic-settings пытается разобрать значение как JSON ещё
+    # до валидатора и падает на пустой строке.
+    avito_allowed_items: Annotated[list[str], NoDecode] = Field(default_factory=list)
     # Concurrent in-flight requests to Avito. A semaphore, not a token
     # bucket — see AvitoClient.
     avito_max_concurrency: int = 5
@@ -134,6 +150,37 @@ class Settings(BaseSettings):
     touch_scheduler_interval_seconds: int = 60
     # Максимум напоминаний на диалог — дальше молчим, а не долбим клиента.
     touch_max_count: int = 3
+
+    @field_validator("avito_allowed_items", mode="before")
+    @classmethod
+    def _split_item_ids(cls, value: object) -> object:
+        """`123,456` из переменной окружения, либо готовый JSON-список.
+
+        Значения остаются СТРОКАМИ, хотя в API Авито item_id — число: в
+        вебхуке он приходит числом, в нашем коде везде приводится к строке
+        (`extract_item_id` -> `_first_scalar`), и в БД лежит строкой
+        (`Chat.item_id`, `String(128)`). Сравнение строк со строками не
+        зависит от того, записал ли оператор в переменную пробел после
+        запятой, — а сравнение строки с числом молча не совпало бы никогда.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                # Разбираем JSON здесь сами, а НЕ возвращаем строку наверх в
+                # надежде, что её декодирует pydantic: с NoDecode он этого уже
+                # не сделает, и наверх уехала бы строка вместо списка. (В
+                # соседнем _split_user_ids такая ветка так и осталась
+                # нерабочей — там её просто никто не использует, все стенды
+                # задают переменную через запятую.)
+                import json
+
+                return [str(part).strip() for part in json.loads(stripped)]
+            return [part.strip() for part in stripped.split(",") if part.strip()]
+        if isinstance(value, (list, tuple)):
+            return [str(part).strip() for part in value if str(part).strip()]
+        return value
 
     @field_validator("telegram_allowed_users", mode="before")
     @classmethod

@@ -198,6 +198,11 @@ class ItemZoneMap(Base):
     item_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     zone_id: Mapped[Optional[str]] = mapped_column(String(64))
     category: Mapped[Optional[str]] = mapped_column(String(32))
+    # Заголовок объявления на Авито — только чтобы оператор в /admin/dialogs
+    # видел, откуда пришёл клиент, словами, а не голым числом item_id.
+    # Заполняется `python -m scripts.export_listings --seed-map`; ни на одно
+    # решение агента не влияет и влиять не должно.
+    title: Mapped[Optional[str]] = mapped_column(String(512))
     note: Mapped[Optional[str]] = mapped_column(Text)
 
 

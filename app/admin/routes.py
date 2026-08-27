@@ -12,6 +12,7 @@ import csv
 import io
 import secrets
 from decimal import Decimal
+from html import escape
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -243,17 +244,39 @@ async def booking(request: Request, _: str = Depends(require_admin)) -> HTMLResp
     return _page("Бронирование", "".join(body))
 
 
+def _listing_cell(row: dict) -> str:
+    """«Заголовок объявления (item_id)» — или прочерк, если объявления нет.
+
+    Заголовок приходит с Авито, то есть это ВНЕШНИЙ текст, попадающий в
+    страницу оператора — отсюда escape(). Отсутствие заголовка (строки в
+    item_zone_map ещё нет, --seed-map не прогоняли) не должно прятать сам
+    item_id: голое число всё равно лучше, чем «непонятно, откуда клиент».
+    """
+    item_id = row.get("item_id")
+    if not item_id:
+        return "—"
+    title = row.get("item_title")
+    if not title:
+        return escape(str(item_id))
+    return f"{escape(str(title))} <span class='note'>({escape(str(item_id))})</span>"
+
+
 @router.get("/dialogs", response_class=HTMLResponse)
 async def dialogs(request: Request, _: str = Depends(require_admin)) -> HTMLResponse:
     provider = getattr(request.app.state, "dialog_provider", None)
     if provider is None:
         return _page("Диалоги", "<p class='note'>Источник диалогов не подключён.</p>")
     rows = await provider.list_dialogs()
-    body = ["<table><tr><th>чат</th><th>зона</th><th>режим</th><th>сообщений</th></tr>"]
+    body = [
+        "<table><tr><th>чат</th><th>объявление</th><th>зона</th>"
+        "<th>режим</th><th>сообщений</th></tr>"
+    ]
     for row in rows:
         mode = "оператор" if row.get("is_human_takeover") else "ИИ"
         body.append(
-            f"<tr><td>{row.get('chat_id')}</td><td>{row.get('zone_id') or '—'}</td>"
+            f"<tr><td>{escape(str(row.get('chat_id')))}</td>"
+            f"<td>{_listing_cell(row)}</td>"
+            f"<td>{escape(str(row.get('zone_id') or '—'))}</td>"
             f"<td>{mode}</td><td>{row.get('messages', 0)}</td></tr>"
         )
     body.append("</table>")

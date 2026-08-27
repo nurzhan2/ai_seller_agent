@@ -553,6 +553,187 @@ async def test_textless_payload_of_unknown_type_is_logged_but_not_answered():
     assert await ops_service.store.get_pending("chat-1") is None
 
 
+# --------------------------------------------------------------------------
+# Фильтр по объявлениям (AVITO_ALLOWED_ITEMS)
+#
+# В аккаунте заказчика 22 объявления, 5 из них не про комплекс: вакансия
+# менеджера, продажа глэмпинга за 39 млн, арендный бизнес, продажа банного
+# комплекса, квартира-студия. Человек, спросивший про вакансию, получал
+# прайс на бани.
+# --------------------------------------------------------------------------
+
+class _FakeAvitoWithChat(_FakeAvito):
+    """`get_chat` для фолбэка item_id. `chat_calls` — чтобы проверить, что
+    лишнего запроса к Авито не случилось."""
+
+    def __init__(self, chat_response: dict | None = None, fail: bool = False):
+        super().__init__()
+        self.chat_response = chat_response or {}
+        self.chat_calls: list[str] = []
+        self.chat_fails = fail
+
+    async def get_chat(self, chat_id: str) -> dict:
+        self.chat_calls.append(chat_id)
+        if self.chat_fails:
+            raise RuntimeError("Avito 503")
+        return self.chat_response
+
+
+def _payload_without_item(chat_id: str = "chat-1", chat_type: str | None = None) -> dict:
+    payload = _payload(chat_id=chat_id, item_id=None)
+    if chat_type is not None:
+        payload["payload"]["value"]["chat_type"] = chat_type
+    return payload
+
+
+async def test_message_from_a_listing_outside_the_allowlist_never_reaches_the_agent():
+    """Главный сценарий: клиент пишет по вакансии — агент молчит и диалога
+    не остаётся вовсе, ни в базе, ни у оператора."""
+    settings = _settings(avito_allowed_items="item-1,item-2")
+    pipeline, store, agent, ops_service = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="item-vacancy", text="Вакансия ещё актуальна?"))
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}                      # диалог не создан
+    assert store.messages == {}                   # сообщение не сохранено
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_message_from_an_allowed_listing_goes_through():
+    settings = _settings(avito_allowed_items="item-1,item-2")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="item-2"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_empty_allowlist_lets_everything_through():
+    """Переменная не задана — поведение ровно прежнее. Пустой список НЕ
+    означает «запретить всё»: забытая переменная не должна превращать
+    агента в молчуна."""
+    pipeline, store, agent, _ = _build(settings=_settings())   # список пуст
+
+    await pipeline.handle_message(_payload(item_id="item-какой-угодно"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_missing_item_id_is_blocked_when_the_allowlist_is_set():
+    """«Объявление не определено» + заданный список = молчим. Ответить про
+    бани человеку, спросившему про квартиру, хуже, чем не ответить."""
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_missing_item_id_passes_when_the_allowlist_is_empty():
+    """Обратная сторона: без списка неизвестный item_id — не повод молчать,
+    так работало всё это время."""
+    pipeline, store, agent, _ = _build(settings=_settings())
+
+    await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_blocked_listing_is_logged_with_the_item_id(caplog):
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload(item_id="item-vacancy"))
+    await _settle()
+
+    assert "item-vacancy" in caplog.text
+    assert "не в списке разрешённых" in caplog.text
+
+
+async def test_missing_item_id_is_logged_separately_from_a_wrong_listing(caplog):
+    """Отдельное сообщение — чтобы по логам было видно, НАСКОЛЬКО часто
+    item_id теряется, а не путать это с чужими объявлениями."""
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    with caplog.at_level("INFO", logger="parmangal.pipeline"):
+        await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert "item_id неизвестен" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Фолбэк item_id через get_chat
+# --------------------------------------------------------------------------
+
+async def test_item_id_is_recovered_from_get_chat_when_the_webhook_lacks_it():
+    """Спек (schemas/Chat): context.type == "item", context.value.id — ID
+    объявления. Восстановленный item_id должен и разблокировать фильтр, и
+    доехать до Chat."""
+    avito = _FakeAvitoWithChat(
+        {"id": "chat-1", "context": {"type": "item", "value": {"id": 777, "title": "Баня"}}}
+    )
+    settings = _settings(avito_allowed_items="777")
+    pipeline, store, agent, _ = _build(settings=settings, avito=avito)
+
+    await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert avito.chat_calls == ["chat-1"]
+    assert len(agent.calls) == 1
+    assert store.chats["chat-1"].item_id == "777"
+
+
+async def test_profile_chats_do_not_trigger_a_get_chat_request():
+    """chat_type u2u/a2u — чат по профилю продавца, объявления там нет в
+    принципе (спек: item_id «актуально только для чатов с типом u2i»).
+    Тратить запрос к Авито на заведомо пустой ответ незачем."""
+    avito = _FakeAvitoWithChat()
+    settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings, avito=avito)
+
+    await pipeline.handle_message(_payload_without_item(chat_type="u2u"))
+    await _settle()
+
+    assert avito.chat_calls == []      # запроса не было
+    assert agent.calls == []           # и ответа тоже
+
+
+async def test_get_chat_failure_does_not_crash_the_turn():
+    """Одно недостающее поле не должно ронять обработку: без списка
+    разрешённых объявлений диалог продолжается как раньше."""
+    avito = _FakeAvitoWithChat(fail=True)
+    pipeline, store, agent, _ = _build(settings=_settings(), avito=avito)
+
+    await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert avito.chat_calls == ["chat-1"]
+    assert len(agent.calls) == 1       # ход состоялся, просто без item_id
+
+
+async def test_get_chat_is_not_called_when_the_webhook_already_has_item_id():
+    """Лишний сетевой запрос на каждое сообщение — не мелочь: item_id есть
+    в вебхуке почти всегда."""
+    avito = _FakeAvitoWithChat()
+    pipeline, store, agent, _ = _build(settings=_settings(), avito=avito)
+
+    await pipeline.handle_message(_payload(item_id="item-1"))
+    await _settle()
+
+    assert avito.chat_calls == []
+
+
 async def test_quoting_a_price_schedules_the_next_touch():
     agent = _FakeAgentLoop(
         TurnResult(

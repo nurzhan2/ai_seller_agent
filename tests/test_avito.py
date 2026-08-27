@@ -348,6 +348,34 @@ def test_chat_id_extraction_tolerates_envelope_shapes():
 # Тип сообщения и диагностика вебхука без текста
 # --------------------------------------------------------------------------
 
+def test_chat_type_extraction_tolerates_envelope_shapes():
+    assert pl.extract_chat_type({"payload": {"value": {"chat_type": "u2i"}}}) == "u2i"
+    assert pl.extract_chat_type({"value": {"chat_type": "u2u"}}) == "u2u"
+    assert pl.extract_chat_type({"junk": 1}) is None
+
+
+def test_item_id_from_chat_reads_the_item_context():
+    """Спек (components/schemas/Chat): context.type == "item",
+    context.value.id — ID объявления, число."""
+    chat = {"id": "c1", "context": {"type": "item", "value": {"id": 1768287444}}}
+    assert pl.extract_item_id_from_chat(chat) == "1768287444"
+
+
+def test_item_id_from_chat_ignores_a_non_item_context():
+    """Чат по профилю: в value.id лежит идентификатор НЕ объявления, и
+    принять его за item_id значило бы отвечать по чужому объявлению."""
+    chat = {"id": "c1", "context": {"type": "user", "value": {"id": 42}}}
+    assert pl.extract_item_id_from_chat(chat) is None
+
+
+def test_item_id_from_chat_handles_missing_pieces():
+    assert pl.extract_item_id_from_chat({}) is None
+    assert pl.extract_item_id_from_chat({"context": {}}) is None
+    assert pl.extract_item_id_from_chat({"context": {"type": "item"}}) is None
+    assert pl.extract_item_id_from_chat({"context": {"type": "item", "value": {}}}) is None
+    assert pl.extract_item_id_from_chat("не словарь") is None
+
+
 def test_message_type_extraction_tolerates_envelope_shapes():
     assert pl.extract_message_type({"payload": {"value": {"type": "image"}}}) == "image"
     assert pl.extract_message_type({"value": {"type": "call"}}) == "call"
@@ -441,3 +469,25 @@ def test_missing_credentials_fail_loudly():
 def test_allowed_users_accepts_comma_separated_env_value():
     assert Settings(telegram_allowed_users="111,222").telegram_allowed_users == [111, 222]
     assert Settings(telegram_allowed_users="").telegram_allowed_users == []
+
+
+def test_allowed_items_accepts_comma_separated_env_value():
+    """Именно так значение приходит из Railway. Пробелы после запятой —
+    норма для руками собранного списка из 17 идентификаторов."""
+    assert Settings(avito_allowed_items="111, 222 ,333").avito_allowed_items == ["111", "222", "333"]
+
+
+def test_allowed_items_empty_means_everything_is_allowed():
+    """Пустая строка и незаданная переменная — «фильтра нет», а не
+    «запретить всё»: забытая переменная не должна ронять агента в молчание
+    на всех стендах разом."""
+    assert Settings(avito_allowed_items="").avito_allowed_items == []
+    assert Settings().avito_allowed_items == []
+
+
+def test_allowed_items_are_strings_even_when_given_as_numbers():
+    """item_id в API Авито — число, а у нас везде строка (extract_item_id,
+    Chat.item_id). Сравнение строки с числом не совпало бы никогда, причём
+    молча — фильтр просто блокировал бы всё подряд."""
+    assert Settings(avito_allowed_items=[111, 222]).avito_allowed_items == ["111", "222"]
+    assert Settings(avito_allowed_items='["111", "222"]').avito_allowed_items == ["111", "222"]

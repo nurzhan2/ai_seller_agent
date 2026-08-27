@@ -37,7 +37,8 @@ app/admin/        админка на FastAPI + HTMX (queries.py — чтени�
 app/db/           модели SQLAlchemy, включая персистентное состояние диалога
 scripts/          replay.py (--provider), compare_providers.py,
                   register_webhook.py, rotate_avito_keys.py,
-                  import_photos.py, export_listings.py,
+                  import_photos.py, export_listings.py (--seed-map кладёт
+                  заголовки объявлений в item_zone_map для /admin/dialogs),
                   unpack_google_drive_photos.py, anonymize_dialogs.py,
                   sync_yclients_services.py (связка zone_id <-> staff_id — у
                   заказчика сотрудник YCLIENTS физически и есть зона),

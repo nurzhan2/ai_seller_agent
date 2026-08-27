@@ -82,6 +82,47 @@ def extract_item_id(payload: dict) -> Optional[str]:
     )
 
 
+def extract_chat_type(payload: dict) -> Optional[str]:
+    """Тип чата: "u2i" (по объявлению), "u2u"/"a2u" (по профилю).
+
+    ПОДТВЕРЖДЕНО СПЕКОМ (components/schemas/WebhookMessage в официальном
+    OpenAPI Авито, см. шапку app/channels/avito_endpoints.py). Там же прямо
+    сказано про соседнее поле item_id: «ID объявления, актуально только для
+    чатов с типом u2i», nullable. Это и есть ответ на вопрос, почему item_id
+    иногда не приходит: у чатов, начатых с профиля продавца, а не с
+    объявления, объявления просто нет — и дозапрашивать его через get_chat
+    бессмысленно, там будет то же самое.
+    """
+    return _first_scalar(
+        payload,
+        [
+            ("payload", "value", "chat_type"),
+            ("value", "chat_type"),
+            ("chat_type",),
+        ],
+    )
+
+
+def extract_item_id_from_chat(chat: dict) -> Optional[str]:
+    """item_id из ответа GET /messenger/v2/.../chats/{chat_id}.
+
+    ПОДТВЕРЖДЕНО СПЕКОМ (components/schemas/Chat): context.type == "item",
+    context.value.id — «ID объявления». Проверка type обязательна: у чата с
+    другим типом контекста в value.id лежит идентификатор чего-то другого,
+    и принять его за объявление означало бы отвечать по чужому item_id.
+    """
+    if not isinstance(chat, dict):
+        return None
+    context = chat.get("context")
+    if not isinstance(context, dict) or context.get("type") != "item":
+        return None
+    value = context.get("value")
+    if not isinstance(value, dict):
+        return None
+    item_id = value.get("id")
+    return str(item_id) if isinstance(item_id, (str, int)) and str(item_id) else None
+
+
 def extract_text(payload: dict) -> Optional[str]:
     value = _first_scalar(
         payload,

@@ -53,6 +53,26 @@ async def test_direct_zone_mapping_resolves(kb):
     assert resolution.zone_id == "tent"
 
 
+async def test_many_listings_map_to_one_zone(kb):
+    """Многие-к-одному — не исключение, а норма у этого заказчика: гриль-
+    домик представлен шестью разными объявлениями, баня «Гараж» — двумя.
+    Каждое из них обязано разрешаться в ту же самую зону, независимо друг
+    от друга; никакой «первый выигрывает» тут не годится."""
+    grill_items = {f"grill-{i}": ItemZoneRow(zone_id="grill_house") for i in range(6)}
+    garage_items = {f"garage-{i}": ItemZoneRow(zone_id="bath_garage") for i in range(2)}
+    lookup = FakeLookup({**grill_items, **garage_items})
+
+    for item_id in grill_items:
+        resolution = await resolve_listing(item_id, lookup, kb)
+        assert resolution.status == "resolved"
+        assert resolution.zone_id == "grill_house"
+
+    for item_id in garage_items:
+        resolution = await resolve_listing(item_id, lookup, kb)
+        assert resolution.status == "resolved"
+        assert resolution.zone_id == "bath_garage"
+
+
 async def test_category_mapping_with_multiple_zones_is_ambiguous(kb):
     """Ровно ситуация из промта: объявление про баню, конкретная баня неясна."""
     lookup = FakeLookup({"123": ItemZoneRow(category="bath")})
