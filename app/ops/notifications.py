@@ -266,3 +266,44 @@ def render_digest(
             lines.append(f"  • {topic}")
 
     return _clip("\n".join(lines), MAX_TELEGRAM_LEN)
+
+
+def render_booking_notice(record: dict) -> str:
+    """Факт поставленной агентом брони. БЕЗ КНОПОК намеренно.
+
+    Бронь уже стоит в YCLIENTS — одобрять нечего, и кнопка «Разрешить»
+    рядом с уже случившимся фактом только путала бы. Оператору здесь нужно
+    ровно одно: знать, что произошло, и иметь под рукой всё, чтобы
+    вмешаться вручную, если что-то не так.
+
+    Часы показаны обоими числами, когда они расходятся: при акции «6-й час
+    в подарок» гость занимает 6 часов, платит за 5, и оператор должен
+    видеть, что заблокировано именно 6 — иначе шестой час выглядит как
+    ошибка агента.
+    """
+    occupied = record.get("occupied_hours")
+    billable = record.get("billable_hours")
+    if billable is not None and occupied is not None and billable != occupied:
+        hours_line = f"Часы: занято {occupied}, оплачено {billable}"
+        promo = record.get("applied_promo")
+        if promo:
+            hours_line += f" (акция: {promo})"
+    else:
+        hours_line = f"Часы: {occupied}"
+
+    lines = [
+        f"📅 БРОНЬ ПОСТАВЛЕНА АГЕНТОМ · чат {record.get('chat_id')}",
+        "",
+        f"Зона: {record.get('zone_id')}",
+        f"Дата: {record.get('booking_date')} в {record.get('start_time')}",
+        hours_line,
+    ]
+    if record.get("guests"):
+        lines.append(f"Гостей: {record['guests']}")
+    if record.get("total") is not None:
+        lines.append(f"Сумма: {record['total']} ₽")
+    lines.append(f"Клиент: {record.get('client_name') or '—'}, {record.get('client_phone') or '—'}")
+    lines.append(f"ID записи в YCLIENTS: {record.get('record_id') or '—'}")
+    lines.append("")
+    lines.append("Подтверждать не нужно — бронь уже в YCLIENTS. Это уведомление.")
+    return "\n".join(lines)

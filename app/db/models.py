@@ -10,13 +10,14 @@ app/pricing/quote_gate.py exists to prevent.
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import date as DateType, datetime
 from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Enum as SAEnum,
     ForeignKey,
@@ -247,6 +248,42 @@ class Lead(Base):
     date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     guests: Mapped[Optional[int]] = mapped_column(Integer)
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class Booking(Base):
+    """Бронь, поставленную агентом, пишем У СЕБЯ, а не только в YCLIENTS.
+
+    Своя запись нужна не для дублирования календаря, а чтобы был ответ на
+    вопрос «что агент вообще набронировал» в тот момент, когда YCLIENTS
+    недоступен, отдал ошибку на середине или когда бронь ставили и
+    отменяли. `record_id` — идентификатор на стороне YCLIENTS (может быть
+    пустым, если тот ответил успехом, но id не вернул).
+
+    `occupied_hours` и `billable_hours` хранятся ОБА и намеренно
+    различаются: при акции «6-й час в подарок» гость занимает площадку 6
+    часов, а платит за 5. В YCLIENTS блокируются занятые, в деньгах
+    считаются оплаченные, и увидеть в записи только одно число означало
+    бы однажды перепутать их местами.
+    """
+
+    __tablename__ = "bookings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    record_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    zone_id: Mapped[Optional[str]] = mapped_column(String(64))
+    booking_date: Mapped[Optional[DateType]] = mapped_column(Date)
+    start_time: Mapped[Optional[str]] = mapped_column(String(8))
+    occupied_hours: Mapped[Optional[int]] = mapped_column(Integer)
+    billable_hours: Mapped[Optional[int]] = mapped_column(Integer)
+    guests: Mapped[Optional[int]] = mapped_column(Integer)
+    total: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    client_name: Mapped[Optional[str]] = mapped_column(String(255))
+    client_phone: Mapped[Optional[str]] = mapped_column(String(64))
+    applied_promo: Mapped[Optional[str]] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

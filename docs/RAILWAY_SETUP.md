@@ -67,12 +67,27 @@ Redis — им переменные не нужны, Railway настраива�
 | `TELEGRAM_OPS_CHAT_ID` | id чата/канала операторов |
 | `TELEGRAM_ALLOWED_USERS` | id операторов через запятую — пустое значение выключает бота для всех, не открывает его всем |
 
+### Автобронирование
+
+`AUTO_BOOKING_ENABLED` по умолчанию `true`: агент сам ставит бронь в
+YCLIENTS, когда клиент подтвердил зону, дату, время и оставил контакты.
+Перед постановкой занятость перепроверяется заново (слот мог уйти, пока
+договаривались), блокируются **часы занятости**, а не оплаченные (акция
+«6-й час в подарок» — 6 против 5), бронь пишется в таблицу `bookings`, и
+оператор получает уведомление в Telegram без кнопок — подтверждать
+нечего, бронь уже стоит.
+
+Требует рабочей связки зон с YCLIENTS (`zone_service_map`, см.
+`python -m scripts.sync_yclients_services`): без неё занятость приходит
+`unknown`, и бронь не ставится вовсе. `false` возвращает прежнее
+поведение — бронь ставит человек.
+
 ### Опциональные
 
 `AVITO_MAX_CONCURRENCY`, `AVITO_TIMEOUT_SECONDS`, `AVITO_MAX_RETRIES`,
 `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_AFTER_ERRORS`, `LLM_DIALOG_MODEL`,
 `LLM_CLASSIFIER_MODEL`, `LLM_BASE_URL`, `DEEPSEEK_ENABLE_THINKING`,
-`YCLIENTS_*`, `AUTO_BOOKING_ENABLED`, `MAX_AGENT_REPLIES_PER_CHAT`,
+`YCLIENTS_*`, `MAX_AGENT_REPLIES_PER_CHAT`,
 `DEBOUNCE_WINDOW_SECONDS`, `DAILY_COST_LIMIT_RUB` — есть безопасные значения
 по умолчанию в `app/config.py`, трогать только осознанно. Полный список с
 комментариями — `.env.example`.

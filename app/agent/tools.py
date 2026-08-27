@@ -192,6 +192,32 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "create_booking",
+        "description": (
+            "Поставить бронь в системе бронирования. Вызывай ТОЛЬКО когда "
+            "клиент подтвердил всё сразу: зону, дату, время начала и "
+            "длительность, и оставил имя с телефоном. До этого — не вызывай. "
+            "Перед постановкой инструмент сам перепроверяет занятость, "
+            "поэтому отдельный check_availability прямо перед ним не нужен. "
+            "Если вернулось booked=false — брони НЕТ: скажи клиенту ровно то, "
+            "что написано в instruction, и не выдавай это за подтверждённую бронь."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "zone_id": {"type": "string"},
+                "date": {"type": "string", "description": "YYYY-MM-DD, только из resolve_date"},
+                "start_time": {"type": "string", "description": "Время начала, HH:MM"},
+                "hours": {"type": "integer", "description": "Сколько часов клиент хочет провести"},
+                "guests": {"type": "integer"},
+                "client_name": {"type": "string", "description": "Имя клиента"},
+                "client_phone": {"type": "string", "description": "Телефон клиента"},
+                "comment": {"type": "string", "description": "Пожелания клиента, если были"},
+            },
+            "required": ["zone_id", "date", "start_time", "client_name", "client_phone"],
+        },
+    },
+    {
         "name": "get_photos",
         "description": (
             "Получить фотографии зоны и отправить их клиенту. Предлагай фото сам, "
@@ -382,6 +408,8 @@ class ToolExecutor:
         concessions_blocked: bool = False,
         concessions_today_provider: Any = None,
         today_fn: Callable[[], DateType] = DateType.today,
+        booking_sink: Any = None,
+        booking_notifier: Any = None,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
@@ -412,6 +440,12 @@ class ToolExecutor:
         # это отдельная зона риска (движок уступок), не связанная с датами
         # бронирования.
         self._today_fn = today_fn
+        # Куда записать поставленную бронь у себя и кого уведомить — тот же
+        # приём внедрения, что у lead_sink/photo_provider. None в обоих
+        # случаях (тесты, харнесс) не мешает поставить бронь: запись и
+        # уведомление важны, но они ПОСЛЕ факта, а не условие для него.
+        self.booking_sink = booking_sink
+        self.booking_notifier = booking_notifier
         self.escalated = False
         self.escalation_reason: Optional[str] = None
         self.last_quote: Optional[PriceQuote] = None
@@ -731,9 +765,6 @@ class ToolExecutor:
                 "и вызови escalate_to_human. Не утверждай, что свободно."
             ),
         }
-        if self.booking_provider is None:
-            return unknown
-
         booking_date = _parse_date(args.get("date"))
         if booking_date is None:
             return {"status": "needs_input", "missing_fields": ["date"]}
@@ -742,15 +773,24 @@ class ToolExecutor:
         # ушёл в YCLIENTS за 2025-08-29 — 422, UNKNOWN, эскалация. Прошлая
         # дата — ошибка инструмента, а не повод спрашивать провайдера то,
         # что и так не имеет смысла спрашивать.
+        #
+        # ПОРЯДОК: проверка даты идёт ДО проверки провайдера. Дата в прошлом
+        # остаётся датой в прошлом независимо от того, подключён ли YCLIENTS,
+        # а «unknown + эскалируй» на такой вопрос — это ровно то самое
+        # «эскалация при каждой неудачной проверке даты», от которого
+        # диалог замолкает вместо того, чтобы переспросить число.
         if booking_date < self._today_fn():
             return {
                 "error": "дата уже прошла",
                 "instruction": (
-                    "Эта дата в прошлом. Не спрашивай занятость — переспроси у "
-                    "клиента дату ещё раз (если он назвал её словами без года, "
-                    "например «29 августа», сначала вызови resolve_date)."
+                    "Эта дата в прошлом. Не спрашивай занятость и НЕ эскалируй — "
+                    "просто переспроси у клиента дату (если он назвал её словами "
+                    "без года, например «29 августа», сначала вызови resolve_date)."
                 ),
             }
+
+        if self.booking_provider is None:
+            return unknown
 
         # Через тот же кеш, что и проверка слота при уступке: один ход —
         # один ответ провайдера про один слот, иначе агент мог бы сказать
@@ -856,6 +896,180 @@ class ToolExecutor:
                 "дату вообще есть открытые слоты — прежде чем называть цену или "
                 "фиксировать выбор клиента, подтверди конкретное время через "
                 "check_availability."
+            ),
+        }
+
+    # -- бронирование ---------------------------------------------------------
+
+    async def _tool_create_booking(self, args: dict) -> dict:
+        """Ставит бронь — но только после ПОВТОРНОЙ проверки занятости.
+
+        Порядок здесь целиком про то, чтобы не подтвердить клиенту бронь,
+        которой нет:
+
+        1. рубильник AUTO_BOOKING_ENABLED — выключен, значит бронь ставит
+           человек, и агент не должен обещать её сам;
+        2. цена должна быть посчитана в этом же диалоге. Не ради денег: из
+           котировки берутся ЧАСЫ ЗАНЯТОСТИ (при акции «6-й час в подарок»
+           их 6, а оплаченных 5) — блокировать оплаченные значит отдать
+           шестой час другому клиенту;
+        3. занятость перепроверяется ЗАНОВО, мимо кеша хода: между «свободно»
+           пять реплик назад и этой секундой слот мог уйти;
+        4. и только потом — запись в YCLIENTS, в нашу БД и уведомление
+           оператору.
+
+        Любой сбой на шагах 1-3 возвращает booked=false с готовой
+        формулировкой: инструмент никогда не отдаёт «успех» без реальной
+        брони.
+        """
+        if not get_settings().auto_booking_enabled:
+            return {
+                "booked": False,
+                "instruction": (
+                    "Автобронирование выключено. Скажи, что придержишь время и "
+                    "менеджер подтвердит, и вызови escalate_to_human."
+                ),
+            }
+        if self.booking_provider is None:
+            return {
+                "booked": False,
+                "instruction": (
+                    "Система бронирования недоступна. Скажи, что уточнишь у "
+                    "менеджера, и вызови escalate_to_human."
+                ),
+            }
+
+        booking_date = _parse_date(args.get("date"))
+        start_time = _parse_time(args.get("start_time"))
+        if booking_date is None or start_time is None:
+            return {"booked": False, "status": "needs_input",
+                    "missing_fields": [f for f, v in (("date", booking_date), ("start_time", start_time)) if v is None],
+                    "instruction": "Уточни у клиента недостающее и повтори."}
+        if booking_date < self._today_fn():
+            return {
+                "booked": False,
+                "error": "дата уже прошла",
+                "instruction": "Эта дата в прошлом. Не эскалируй — переспроси дату у клиента.",
+            }
+
+        quote_for_hours = self.last_quote
+        if quote_for_hours is None or quote_for_hours.status != "ok":
+            return {
+                "booked": False,
+                "instruction": (
+                    "Сначала посчитай цену через calculate_price — без неё "
+                    "неизвестно, сколько часов занимать."
+                ),
+            }
+        occupied_hours = quote_for_hours.occupied_hours or args.get("hours")
+        if not occupied_hours:
+            return {
+                "booked": False,
+                "status": "needs_input",
+                "missing_fields": ["hours"],
+                "instruction": "Уточни у клиента, на сколько часов он планирует.",
+            }
+
+        zone_id = args.get("zone_id", "")
+        # Мимо кеша хода — см. докстринг, п.3. `_availability_cache` живёт
+        # ровно один ход и существует ради согласованности внутри него; для
+        # брони важнее свежесть, поэтому запись о слоте выбрасывается и
+        # спрашивается заново. Обновлённый ответ снова попадает в кеш, так
+        # что остальные проверки в этом же ходу увидят ту же картину.
+        self._availability_cache.pop((zone_id, booking_date, start_time, occupied_hours), None)
+        availability = await self._availability_for(
+            zone_id, booking_date, start_time, occupied_hours
+        )
+        if availability is None or not availability.is_known:
+            return {
+                "booked": False,
+                "status": "unknown",
+                "instruction": (
+                    "Занятость сейчас не подтверждается — бронь НЕ поставлена. "
+                    "Скажи, что уточнишь у менеджера, и вызови escalate_to_human."
+                ),
+            }
+        if availability.status.value == "busy":
+            return {
+                "booked": False,
+                "status": "busy",
+                "free_slots": list(availability.free_slots),
+                "instruction": (
+                    "Пока договаривались, время заняли — брони НЕТ. Извинись, "
+                    "предложи время из free_slots или вызови find_next_available "
+                    "и предложи ближайшие свободные даты. Не эскалируй."
+                ),
+            }
+
+        from app.booking.base import BookingRequest
+
+        result = await self.booking_provider.create_booking(
+            BookingRequest(
+                zone_id=zone_id,
+                date=booking_date,
+                start_time=start_time,
+                occupied_hours=int(occupied_hours),
+                guests=args.get("guests") or 0,
+                client_name=args.get("client_name"),
+                client_phone=args.get("client_phone"),
+                comment=args.get("comment"),
+            )
+        )
+        if not result.success:
+            logger.warning(
+                "booking failed", extra={"chat_id": self.dialog_id, "error": result.error},
+            )
+            return {
+                "booked": False,
+                "error": result.error,
+                "instruction": (
+                    "Бронь не поставилась. Скажи, что уточнишь у менеджера и "
+                    "вернёшься, и вызови escalate_to_human."
+                ),
+            }
+
+        record = {
+            "chat_id": self.dialog_id,
+            "record_id": result.booking_id,
+            "zone_id": zone_id,
+            "booking_date": booking_date,
+            "start_time": start_time.strftime("%H:%M"),
+            "occupied_hours": int(occupied_hours),
+            "billable_hours": quote_for_hours.billable_hours,
+            "guests": args.get("guests"),
+            "total": quote_for_hours.total,
+            "client_name": args.get("client_name"),
+            "client_phone": args.get("client_phone"),
+            "applied_promo": quote_for_hours.applied_promo,
+        }
+        # Запись у себя и уведомление оператору — ПОСЛЕ успеха в YCLIENTS и
+        # каждое в своём try: бронь уже стоит, и уронить ход из-за того, что
+        # не записалось в нашу таблицу или не ушло в Telegram, значит
+        # оставить клиента без подтверждения при существующей брони.
+        if self.booking_sink is not None:
+            try:
+                await self.booking_sink.save(**record)
+            except Exception:
+                logger.exception("booking saved in YCLIENTS but not in our DB",
+                                 extra={"chat_id": self.dialog_id, "record_id": result.booking_id})
+        if self.booking_notifier is not None:
+            try:
+                await self.booking_notifier(record)
+            except Exception:
+                logger.exception("booking notification failed",
+                                 extra={"chat_id": self.dialog_id})
+
+        logger.info("booking created",
+                    extra={"chat_id": self.dialog_id, "record_id": result.booking_id,
+                           "zone_id": zone_id, "occupied_hours": int(occupied_hours)})
+        return {
+            "booked": True,
+            "record_id": result.booking_id,
+            "occupied_hours": int(occupied_hours),
+            "instruction": (
+                "Время придержано. Скажи клиенту, что придержала время и менеджер "
+                "свяжется для подтверждения. Слова «забронировал», «бронь "
+                "подтверждена», «место за вами» по-прежнему запрещены."
             ),
         }
 

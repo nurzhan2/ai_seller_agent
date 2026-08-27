@@ -573,3 +573,26 @@ class SqlAlchemyDialogStore:
                 )
             ).scalar()
         return count or 0
+
+
+class SqlAlchemyBookingSink:
+    """Пишет поставленную агентом бронь в нашу таблицу `bookings`.
+
+    Отдельный маленький класс, а не метод `SqlAlchemyDialogStore`: бронь —
+    не часть переписки, и исполнителю инструментов (`ToolExecutor`) нужен
+    именно узкий объект с одним `save`, а не весь стор диалога.
+
+    Ошибку НЕ глушит: вызывающий код (`_tool_create_booking`) сам решает,
+    что делать со сбоем записи — там бронь уже стоит в YCLIENTS, и падать
+    из-за нашей таблицы нельзя, но и делать вид, что записалось, тоже.
+    """
+
+    def __init__(self, session_factory):
+        self._session_factory = session_factory
+
+    async def save(self, **record) -> None:
+        from app.db.models import Booking
+
+        async with self._session_factory() as session:
+            session.add(Booking(**record))
+            await session.commit()

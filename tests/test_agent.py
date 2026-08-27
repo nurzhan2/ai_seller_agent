@@ -334,10 +334,26 @@ async def test_get_zones_returns_no_prices(kb):
 
 
 async def test_check_availability_is_unknown_without_provider(kb):
-    ex = ToolExecutor(kb, "d1")
+    """today_fn зафиксирован, а дата взята будущая относительно него: иначе
+    сработает проверка «дата в прошлом» и тест проверит не то, о чём он —
+    не путь без провайдера, а разбор даты."""
+    ex = ToolExecutor(kb, "d1", today_fn=lambda: date(2026, 7, 1))
     result = await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-07-18"})
     assert result["status"] == "unknown"
     assert "escalate_to_human" in result["instruction"]
+
+
+async def test_past_date_does_not_escalate_even_without_a_provider(kb):
+    """Дата в прошлом остаётся датой в прошлом независимо от того,
+    подключён ли YCLIENTS. «unknown + эскалируй» на такой вопрос — то самое
+    «эскалация при каждой неудачной проверке даты», из-за которой диалог
+    замолкал вместо того, чтобы переспросить число."""
+    ex = ToolExecutor(kb, "d1", today_fn=lambda: date(2026, 8, 27))
+
+    result = await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2025-08-29"})
+
+    assert result["error"] == "дата уже прошла"
+    assert "НЕ эскалируй" in result["instruction"]
 
 
 # --------------------------------------------------------------------------
@@ -848,3 +864,197 @@ async def test_later_turns_without_item_id_do_not_repeat_the_direction_question(
 def test_system_prompt_describes_one_question_disambiguation(kb):
     text = build_system_prompt(kb)[0]["text"]
     assert "какую баню" in text.lower() or "один уточняющий вопрос" in text.lower()
+
+
+# --------------------------------------------------------------------------
+# Бронирование (AUTO_BOOKING_ENABLED)
+# --------------------------------------------------------------------------
+
+class _BookingProvider:
+    """Отдаёт заданную занятость и записывает поставленные брони."""
+
+    def __init__(self, statuses=None, succeed=True):
+        from app.booking.base import AvailabilityStatus
+        # Список — чтобы вернуть РАЗНЫЕ ответы на первый и второй вызов:
+        # именно так проверяется, что перед бронью занятость спрашивают
+        # заново, а не берут из кеша хода.
+        self.statuses = list(statuses or [AvailabilityStatus.FREE])
+        self.availability_calls = []
+        self.bookings = []
+        self.succeed = succeed
+
+    async def check_availability(self, zone_id, date, start_time=None, hours=None):
+        from app.booking.base import Availability
+        self.availability_calls.append({"zone_id": zone_id, "date": date,
+                                        "start_time": start_time, "hours": hours})
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        return Availability(status=status, free_slots=("18:00",))
+
+    async def create_booking(self, request):
+        from app.booking.base import BookingResult
+        self.bookings.append(request)
+        if not self.succeed:
+            return BookingResult(False, error="YCLIENTS 500")
+        return BookingResult(success=True, booking_id="rec-1")
+
+
+class _BookingSink:
+    def __init__(self):
+        self.saved = []
+
+    async def save(self, **record):
+        self.saved.append(record)
+
+
+BOOKING_ARGS = {
+    "zone_id": "bath_russian", "date": "2026-08-29", "start_time": "14:00",
+    "guests": 6, "client_name": "Иван", "client_phone": "+79990000000",
+}
+
+
+async def _executor_with_quote(kb, provider, hours=3, **kw):
+    """Котировка обязательна до брони — из неё берутся часы занятости."""
+    ex = ToolExecutor(kb, "d1", booking_provider=provider,
+                      today_fn=lambda: date(2026, 8, 27), **kw)
+    await ex.run("calculate_price", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                     "start_time": "14:00", "hours": hours, "guests": 6})
+    return ex
+
+
+async def test_booking_is_created_and_rechecked_first(kb):
+    """Перед постановкой занятость спрашивается ЗАНОВО: между «свободно»
+    пять реплик назад и этой секундой слот мог уйти."""
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider)
+    await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                        "start_time": "14:00", "hours": 3})
+    calls_before = len(provider.availability_calls)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is True
+    assert result["record_id"] == "rec-1"
+    assert len(provider.availability_calls) == calls_before + 1   # именно повторный запрос
+    assert len(provider.bookings) == 1
+
+
+async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb):
+    """Первый ответ FREE, второй BUSY — ровно гонка, ради которой
+    перепроверка и существует. Бронь ставиться не должна."""
+    from app.booking.base import AvailabilityStatus
+    provider = _BookingProvider(statuses=[AvailabilityStatus.FREE, AvailabilityStatus.BUSY])
+    ex = await _executor_with_quote(kb, provider)
+    # Агент сказал клиенту «свободно» — это первый ответ провайдера.
+    first = await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                                "start_time": "14:00", "hours": 3})
+    assert first["status"] == "free"
+
+    # ...пока договаривались, слот ушёл. Перепроверка обязана это увидеть.
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert result["status"] == "busy"
+    assert provider.bookings == []
+    assert "Не эскалируй" in result["instruction"]
+
+
+async def test_booking_blocks_occupied_hours_not_paid_ones(kb):
+    """Акция «6-й час в подарок»: гость занимает 6 часов, платит за 5.
+    Заблокировать 5 значит отдать шестой час другому клиенту."""
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider, hours=6)
+    assert ex.last_quote.billable_hours == 5 and ex.last_quote.occupied_hours == 6
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is True
+    assert provider.bookings[0].occupied_hours == 6
+    assert result["occupied_hours"] == 6
+
+
+async def test_booking_is_written_to_our_db_with_both_hour_counts(kb):
+    provider = _BookingProvider()
+    sink = _BookingSink()
+    ex = await _executor_with_quote(kb, provider, hours=6, booking_sink=sink)
+
+    await ex.run("create_booking", BOOKING_ARGS)
+
+    assert len(sink.saved) == 1
+    saved = sink.saved[0]
+    assert saved["record_id"] == "rec-1"
+    assert saved["occupied_hours"] == 6
+    assert saved["billable_hours"] == 5
+    assert saved["applied_promo"] == "sixth_hour_free"
+
+
+async def test_booking_notifies_the_operator(kb):
+    provider = _BookingProvider()
+    notices = []
+
+    async def notifier(record):
+        notices.append(record)
+
+    ex = await _executor_with_quote(kb, provider, booking_notifier=notifier)
+
+    await ex.run("create_booking", BOOKING_ARGS)
+
+    assert len(notices) == 1
+    assert notices[0]["zone_id"] == "bath_russian"
+
+
+async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb):
+    """Бронь уже в YCLIENTS. Уронить ход из-за нашей таблицы — оставить
+    клиента без подтверждения при существующей броне."""
+    class _BrokenSink:
+        async def save(self, **record):
+            raise RuntimeError("БД недоступна")
+
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider, booking_sink=_BrokenSink())
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is True
+
+
+async def test_booking_requires_a_price_quote_first(kb):
+    """Без котировки неизвестны часы занятости — гадать их нельзя."""
+    provider = _BookingProvider()
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: date(2026, 8, 27))
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert provider.bookings == []
+    assert "calculate_price" in result["instruction"]
+
+
+async def test_booking_is_refused_when_the_switch_is_off(kb, monkeypatch):
+    from app.config import Settings, get_settings
+
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider)
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings",
+        lambda: Settings(auto_booking_enabled=False),
+    )
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert provider.bookings == []
+
+
+async def test_booking_failure_is_never_reported_as_success(kb):
+    provider = _BookingProvider(succeed=False)
+    ex = await _executor_with_quote(kb, provider)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert "escalate_to_human" in result["instruction"]
+
+
+def test_auto_booking_is_on_by_default():
+    from app.config import Settings
+    assert Settings().auto_booking_enabled is True

@@ -24,7 +24,12 @@ from app.logging_setup import configure_logging
 from app.metrics import dry_run_gauge, render_metrics
 from app.ops.bot import OpsService
 from app.ops.handlers import build_dispatcher, set_bot_commands
-from app.ops.notifications import DialogCard, dialog_keyboard, render_dialog_card
+from app.ops.notifications import (
+    DialogCard,
+    dialog_keyboard,
+    render_booking_notice,
+    render_dialog_card,
+)
 from app.ops.state import SqlAlchemyOpsStore
 from app.ops.touch_scheduler import SqlAlchemyTouchStore, run_scheduler_pass
 
@@ -90,6 +95,26 @@ def build_touch_sender(
             await avito_client.send_message(chat_id, text_)
 
     return send
+
+
+def build_booking_notifier(settings: Any, ops_bot: Any):
+    """Уведомление оператору о поставленной броне — БЕЗ КНОПОК.
+
+    Бронь уже в YCLIENTS, одобрять нечего (см. render_booking_notice).
+    Без бота или без TELEGRAM_OPS_CHAT_ID возвращается None — тогда
+    `_tool_create_booking` просто не уведомляет, и это не мешает брони:
+    факт остаётся в нашей таблице `bookings` и в логе.
+    """
+    if ops_bot is None or not getattr(settings, "telegram_ops_chat_id", ""):
+        return None
+
+    async def notify(record: dict) -> None:
+        await ops_bot.send_message(
+            chat_id=settings.telegram_ops_chat_id,
+            text=render_booking_notice(record),
+        )
+
+    return notify
 
 
 async def supervised_touch_scheduler(
@@ -310,7 +335,7 @@ async def lifespan(app: FastAPI):
     # dialog_store создаётся ЗДЕСЬ, а не ниже вместе с конвейером: он нужен
     # гейту исходящих, а гейт — воркеру касаний, который стартует раньше.
     from app.channels.outbound_gate import OutboundGate
-    from app.dialog_store import SqlAlchemyDialogStore
+    from app.dialog_store import SqlAlchemyBookingSink, SqlAlchemyDialogStore
 
     dialog_store = SqlAlchemyDialogStore(get_sessionmaker())
     # Единственная дверь наружу. Дальше по коду в качестве «клиента Авито»
@@ -358,6 +383,8 @@ async def lifespan(app: FastAPI):
         classifier_model=classifier_model,
         booking_provider=booking_provider,
         concessions_today_provider=dialog_store.count_concessions_today,
+        booking_sink=SqlAlchemyBookingSink(get_sessionmaker()),
+        booking_notifier=build_booking_notifier(settings, ops_bot),
     )
     pipeline = MessagePipeline(
         store=dialog_store,
