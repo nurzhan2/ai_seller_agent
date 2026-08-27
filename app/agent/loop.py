@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from app.agent.listing_context import ItemZoneLookup, build_listing_hint, resolve_listing
+from app.agent.listing_context import (
+    ItemZoneLookup,
+    build_listing_hint,
+    no_listing_hint,
+    resolve_listing,
+)
 from app.agent.prompts import CLASSIFIER_PROMPT, build_system_prompt
 from app.agent.providers.anthropic_provider import PRICE_PER_MTOK_RUB as _ANTHROPIC_RATES
 from app.agent.providers.anthropic_provider import AnthropicProvider
@@ -215,6 +220,12 @@ class AgentLoop:
             hint = build_listing_hint(resolution, self.kb)
             if hint:
                 turn_content = f"{user_text}\n\n{hint}"
+        elif not history:
+            # Чат из профиля продавца (u2u/a2u): объявления нет, зацепки о
+            # зоне тоже. Подсказка идёт ТОЛЬКО на первом ходу — дальше
+            # клиент уже ответил, чего он хочет, и переспрашивать
+            # направление в каждом сообщении незачем.
+            turn_content = f"{user_text}\n\n{no_listing_hint()}"
 
         messages = list(history[-HISTORY_WINDOW:])
         messages.append({"role": "user", "content": turn_content})

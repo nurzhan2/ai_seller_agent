@@ -623,10 +623,23 @@ async def test_empty_allowlist_lets_everything_through():
     assert len(agent.calls) == 1
 
 
-async def test_missing_item_id_is_blocked_when_the_allowlist_is_set():
-    """«Объявление не определено» + заданный список = молчим. Ответить про
-    бани человеку, спросившему про квартиру, хуже, чем не ответить."""
+async def test_chat_without_item_id_gets_an_answer():
+    """Обращение из профиля продавца (u2u/a2u): объявления нет по спеку
+    Авито. Раньше такой чат блокировался — теперь это живой клиент, и агент
+    отвечает как обычно, даже когда белый список объявлений задан."""
     settings = _settings(avito_allowed_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload_without_item())
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_chat_without_item_id_can_still_be_blocked_by_the_flag():
+    """AVITO_ALLOW_CHATS_WITHOUT_ITEM=false возвращает прежнее поведение —
+    рубильник на случай, если из профиля польётся мусор."""
+    settings = _settings(avito_allow_chats_without_item=False)
     pipeline, store, agent, _ = _build(settings=settings)
 
     await pipeline.handle_message(_payload_without_item())
@@ -696,20 +709,47 @@ async def test_blocked_listing_is_logged_with_the_item_id(caplog):
     await _settle()
 
     assert "item-vacancy" in caplog.text
-    assert "не в списке разрешённых" in caplog.text
+    assert "под запретом" in caplog.text
 
 
-async def test_missing_item_id_is_logged_separately_from_a_wrong_listing(caplog):
-    """Отдельное сообщение — чтобы по логам было видно, НАСКОЛЬКО часто
-    item_id теряется, а не путать это с чужими объявлениями."""
-    settings = _settings(avito_allowed_items="item-1")
+# --------------------------------------------------------------------------
+# Чёрный список — основной режим
+# --------------------------------------------------------------------------
+
+async def test_blocklisted_listing_is_ignored():
+    """Пять посторонних объявлений заказчика. Вакансия менеджера — то самое
+    объявление, из-за которого фильтр вообще появился."""
+    settings = _settings(avito_blocked_items="8204183112")
     pipeline, store, agent, _ = _build(settings=settings)
 
-    with caplog.at_level("INFO", logger="parmangal.pipeline"):
-        await pipeline.handle_message(_payload_without_item())
+    await pipeline.handle_message(_payload(item_id="8204183112", text="Вакансия актуальна?"))
     await _settle()
 
-    assert "item_id неизвестен" in caplog.text
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_a_new_listing_outside_the_blocklist_works_immediately():
+    """Главная причина замены белого списка чёрным: новое объявление
+    комплекса начинает работать без правки переменной."""
+    settings = _settings(avito_blocked_items="8204183112")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="9999-новое-объявление"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_allowlist_still_wins_when_set():
+    """Совместимость со стендами, где AVITO_ALLOWED_ITEMS уже выставлен."""
+    settings = _settings(avito_allowed_items="item-1", avito_blocked_items="item-1")
+    pipeline, store, agent, _ = _build(settings=settings)
+
+    await pipeline.handle_message(_payload(item_id="item-1"))
+    await _settle()
+
+    assert len(agent.calls) == 1
 
 
 # --------------------------------------------------------------------------
@@ -739,14 +779,14 @@ async def test_profile_chats_do_not_trigger_a_get_chat_request():
     принципе (спек: item_id «актуально только для чатов с типом u2i»).
     Тратить запрос к Авито на заведомо пустой ответ незачем."""
     avito = _FakeAvitoWithChat()
-    settings = _settings(avito_allowed_items="item-1")
+    settings = _settings(avito_blocked_items="8204183112")
     pipeline, store, agent, _ = _build(settings=settings, avito=avito)
 
     await pipeline.handle_message(_payload_without_item(chat_type="u2u"))
     await _settle()
 
     assert avito.chat_calls == []      # запроса не было
-    assert agent.calls == []           # и ответа тоже
+    assert len(agent.calls) == 1       # но ответить клиенту это не мешает
 
 
 async def test_get_chat_failure_does_not_crash_the_turn():
@@ -1437,3 +1477,97 @@ async def test_timeout_never_fires_under_dry_run_even_with_a_stale_due_at():
 
     assert handled == []
     assert avito.sent == []
+
+
+# --------------------------------------------------------------------------
+# Одна точка фильтрации на ВСЕ исходящие пути
+#
+# Пункт 5 задачи. Конвейер отсекает запрещённое объявление ещё на входе,
+# поэтому ниже гейт проверяется отдельно — на случай, когда чат уже создан
+# (например, объявление внесли в чёрный список ПОСЛЕ начала переписки):
+# ни один путь отправки не должен написать такому клиенту.
+# --------------------------------------------------------------------------
+
+def _gated(blocked_item: str = "8204183112", **overrides):
+    """Конвейер, у которого «клиент Авито» — OutboundGate, как в app/main.py."""
+    from app.channels.outbound_gate import OutboundGate
+
+    settings = _live_settings(avito_blocked_items=blocked_item, **overrides)
+    store = InMemoryDialogStore()
+    raw_avito = _FakeAvito()
+    gate = OutboundGate(raw_avito, settings, store.get_chat_item_id)
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    return settings, store, raw_avito, gate, ops_service
+
+
+async def test_agent_reply_to_a_blocked_listing_never_reaches_the_client():
+    settings, store, raw_avito, gate, ops_service = _gated()
+    # Чат уже существует и связан с объявлением, попавшим в чёрный список.
+    await store.get_or_create_chat("chat-1", item_id="8204183112")
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=gate, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    await pipeline._deliver(
+        store.chats["chat-1"], TurnResult(text="Баня свободна!"), client_text="?",
+    )
+
+    assert raw_avito.sent == []
+
+
+async def test_image_reply_to_a_blocked_listing_never_reaches_the_client():
+    settings, store, raw_avito, gate, ops_service = _gated()
+    await store.get_or_create_chat("chat-1", item_id="8204183112")
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=gate, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    await pipeline._handle_image_without_text(store.chats["chat-1"])
+
+    assert raw_avito.sent == []
+
+
+async def test_concession_timeout_fallback_to_a_blocked_listing_is_not_sent():
+    settings, store, raw_avito, gate, ops_service = _gated()
+    await store.get_or_create_chat("chat-1", item_id="8204183112")
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="скидка", created_at=NOW - timedelta(minutes=20),
+            is_concession=True, fallback_text="Уточню детали и вернусь с ответом.",
+            due_at=NOW - timedelta(minutes=5),
+        ),
+    )
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=gate, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert raw_avito.sent == []
+    assert handled == []
+
+
+async def test_the_same_paths_work_for_an_allowed_listing():
+    """Обратная сторона: гейт не должен молча глушить обычные чаты."""
+    settings, store, raw_avito, gate, ops_service = _gated()
+    await store.get_or_create_chat("chat-1", item_id="9999-обычное")
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=gate, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+
+    await pipeline._deliver(
+        store.chats["chat-1"], TurnResult(text="Баня свободна!"), client_text="?",
+    )
+
+    assert raw_avito.sent == [("chat-1", "Баня свободна!")]
+
+
+def test_moderation_mode_defaults_to_concessions_only():
+    """Подтверждение оператора только для ценовых уступок — значение по
+    умолчанию, а не то, что надо не забыть выставить на стенде."""
+    assert Settings().moderation_mode == "concessions_only"

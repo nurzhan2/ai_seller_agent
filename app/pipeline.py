@@ -9,12 +9,13 @@
 
 `handle_message` (синхронная часть, на каждое входящее):
     1. отбрасываем эхо наших же сообщений — иначе агент отвечает сам себе;
-    1a. ОПРЕДЕЛЯЕМ item_id и сверяем со списком разрешённых объявлений
-       (`AVITO_ALLOWED_ITEMS`). Чужое объявление — выходим НЕМЕДЛЕННО, до
-       создания `Chat`: в аккаунте заказчика есть вакансия менеджера,
-       продажа глэмпинга и квартира-студия, и диалога по ним не должно
-       остаться ни в базе, ни в карточках оператора. Пустой список
-       разрешает всё (см. `_listing_is_allowed`);
+    1a. ОПРЕДЕЛЯЕМ item_id и прогоняем через фильтр объявлений
+       (`app/channels/outbound_gate.py:is_listing_allowed` — та же функция,
+       что и на границе отправки). Запрещённое объявление — выходим
+       НЕМЕДЛЕННО, до создания `Chat`: в аккаунте заказчика есть вакансия
+       менеджера, продажа глэмпинга и квартира-студия, и диалога по ним не
+       должно остаться ни в базе, ни в карточках оператора. Чаты без
+       объявления (обращение из профиля, u2u/a2u) — штатно разрешены;
     2. находим/заводим `Chat`, подтягиваем item_id и zone_id;
     3. сохраняем входящее в `Message`;
     4. СБРАСЫВАЕМ таймер касаний — до всех проверок «отвечает ли агент».
@@ -96,6 +97,7 @@ from app.channels.avito_payloads import (
     is_image_message,
     is_outgoing_echo,
 )
+from app.channels.outbound_gate import is_listing_allowed
 from app.db.models import SendStatus
 from app.dialog_store import HISTORY_LIMIT, DialogStore
 from app.metrics import messages_total
@@ -291,35 +293,23 @@ class MessagePipeline:
         return recovered
 
     def _listing_is_allowed(self, item_id: Optional[str], chat_id: str) -> bool:
-        """Фильтр по AVITO_ALLOWED_ITEMS. Пустой список — разрешено всё.
+        """То же правило, что и на границе отправки — буквально та же
+        функция (`is_listing_allowed`), а не её копия.
 
-        В аккаунте заказчика 22 объявления, и 5 из них не про комплекс
-        (вакансия, продажа глэмпинга, арендный бизнес, продажа банного
-        комплекса, квартира-студия). Ответ про бани человеку, спросившему
-        про вакансию, — худший исход, чем молчание, поэтому неизвестный
-        item_id при заданном списке тоже блокируется.
+        Проверка стоит ЗДЕСЬ дополнительно к гейту не ради дублирования, а
+        ради другого эффекта: не завести диалог по чужому объявлению вообще
+        — ни строки в базе, ни карточки оператору. Гарантию «клиент не
+        получит сообщение» даёт гейт; эта проверка экономит мусор.
         """
-        allowed = getattr(self.settings, "avito_allowed_items", None) or []
-        if not allowed:
+        if is_listing_allowed(item_id, self.settings):
             return True
 
-        if item_id is None:
-            logger.info(
-                "pipeline: пропущено — item_id неизвестен, а список разрешённых "
-                "объявлений задан (%d шт.). Молчим: ответить по чужому объявлению "
-                "хуже, чем не ответить",
-                len(allowed), extra={"chat_id": chat_id},
-            )
-            return False
-
-        if item_id not in allowed:
-            logger.info(
-                "pipeline: пропущено — объявление %s не в списке разрешённых (%d шт.)",
-                item_id, len(allowed), extra={"chat_id": chat_id, "item_id": item_id},
-            )
-            return False
-
-        return True
+        logger.info(
+            "pipeline: пропущено — объявление %s под запретом",
+            item_id if item_id is not None else "(чат без объявления)",
+            extra={"chat_id": chat_id, "item_id": item_id},
+        )
+        return False
 
     async def _reset_touch_timer(self, chat_id: str) -> None:
         concession, touch = await self.store.load_dialog_state(chat_id)

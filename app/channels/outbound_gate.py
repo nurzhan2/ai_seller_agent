@@ -35,6 +35,39 @@ logger = logging.getLogger("parmangal.outbound")
 ItemIdLookup = Callable[[str], Awaitable[Optional[str]]]
 
 
+def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
+    """Единственное определение правила «по этому объявлению можно писать».
+
+    Одна функция на оба места, где правило применяется: на входе в конвейер
+    (чтобы не заводить диалог по чужому объявлению) и на границе отправки
+    (`OutboundGate`, чтобы ни один путь не написал клиенту мимо проверки).
+    Раньше это была скопированная логика в двух местах — так и разъезжаются
+    инварианты.
+
+    Порядок разбора:
+
+    1. Нет item_id (обращение из профиля, chat_type u2u/a2u — объявления у
+       такого чата нет по спеку Авито). Решает
+       `AVITO_ALLOW_CHATS_WITHOUT_ITEM`; по умолчанию отвечаем — это живой
+       клиент, и молчание хуже ответа.
+    2. Задан белый список `AVITO_ALLOWED_ITEMS` — он В ПРИОРИТЕТЕ и работает
+       как раньше: разрешено только перечисленное. Оставлен ради стендов,
+       где он уже выставлен, и как аварийный режим «пускать только вот эти».
+    3. Иначе — чёрный список `AVITO_BLOCKED_ITEMS`: запрещено только
+       перечисленное, всё остальное (включая новые объявления комплекса)
+       работает сразу.
+    """
+    if item_id is None:
+        return bool(getattr(settings, "avito_allow_chats_without_item", True))
+
+    allowed = getattr(settings, "avito_allowed_items", None) or []
+    if allowed:
+        return item_id in allowed
+
+    blocked = getattr(settings, "avito_blocked_items", None) or []
+    return item_id not in blocked
+
+
 class ListingNotAllowed(RuntimeError):
     """Попытка написать в чат по объявлению вне белого списка.
 
@@ -69,21 +102,30 @@ class OutboundGate:
 
     # -- решение -----------------------------------------------------------
 
-    async def is_allowed(self, chat_id: str) -> bool:
-        """Можно ли писать в этот чат. Пустой список — можно всё.
+    def _filter_is_off(self) -> bool:
+        """Ни чёрного списка, ни белого, и чаты без объявления разрешены —
+        фильтровать нечего, и ходить в базу за item_id незачем."""
+        return (
+            not (getattr(self._settings, "avito_allowed_items", None) or [])
+            and not (getattr(self._settings, "avito_blocked_items", None) or [])
+            and bool(getattr(self._settings, "avito_allow_chats_without_item", True))
+        )
 
-        Ошибка поиска item_id — это ЗАПРЕТ, а не разрешение: список задан,
-        значит оператор явно перечислил, по каким объявлениям агент имеет
-        право писать, и «мы не смогли проверить» не должно превращаться в
-        «значит, отправляем». Молчание дешевле ответа не тому человеку.
+    async def is_allowed(self, chat_id: str) -> bool:
+        """Можно ли писать в этот чат — по правилу `is_listing_allowed`.
+
+        Ошибка поиска item_id — это ЗАПРЕТ, а не разрешение. Чат без
+        объявления и чат, про который мы НЕ СМОГЛИ УЗНАТЬ, есть ли у него
+        объявление, — разные вещи: первое штатно разрешено
+        (`AVITO_ALLOW_CHATS_WITHOUT_ITEM`), второе означает, что проверка не
+        отработала, и подменять её результат догадкой нельзя.
         """
-        allowed = getattr(self._settings, "avito_allowed_items", None) or []
-        if not allowed:
+        if self._filter_is_off():
             return True
 
         if self._item_id_lookup is None:
             logger.warning(
-                "outbound: список объявлений задан, но искать item_id нечем — "
+                "outbound: фильтр объявлений включён, но искать item_id нечем — "
                 "отправка заблокирована",
                 extra={"chat_id": chat_id},
             )
@@ -98,22 +140,15 @@ class OutboundGate:
             )
             return False
 
-        if item_id is None:
-            logger.info(
-                "outbound: заблокировано — item_id чата неизвестен, а список "
-                "разрешённых объявлений задан (%d шт.)",
-                len(allowed), extra={"chat_id": chat_id},
-            )
-            return False
+        if is_listing_allowed(item_id, self._settings):
+            return True
 
-        if item_id not in allowed:
-            logger.info(
-                "outbound: заблокировано — объявление %s не в списке разрешённых (%d шт.)",
-                item_id, len(allowed), extra={"chat_id": chat_id, "item_id": item_id},
-            )
-            return False
-
-        return True
+        logger.info(
+            "outbound: заблокировано — объявление %s под запретом",
+            item_id if item_id is not None else "(чат без объявления)",
+            extra={"chat_id": chat_id, "item_id": item_id},
+        )
+        return False
 
     # -- отправка ----------------------------------------------------------
 

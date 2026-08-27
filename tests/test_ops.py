@@ -411,19 +411,19 @@ async def test_approved_reply_to_a_blocked_chat_is_not_delivered():
             return {"ok": True}
 
     async def lookup(chat_id: str):
-        return None            # чат по профилю: объявления нет
+        return "8204183112"    # вакансия менеджера — в чёрном списке
 
     client = _Client()
-    gate = OutboundGate(client, Settings(avito_allowed_items="item-1"), lookup)
+    gate = OutboundGate(client, Settings(), lookup)   # пять id заблокированы по умолчанию
     service = OpsService(
         store=InMemoryOpsStore(),
         settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True),
         send_to_avito=gate.send_message,
     )
-    await service.queue_reply("u2u-chat", "Здравствуйте! Свободно.")
+    await service.queue_reply("chat-vacancy", "Здравствуйте! Свободно.")
 
     with pytest.raises(ListingNotAllowed):
-        await service.approve("u2u-chat", ALLOWED_USER)
+        await service.approve("chat-vacancy", ALLOWED_USER)
 
     assert client.sent == []
 

@@ -47,6 +47,31 @@ class Settings(BaseSettings):
     # без него pydantic-settings пытается разобрать значение как JSON ещё
     # до валидатора и падает на пустой строке.
     avito_allowed_items: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    # Чёрный список — основной способ фильтрации. В отличие от белого,
+    # новое объявление КОМПЛЕКСА начинает работать сразу, без правки
+    # переменной: под запретом только перечисленное здесь.
+    #
+    # Пять id зашиты значением по умолчанию сознательно. Это не про
+    # «конфигурация в коде»: если переменную забудут выставить на новом
+    # стенде, посторонние объявления снова начнут получать прайс на бани —
+    # ровно тот баг, ради которого фильтр и появился. Переопределяется
+    # переменной окружения как обычно, в том числе пустым значением
+    # (`AVITO_BLOCKED_ITEMS=` — не блокировать ничего).
+    avito_blocked_items: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "8204183112",   # вакансия менеджера
+            "8076244626",   # продажа глэмпинга
+            "8076019723",   # арендный бизнес
+            "7980739861",   # продажа банного комплекса
+            "8172444564",   # квартира-студия
+        ]
+    )
+    # Обращения из профиля продавца (chat_type u2u/a2u) приходят без
+    # item_id — по спеку Авито объявления у таких чатов нет в принципе
+    # (см. app/channels/avito_payloads.py:extract_chat_type). Это живые
+    # клиенты, и молчать в ответ хуже, чем ответить: агент отвечает как
+    # обычно, только первым сообщением уточняет направление.
+    avito_allow_chats_without_item: bool = True
     # Concurrent in-flight requests to Avito. A semaphore, not a token
     # bucket — see AvitoClient.
     avito_max_concurrency: int = 5
@@ -151,7 +176,7 @@ class Settings(BaseSettings):
     # Максимум напоминаний на диалог — дальше молчим, а не долбим клиента.
     touch_max_count: int = 3
 
-    @field_validator("avito_allowed_items", mode="before")
+    @field_validator("avito_allowed_items", "avito_blocked_items", mode="before")
     @classmethod
     def _split_item_ids(cls, value: object) -> object:
         """`123,456` из переменной окружения, либо готовый JSON-список.

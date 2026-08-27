@@ -819,12 +819,30 @@ async def test_run_turn_injects_ambiguous_zone_hint(kb):
     assert "Русский стиль" in sent_text and "Гараж" in sent_text and "Рыцарская" in sent_text
 
 
-async def test_run_turn_without_item_id_sends_plain_text(kb):
+async def test_first_turn_without_item_id_asks_for_the_direction(kb):
+    """Обращение из профиля продавца (u2u/a2u): объявления нет, зацепки о
+    зоне тоже. Раньше такие чаты просто блокировались; теперь агент
+    отвечает, но первым сообщением выясняет направление."""
     script = [FakeResponse(content=[TextBlock("ок")])]
     agent, client = loop_for(kb, script)
+
     await agent.run_turn("d1", [], "привет")
+
+    sent_text = client.messages.calls[-1]["messages"][-1]["content"]
+    assert "баня, купол, гриль-домик или шатёр" in sent_text
+
+
+async def test_later_turns_without_item_id_do_not_repeat_the_direction_question(kb):
+    """Клиент уже ответил, чего хочет — переспрашивать направление в каждом
+    сообщении незачем. Подсказка только на первом ходу."""
+    script = [FakeResponse(content=[TextBlock("ок")])]
+    agent, client = loop_for(kb, script)
+    history = [{"role": "user", "content": "хочу баню"}, {"role": "assistant", "content": "какую?"}]
+
+    await agent.run_turn("d1", history, "русскую")
+
     main_call = next(c for c in client.messages.calls if c["model"] == "claude-sonnet-5")
-    assert main_call["messages"][-1]["content"] == "привет"
+    assert main_call["messages"][-1]["content"] == "русскую"
 
 
 def test_system_prompt_describes_one_question_disambiguation(kb):

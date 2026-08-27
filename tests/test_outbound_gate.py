@@ -38,14 +38,17 @@ class _FakeClient:
         return {"id": chat_id}
 
 
-def _gate(items: str = "", chats: dict | None = None) -> tuple[OutboundGate, _FakeClient]:
+def _gate(
+    items: str = "", chats: dict | None = None, blocked: str = "",
+) -> tuple[OutboundGate, _FakeClient]:
     chats = chats if chats is not None else {}
 
     async def lookup(chat_id: str):
         return chats.get(chat_id)
 
     client = _FakeClient()
-    return OutboundGate(client, Settings(avito_allowed_items=items), lookup), client
+    settings = Settings(avito_allowed_items=items, avito_blocked_items=blocked)
+    return OutboundGate(client, settings, lookup), client
 
 
 # --------------------------------------------------------------------------
@@ -78,14 +81,83 @@ async def test_listing_outside_the_allowlist_is_blocked():
     assert client.sent == []
 
 
-async def test_unknown_item_id_is_blocked_when_the_allowlist_is_set():
-    """Ровно случай из инцидента: чат u2u, объявления нет вовсе."""
+async def test_chat_without_a_listing_is_allowed_by_default():
+    """Чат u2u/a2u — обращение из профиля продавца, объявления у него нет
+    по спеку Авито. Это живой клиент: агент отвечает, молчание хуже."""
     gate, client = _gate(items="item-1", chats={})
 
+    await gate.send_message("u2u-2QuAfvI4HoxsE7IKKDN3SA", "Здравствуйте!")
+
+    assert client.sent == [("u2u-2QuAfvI4HoxsE7IKKDN3SA", "Здравствуйте!")]
+
+
+async def test_chat_without_a_listing_can_be_blocked_by_the_flag():
+    """AVITO_ALLOW_CHATS_WITHOUT_ITEM=false возвращает прежнее поведение —
+    рубильник на случай, если из профиля польётся мусор."""
+    async def lookup(chat_id: str):
+        return None
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client,
+        Settings(avito_blocked_items="item-x", avito_allow_chats_without_item=False),
+        lookup,
+    )
+
     with pytest.raises(ListingNotAllowed):
-        await gate.send_message("u2u-2QuAfvI4HoxsE7IKKDN3SA", "Приняли решение?")
+        await gate.send_message("u2u-chat", "Здравствуйте!")
 
     assert client.sent == []
+
+
+# --------------------------------------------------------------------------
+# Чёрный список — основной режим
+# --------------------------------------------------------------------------
+
+async def test_blocked_listing_is_rejected():
+    """Пять посторонних объявлений заказчика — вакансия, продажа бизнеса,
+    квартира. Ответ про бани такому клиенту хуже молчания."""
+    gate, client = _gate(blocked="8204183112", chats={"chat-1": "8204183112"})
+
+    with pytest.raises(ListingNotAllowed):
+        await gate.send_message("chat-1", "Баня свободна!")
+
+    assert client.sent == []
+
+
+async def test_a_listing_outside_the_blocklist_passes():
+    """Главная причина замены белого списка чёрным: новое объявление
+    комплекса работает сразу, без правки переменной."""
+    gate, client = _gate(blocked="8204183112", chats={"chat-1": "9999-новое"})
+
+    await gate.send_message("chat-1", "Здравствуйте!")
+
+    assert client.sent == [("chat-1", "Здравствуйте!")]
+
+
+async def test_the_five_default_blocked_listings_are_blocked_without_any_env_var():
+    """Переменную могут забыть выставить на новом стенде — тогда посторонние
+    объявления снова начнут получать прайс на бани. Пять id зашиты
+    значением по умолчанию именно поэтому."""
+    for item_id in ("8204183112", "8076244626", "8076019723", "7980739861", "8172444564"):
+        async def lookup(chat_id: str, _item=item_id):
+            return _item
+
+        client = _FakeClient()
+        gate = OutboundGate(client, Settings(), lookup)   # никаких переменных
+
+        with pytest.raises(ListingNotAllowed):
+            await gate.send_message("chat-1", "Баня свободна!")
+        assert client.sent == []
+
+
+async def test_allowlist_wins_over_the_blocklist_when_set():
+    """Совместимость: где AVITO_ALLOWED_ITEMS уже выставлен, он и решает."""
+    gate, client = _gate(items="item-1", blocked="item-1", chats={"chat-1": "item-1"})
+
+    await gate.send_message("chat-1", "Здравствуйте!")
+
+    assert client.sent == [("chat-1", "Здравствуйте!")]
 
 
 async def test_lookup_failure_blocks_rather_than_allows():
