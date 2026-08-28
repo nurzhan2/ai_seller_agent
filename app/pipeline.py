@@ -387,14 +387,18 @@ class MessagePipeline:
         await self.debouncer.submit(chat_id, text)
 
     def _is_too_old_to_answer(self, payload: dict, *, source: str) -> bool:
-        """AGENT_MIN_INBOUND_TS: единственная защита от ответа в чат,
+        """AGENT_MIN_INBOUND_TS: единственная защита от ответа в чат, где
+        клиент писал в последний раз давно.
 
-        где клиент писал в последний раз давно. 0 (дефолт) — проверка
-        выключена целиком, в том числе fail-closed-ветка ниже: на стендах
-        без настроенного порога отсутствие `created` не должно ничего
-        блокировать.
+        ДЕФОЛТ БЕЗОПАСНЫЙ. 0/незадано означает «агент не отвечает ни на
+        что» — НЕ «проверка выключена». Обратный дефолт (0 = защита не
+        активна) означал бы, что забытая на деплое переменная тихо снимает
+        защиту, — ровно тот класс ошибки, что уже стоил 65 сообщений (см.
+        app/config.py:agent_min_inbound_ts). app/main.py дублирует это
+        WARNING'ом в лог при старте, если POLLER_ENABLED=true, а порог
+        не поднят.
 
-        Пока порог включён (> 0), сообщение с НЕИЗВЕСТНЫМ `created`
+        Пока порог включён (> 0), сообщение с НЕИЗВЕСТНЫМ `created` тоже
         считается СТАРЫМ, а не свежим (fail closed — тот же приём, что у
         `OutboundGate.is_allowed` и `OwnItemIds.__call__`): доверять
         свежести, о которой нечего сказать, нельзя ровно там, где мы уже
@@ -402,7 +406,12 @@ class MessagePipeline:
         """
         threshold = getattr(self.settings, "agent_min_inbound_ts", 0) or 0
         if threshold <= 0:
-            return False
+            logger.warning(
+                "pipeline: AGENT_MIN_INBOUND_TS не задан (<= 0) — агент не "
+                "отвечает ни на что, пока порог не поднят осознанно",
+                extra={"chat_id": extract_chat_id(payload), "source": source},
+            )
+            return True
 
         created = extract_created(payload)
         if created is not None and created >= threshold:

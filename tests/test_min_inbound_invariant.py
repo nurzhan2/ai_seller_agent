@@ -222,3 +222,43 @@ async def test_message_created_exactly_at_the_cutoff_still_gets_an_answer():
     assert await pipeline.handle_message(boundary_event, source="webhook") is True
     await _settle()
     assert agent.calls == ["chat-boundary"]
+
+
+# --------------------------------------------------------------------------
+# Дефолт безопасный: незаданный/нулевой порог = агент не отвечает НИ НА ЧТО,
+# а не «проверки нет». Обратный дефолт означал бы, что забытая на деплое
+# переменная тихо снимает защиту — тот же класс ошибки, что уже стоил 65
+# сообщений.
+# --------------------------------------------------------------------------
+
+async def test_unset_threshold_answers_nothing_not_even_a_brand_new_message():
+    settings = _settings(agent_min_inbound_ts=0)
+    pipeline, agent = _build_pipeline(settings)
+
+    brand_new_event = {"payload": {"value": {
+        "id": "m-new", "chat_id": "chat-new", "author_id": "buyer",
+        "item_id": "111", "content": {"text": "привет"},
+        "created": NOW_TS,  # свежее некуда — прямо сейчас
+    }}}
+
+    assert await pipeline.handle_message(brand_new_event, source="webhook") is True
+    await _settle()
+    assert agent.calls == [], "незаданный порог не должен пропускать даже свежее сообщение"
+
+
+async def test_unset_threshold_answers_nothing_via_the_poller_either():
+    settings = _settings(agent_min_inbound_ts=0)
+    chat_id, message_id = "fresh-1", "m-fresh-1"
+    chats = [_chat(chat_id, "111", NOW_TS, message_id)]
+    messages = {chat_id: [_message(message_id, NOW_TS)]}
+
+    pipeline, agent = _build_pipeline(settings)
+    client = _FakeAvitoClient(chats, messages)
+    poller = AvitoPoller(
+        client=client, pipeline=pipeline, cursors=InMemoryCursorStore(),
+        settings=settings, items_provider=lambda: _resolved({"111"}), now_fn=lambda: NOW,
+    )
+
+    await poller.run_pass()
+    await _settle()
+    assert agent.calls == []

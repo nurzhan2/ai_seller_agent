@@ -30,6 +30,7 @@ from app.pricing.concessions import ConcessionDecision, ConcessionEvent, DialogC
 from app.pricing.engine import PriceQuote
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+NOW_TS = int(NOW.timestamp())
 
 OUR_USER_ID = "seller-1"
 
@@ -45,12 +46,17 @@ def _payload(
     message_id: str = "msg-1",
     author_id: str = "buyer-9",
     item_id: str | None = "item-1",
+    created: int = NOW_TS,
 ) -> dict:
     value: dict = {
         "id": message_id,
         "chat_id": chat_id,
         "author_id": author_id,
         "content": {"text": text},
+        # AGENT_MIN_INBOUND_TS (app/pipeline.py) — дефолт NOW_TS, чтобы эти
+        # фикстуры проходили порог "как есть"; тесты самого порога держат
+        # его в tests/test_min_inbound_invariant.py, а не здесь.
+        "created": created,
     }
     if item_id is not None:
         value["item_id"] = item_id
@@ -62,6 +68,7 @@ def _image_payload(
     message_id: str = "msg-img-1",
     author_id: str = "buyer-9",
     item_id: str | None = "item-1",
+    created: int = NOW_TS,
 ) -> dict:
     """Фото без подписи — по общеизвестной (не подтверждённой спеком) форме
     мессенджер-вебхука Авито: type="image", content.image вместо content.text."""
@@ -71,6 +78,7 @@ def _image_payload(
         "author_id": author_id,
         "type": "image",
         "content": {"image": {"sizes": {"140x105": "https://example.com/photo.jpg"}}},
+        "created": created,
     }
     if item_id is not None:
         value["item_id"] = item_id
@@ -142,6 +150,11 @@ def _settings(**overrides) -> Settings:
         telegram_allowed_users=[1],
         touch_reminder_delay_minutes=30,
         touch_max_count=3,
+        # Порог AGENT_MIN_INBOUND_TS дефолтится в 0 = «отвечать не на что»
+        # (app/config.py) — эти тесты не про порог, им нужен пропускающий
+        # порог, чтобы _payload()/_image_payload() (created=NOW_TS) через
+        # него проходили как обычно.
+        agent_min_inbound_ts=NOW_TS - 3600,
     )
     base.update(overrides)
     return Settings(**base)
@@ -1122,6 +1135,7 @@ def _live_settings(**overrides) -> Settings:
         touch_reminder_delay_minutes=30,
         touch_max_count=3,
         concession_approval_timeout_minutes=15,
+        agent_min_inbound_ts=NOW_TS - 3600,
     )
     base.update(overrides)
     return Settings(**base)

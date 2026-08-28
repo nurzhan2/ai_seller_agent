@@ -459,6 +459,18 @@ async def lifespan(app: FastAPI):
     webhooks.configure(handler=pipeline.handle_message)
     logger.info("incoming pipeline: wired to the Avito webhook")
 
+    if settings.agent_min_inbound_ts <= 0:
+        # Дефолт 0 = агент не отвечает НИ НА ЧТО, ни поллеру, ни вебхуку —
+        # см. app/config.py:agent_min_inbound_ts и
+        # app/pipeline.py:_is_too_old_to_answer. Не внутри `if
+        # settings.poller_enabled` ниже: вебхук подключён строкой выше
+        # безусловно и молчит по той же причине независимо от поллера.
+        logger.warning(
+            "pipeline: AGENT_MIN_INBOUND_TS не задан (<= 0) — агент НЕ БУДЕТ "
+            "отвечать ни на одно сообщение ни на одном канале, пока порог "
+            "не поднят осознанно"
+        )
+
     # Поллер — ОСНОВНОЙ канал; вебхук выше остаётся вторым. Причина в том,
     # что вебхуки по объявлениям комплекса не доставляются: за всю историю
     # базы 49 входящих, и все u2i-чаты среди них — по объявлениям из чёрного
@@ -491,10 +503,9 @@ async def lifespan(app: FastAPI):
             supervised_poller(poller, interval_seconds=settings.poller_interval_seconds)
         )
         logger.info(
-            "poller: запущен, интервал %d с, AGENT_MIN_INBOUND_TS=%d%s",
+            "poller: запущен, интервал %d с, AGENT_MIN_INBOUND_TS=%d "
+            "(предупреждение о пороге — в общем логе старта выше, если он не поднят)",
             settings.poller_interval_seconds, settings.agent_min_inbound_ts,
-            " (защита от старых чатов ВЫКЛЮЧЕНА — 0 означает «не настроено»)"
-            if settings.agent_min_inbound_ts <= 0 else "",
         )
     else:
         logger.warning(
