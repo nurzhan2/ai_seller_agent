@@ -9,6 +9,19 @@
 Одна сессия на вызов — как и во всём остальном проекте: между шагами
 конвейера стоит окно debounce длиной в десятки секунд, держать соединение
 открытым всё это время незачем.
+
+КУРСОР ОТВЕЧАЕТ ТОЛЬКО ЗА «ЧТО ЧИТАТЬ». До инцидента 2026-08-28 у него было
+второе значение — `cold_start_skipped` решал ещё и «отвечать ли», и именно
+это решение (курсор + POLLER_BACKFILL_HOURS + собственная развилка
+«свежее/старое») разошлось на практике: 65 клиентов получили ответ в чат,
+где последнее слово было от нескольких дней до нескольких месяцев назад.
+Разбор — `already_seen` ниже сравнивала `seen_ids`, а холодный старт писал
+курсор с реальным `created`, но ПУСТЫМ `seen_ids`; на следующем проходе
+`created == self.created`, `message_id in ()` — False, и «уже решили
+пропустить» читалось как «новое». Починка не в этом файле: «кому отвечать»
+решает `AGENT_MIN_INBOUND_TS` в app/pipeline.py, единой точкой, независимо
+от курсора, флагов, номера прохода и канала — так что ошибка курсора (какая
+угодно, не только эта) больше не может привести к лишнему исходящему.
 """
 
 from __future__ import annotations
@@ -33,7 +46,6 @@ class CursorRecord:
     chat_id: str
     created: int = 0
     seen_ids: tuple[str, ...] = ()
-    cold_start_skipped: bool = False
     skipped_reason: Optional[str] = None
     item_id: Optional[str] = None
 
@@ -60,15 +72,13 @@ class CursorRecord:
             merged = self.seen_ids + tuple(i for i in ids if i not in self.seen_ids)
             # Список не растёт бесконечно: он относится к ОДНОЙ секунде, и
             # как только придёт сообщение следующей секунды, он обнулится.
-            return CursorRecord(self.chat_id, created, merged, False, None, self.item_id)
-        return CursorRecord(self.chat_id, created, ids, False, None, self.item_id)
+            return CursorRecord(self.chat_id, created, merged, None, self.item_id)
+        return CursorRecord(self.chat_id, created, ids, None, self.item_id)
 
 
 class CursorStore(Protocol):
     async def load(self, chat_ids: list[str]) -> dict[str, CursorRecord]: ...
     async def save(self, record: CursorRecord) -> None: ...
-    async def list_cold_start_skipped(self, limit: int = 200) -> list[CursorRecord]: ...
-    async def clear_skip(self, chat_id: str) -> Optional[CursorRecord]: ...
 
 
 @dataclass
@@ -83,19 +93,6 @@ class InMemoryCursorStore:
     async def save(self, record: CursorRecord) -> None:
         self.rows[record.chat_id] = record
 
-    async def list_cold_start_skipped(self, limit: int = 200) -> list[CursorRecord]:
-        return [r for r in self.rows.values() if r.cold_start_skipped][:limit]
-
-    async def clear_skip(self, chat_id: str) -> Optional[CursorRecord]:
-        row = self.rows.get(chat_id)
-        if row is None:
-            return None
-        cleared = CursorRecord(
-            row.chat_id, row.created, row.seen_ids, False, None, row.item_id
-        )
-        self.rows[chat_id] = cleared
-        return row
-
 
 class SqlAlchemyCursorStore:
     def __init__(self, session_factory):
@@ -107,7 +104,6 @@ class SqlAlchemyCursorStore:
             chat_id=row.chat_id,
             created=int(row.last_message_created or 0),
             seen_ids=tuple(row.last_message_ids or ()),
-            cold_start_skipped=bool(row.cold_start_skipped),
             skipped_reason=row.skipped_reason,
             item_id=row.item_id,
         )
@@ -152,49 +148,7 @@ class SqlAlchemyCursorStore:
 
             row.last_message_created = record.created
             row.last_message_ids = list(record.seen_ids)
-            row.cold_start_skipped = record.cold_start_skipped
             row.skipped_reason = record.skipped_reason
             if record.item_id is not None:
                 row.item_id = record.item_id
             await session.commit()
-
-    async def list_cold_start_skipped(self, limit: int = 200) -> list[CursorRecord]:
-        from sqlalchemy import select
-
-        from app.db.models import ChatCursor
-
-        async with self._session_factory() as session:
-            rows = (
-                await session.execute(
-                    select(ChatCursor)
-                    .where(ChatCursor.cold_start_skipped.is_(True))
-                    .order_by(ChatCursor.last_message_created.desc())
-                    .limit(limit)
-                )
-            ).scalars().all()
-        return [self._to_record(row) for row in rows]
-
-    async def clear_skip(self, chat_id: str) -> Optional[CursorRecord]:
-        """Снять пометку «пропущен холодным стартом» и вернуть СТАРУЮ строку.
-
-        Старую — потому что вызывающему (кнопке «обработать» в админке) нужен
-        курсор ДО снятия: именно с него он будет перечитывать чат. После
-        снятия эта информация в базе уже недоступна.
-        """
-        from sqlalchemy import select
-
-        from app.db.models import ChatCursor
-
-        async with self._session_factory() as session:
-            row = (
-                await session.execute(
-                    select(ChatCursor).where(ChatCursor.chat_id == chat_id)
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                return None
-            previous = self._to_record(row)
-            row.cold_start_skipped = False
-            row.skipped_reason = None
-            await session.commit()
-        return previous

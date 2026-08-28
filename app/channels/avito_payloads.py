@@ -167,6 +167,34 @@ def build_event_from_polled_message(
     }
 
 
+def extract_created(payload: dict) -> Optional[int]:
+    """Unix-секунды создания сообщения — реальное время из Авито, а не
+    момент, когда мы его увидели.
+
+    Единственный сигнал, на котором держится `AGENT_MIN_INBOUND_TS`
+    (app/pipeline.py): вебхук и поллер несут его под одним и тем же путём
+    (см. `build_event_from_polled_message` — форма события намеренно та же,
+    что у вебхука), плюс запасной путь по верхнеуровневому `timestamp`
+    конверта на случай вебхука без `created` внутри `value`.
+
+    None означает «не смогли определить» — вызывающий код (в отличие от
+    большинства экстракторов этого модуля) обязан считать это НЕ «свежим», а
+    «неизвестным»: см. докстринг `agent_min_inbound_ts` в app/config.py.
+    """
+    for path in (
+        ("payload", "value", "created"),
+        ("value", "created"),
+        ("created",),
+        ("timestamp",),
+    ):
+        value = _dig(payload, path)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
 def extract_chat_type(payload: dict) -> Optional[str]:
     """Тип чата: "u2i" (по объявлению), "u2u"/"a2u" (по профилю).
 

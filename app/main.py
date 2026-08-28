@@ -491,10 +491,10 @@ async def lifespan(app: FastAPI):
             supervised_poller(poller, interval_seconds=settings.poller_interval_seconds)
         )
         logger.info(
-            "poller: запущен, интервал %d с, окно холодного старта %d ч%s",
-            settings.poller_interval_seconds, settings.poller_backfill_hours,
-            " (никого не будим — только новые сообщения)"
-            if settings.poller_backfill_hours <= 0 else "",
+            "poller: запущен, интервал %d с, AGENT_MIN_INBOUND_TS=%d%s",
+            settings.poller_interval_seconds, settings.agent_min_inbound_ts,
+            " (защита от старых чатов ВЫКЛЮЧЕНА — 0 означает «не настроено»)"
+            if settings.agent_min_inbound_ts <= 0 else "",
         )
     else:
         logger.warning(

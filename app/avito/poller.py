@@ -46,6 +46,20 @@
     аккаунта. Это временная мера до таблицы `item_scope` (блок 1), и она
     живёт ЗДЕСЬ, в поллере, а не в общем фильтре — чтобы не менять поведение
     боевого пути вебхука ради чужой проблемы.
+
+ЗДЕСЬ БОЛЬШЕ НЕТ ХОЛОДНОГО СТАРТА КАК ОСОБОГО СЛУЧАЯ. До инцидента
+2026-08-28 чат без курсора проходил через `_cold_start_decision`
+(POLLER_BACKFILL_HOURS, «свежее/старое», «последнее слово наше») — решение
+принимал курсор. На практике эти четыре состояния не сошлись, и 65 клиентов
+получили ответ в чат месячной давности (разбор — CursorRecord.already_seen
+в app/avito/cursors.py). Теперь чат без курсора начинает читаться с нуля,
+той же веткой, что и любой другой проход — курсор решает ТОЛЬКО что уже
+прочитано. Отвечать ли — решает `AGENT_MIN_INBOUND_TS` в app/pipeline.py,
+на входе в конвейер, независимо от поллера. Стоимость: первый проход после
+включения читает историю каждого нового чата целиком (в пределах
+POLLER_MAX_MESSAGE_PAGES), а не пропускает её молча — ожидаемо дороже по
+запросам к Авито и по ходам агента, но не может привести к лишнему
+исходящему.
 """
 
 from __future__ import annotations
@@ -80,7 +94,6 @@ class PassStats:
     chats_seen: int = 0
     chats_with_new: int = 0
     messages_fed: int = 0
-    cold_start_skipped: int = 0
     failed_chats: int = 0
     requests: int = 0
     truncated_chats: int = 0
@@ -121,14 +134,6 @@ def _created_of(node: dict) -> Optional[int]:
             return value
         if isinstance(value, str) and value.isdigit():
             return int(value)
-    return None
-
-
-def _author_of(node: dict) -> Optional[str]:
-    for key in ("author_id", "authorId", "user_id"):
-        value = node.get(key)
-        if isinstance(value, (str, int)) and str(value):
-            return str(value)
     return None
 
 
@@ -277,11 +282,9 @@ class AvitoPoller:
 
         logger.info(
             "poller: проход завершён — чатов %d, с новыми %d, подано сообщений %d, "
-            "пропущено холодным стартом %d, сбоев %d, запросов %d, обрезано хвостов %d, "
-            "причины пропуска %s",
+            "сбоев %d, запросов %d, обрезано хвостов %d, причины пропуска %s",
             stats.chats_seen, stats.chats_with_new, stats.messages_fed,
-            stats.cold_start_skipped, stats.failed_chats, stats.requests,
-            stats.truncated_chats, stats.reasons,
+            stats.failed_chats, stats.requests, stats.truncated_chats, stats.reasons,
         )
         return stats
 
@@ -351,14 +354,11 @@ class AvitoPoller:
 
         cursor = cursor_by_chat.get(chat_id)
 
-        # Гуард «своё ли объявление» — до всего остального, включая холодный
-        # старт: чужой чат не должен даже попадать в список «пропущенных с
-        # кнопкой обработать», иначе оператор однажды нажмёт её у репетитора.
+        # Гуард «своё ли объявление» — до всего остального.
         if own_items and (item_id is None or item_id not in own_items):
-            if cursor is None or not cursor.cold_start_skipped:
+            if cursor is None:
                 await self._save_cursor(
-                    CursorRecord(chat_id, last_created or 0, (), True,
-                                 "not_our_listing", item_id)
+                    CursorRecord(chat_id, last_created or 0, (), "not_our_listing", item_id)
                 )
             stats.skip("not_our_listing")
             return
@@ -366,53 +366,28 @@ class AvitoPoller:
         if last_created is None:
             if cursor is None:
                 await self._save_cursor(
-                    CursorRecord(chat_id, 0, (), True, "no_messages", item_id)
+                    CursorRecord(chat_id, 0, (), "no_messages", item_id)
                 )
-                stats.cold_start_skipped += 1
             stats.skip("no_messages")
             return
 
         if cursor is None:
-            decision, reason = self._cold_start_decision(last, last_created)
-            if decision == "skip":
-                await self._save_cursor(
-                    CursorRecord(chat_id, last_created, (), True, reason, item_id)
-                )
-                stats.cold_start_skipped += 1
-                stats.skip(reason)
-                return
-            # Обрабатываем: курсор начинается ДО последнего сообщения, чтобы
-            # оно само попало в выборку.
-            cursor = CursorRecord(chat_id, 0, (), False, None, item_id)
+            # Курсор отвечает только за «что читать» — холодный старт больше
+            # не решает, отвечать ли (см. докстринг модуля и
+            # AGENT_MIN_INBOUND_TS в app/config.py). Начинаем с нуля, той же
+            # веткой, что и любой другой проход — последнее сообщение само
+            # попадёт в выборку `_drain_chat` ниже.
+            cursor = CursorRecord(chat_id, 0, (), None, item_id)
 
         if cursor.already_seen(_message_id_of(last), last_created):
             stats.skip("up_to_date")
             return
 
         stats.chats_with_new += 1
-        await self._drain_chat(chat_id, item_id, _chat_type_of(chat), cursor, stats)
-
-    def _cold_start_decision(self, last: dict, last_created: int) -> tuple[str, str]:
-        """Что делать с чатом, у которого курсора ещё нет.
-
-        Автоответ только там, где последнее сообщение ВХОДЯЩЕЕ и СВЕЖЕЕ
-        окна. Всё остальное помечается прочитанным без единого исходящего:
-        реанимация старой переписки — решение человека, а не побочный эффект
-        первого запуска.
-        """
-        author = _author_of(last)
-        our_id = getattr(self.settings, "avito_user_id", "") or ""
-        if author is not None and our_id and author == our_id:
-            return "skip", "outgoing_last"
-
-        hours = self.settings.poller_backfill_hours
-        if hours <= 0:
-            return "skip", "backfill_disabled"
-
-        now = int(self.now_fn().timestamp())
-        if now - last_created > hours * 3600:
-            return "skip", "old"
-        return "process", "fresh_incoming"
+        await self._drain_chat(
+            chat_id, item_id, _chat_type_of(chat), cursor, stats,
+            last_message_id=_message_id_of(last), last_created=last_created,
+        )
 
     async def _drain_chat(
         self,
@@ -421,9 +396,25 @@ class AvitoPoller:
         chat_type: str,
         cursor: CursorRecord,
         stats: PassStats,
+        *,
+        last_message_id: Optional[str],
+        last_created: int,
     ) -> None:
         new_messages = await self._fetch_new_messages(chat_id, cursor, stats)
         if not new_messages:
+            # `chats.list` уже показал этот чат как «есть новое» (курсор не
+            # already_seen на его last_message), но постраничный сборщик
+            # сообщений ничего не вернул — по факту либо у чата нет
+            # сообщений, либо ответ страницы пуст. В любом случае молчать и
+            # НЕ двигать курсор нельзя: на следующем проходе чат снова
+            # выглядел бы «холодным» и снова стоил бы запроса за
+            # сообщениями, и так каждый проход. Продвигаем курсор прямо
+            # тем, что уже знаем из списка чатов — тем же приёмом, что
+            # раньше использовал холодный старт для случаев «пропуск», но
+            # теперь БЕЗ пустого seen_ids: advanced_by кладёт message_id
+            # внутрь сам.
+            cursor = cursor.advanced_by(last_message_id, last_created)
+            await self._save_cursor(cursor)
             return
 
         for message in new_messages:

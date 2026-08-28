@@ -237,10 +237,13 @@ class ChatCursor(Base):
     дедуп по message_id нельзя: его заявка живёт сутки, а чат может стоять
     на одном и том же курсоре неделями.
 
-    `cold_start_skipped` — чат помечен прочитанным при первом проходе БЕЗ
-    единого исходящего (см. POLLER_BACKFILL_HOURS). Такие чаты показываются
-    в /admin/dialogs отдельным списком с кнопкой «обработать»: реанимация
-    старой переписки — решение человека, а не побочный эффект запуска.
+    БЕЗ понятия «холодный старт пропущен». Курсор отвечает только за «что
+    читать» — кому отвечать решает AGENT_MIN_INBOUND_TS в app/pipeline.py,
+    единой точкой, независимой от курсора (см. app/config.py). Раньше здесь
+    жил ещё и `cold_start_skipped` — чат, помеченный прочитанным на первом
+    проходе без единого исходящего; убран целиком после инцидента
+    2026-08-28: сама эта развилка (курсор решает, отвечать ли) и была
+    причиной, по которой 65 клиентов получили ответ в чат месячной давности.
     """
 
     __tablename__ = "chat_cursor"
@@ -249,8 +252,7 @@ class ChatCursor(Base):
     chat_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     last_message_created: Mapped[int] = mapped_column(BigInteger, default=0)
     last_message_ids: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
-    cold_start_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
-    # old | outgoing_last | no_messages | backfill_disabled | not_our_listing
+    # no_messages | not_our_listing — чат не по нашей части ящика.
     skipped_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # Заголовок и объявление — только чтобы оператор видел в /admin/dialogs,
     # что именно он собирается разбудить, словами, а не голым chat_id.

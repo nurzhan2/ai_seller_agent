@@ -11,7 +11,6 @@ from __future__ import annotations
 import csv
 import io
 import secrets
-from datetime import datetime, timezone
 from decimal import Decimal
 from html import escape
 from typing import Any, Optional
@@ -318,103 +317,7 @@ async def dialogs(request: Request, _: str = Depends(require_admin)) -> HTMLResp
             f"<td>{escape(last_text)}</td></tr>"
         )
     body.append("</table>")
-    body.append(await _cold_start_section(request))
     return _page("Диалоги", "".join(body))
-
-
-async def _cold_start_section(request: Request) -> str:
-    """Чаты, которые поллер пометил прочитанными и НЕ ответил.
-
-    Существует ради одного правила: реанимация старой переписки — решение
-    человека. При первом запуске поллер видит весь ящик, и «ответить всем,
-    кто когда-либо писал» — это десятки сообщений живым людям по поводу,
-    который они давно забыли. Поэтому такие чаты молча помечаются
-    прочитанными, а сюда попадают списком с кнопкой.
-    """
-    store = getattr(request.app.state, "cursor_store", None)
-    if store is None:
-        return ""
-
-    try:
-        rows = await store.list_cold_start_skipped()
-    except Exception:
-        # Страница диагностическая; уронить её 500-й из-за одной таблицы —
-        # потерять ровно тот инструмент, ради которого её открыли.
-        return ("<h2>Пропущено при холодном старте</h2>"
-                "<p class='note'>Не удалось прочитать курсоры.</p>")
-
-    if not rows:
-        return ("<h2>Пропущено при холодном старте</h2>"
-                "<p class='note'>Пусто — поллер никого не пропускал.</p>")
-
-    # not_our_listing сюда не показываем: это чаты по ЧУЖИМ объявлениям
-    # (репетитор, покос травы, чайник — владелец аккаунта там покупатель),
-    # и кнопка «обработать» у них означала бы прайс на баню в ответ не по
-    # адресу. Они помечены прочитанными и разбираются глазами, а не кнопкой.
-    visible = [r for r in rows if r.skipped_reason != "not_our_listing"]
-    foreign = len(rows) - len(visible)
-
-    out = [
-        "<h2>Пропущено при холодном старте</h2>",
-        "<p class='note'>Поллер пометил эти чаты прочитанными и НЕ отвечал. "
-        "Кнопка перечитывает чат с нуля и подаёт его агенту — переписка "
-        "может быть месячной давности, посмотрите, прежде чем будить.",
-    ]
-    if foreign:
-        out.append(f" Ещё {foreign} чат(ов) по чужим объявлениям скрыто.")
-    out.append("</p>")
-    out.append("<table><tr><th>чат</th><th>объявление</th><th>причина</th>"
-               "<th>последнее сообщение</th><th></th></tr>")
-    for row in visible:
-        when = (
-            datetime.fromtimestamp(row.created, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-            if row.created else "—"
-        )
-        out.append(
-            f"<tr><td>{escape(row.chat_id)}</td>"
-            f"<td>{escape(row.item_id or '—')}</td>"
-            f"<td>{escape(row.skipped_reason or '—')}</td>"
-            f"<td>{escape(when)}</td>"
-            "<td><form method='post' action='/admin/dialogs/process'>"
-            f"<input type='hidden' name='chat_id' value='{escape(row.chat_id)}'>"
-            "<button type='submit'>обработать</button></form></td></tr>"
-        )
-    out.append("</table>")
-    return "".join(out)
-
-
-@router.post("/dialogs/process")
-async def dialogs_process(
-    request: Request, _: str = Depends(require_admin)
-) -> RedirectResponse:
-    """Снять пометку «пропущен» и перечитать чат ближайшим проходом поллера.
-
-    Работу делает НЕ этот обработчик, а поллер: здесь только снимается флаг
-    и откатывается курсор. Иначе пришлось бы держать второй путь подачи
-    сообщений в конвейер — ровно то, чего избегает вся остальная система
-    (одна точка фильтрации исходящих, одна точка дедупа входящих).
-
-    Курсор откатывается в ноль, а не в «последнее сообщение»: смысл кнопки в
-    том, чтобы агент УВИДЕЛ переписку, а не пропустил её ещё раз. От
-    повторного ответа на уже отвеченное защищает дедуп по message_id и
-    уникальный индекс в `messages`.
-    """
-    form = await request.form()
-    chat_id = str(form.get("chat_id") or "").strip()
-    store = getattr(request.app.state, "cursor_store", None)
-
-    if chat_id and store is not None:
-        from app.avito.cursors import CursorRecord
-
-        previous = await store.clear_skip(chat_id)
-        if previous is not None:
-            await store.save(
-                CursorRecord(chat_id=chat_id, created=0, seen_ids=(),
-                             cold_start_skipped=False, skipped_reason=None,
-                             item_id=previous.item_id)
-            )
-
-    return RedirectResponse(url="/admin/dialogs", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @router.get("/leads", response_class=HTMLResponse)

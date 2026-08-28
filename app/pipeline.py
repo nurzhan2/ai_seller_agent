@@ -8,6 +8,15 @@
 ПОРЯДОК ШАГОВ ЗДЕСЬ — ЧАСТЬ ПОВЕДЕНИЯ, А НЕ ОФОРМЛЕНИЕ.
 
 `handle_message` (синхронная часть, на каждое входящее):
+    0. ПОРОГ ВОЗРАСТА (`_is_too_old_to_answer`, AGENT_MIN_INBOUND_TS) —
+       первым делом в `_accept`, сразу после дедупа в `_handle_message`
+       (шаг ещё раньше этого списка) и до всего перечисленного ниже.
+       Сообщение старше порога дальше по функции размечено, но НЕ
+       блокирует запись в историю (шаг 3) — блокирует только шаги, которые
+       порождают исходящее (6 и шаблонный ответ на фото). Живёт здесь, а
+       не в поллере: вебхук идёт тем же путём `_accept`, и проверка в
+       поллере эту дыру не закрыла бы. Разбор инцидента 2026-08-28 (65
+       чатов) — в app/config.py:agent_min_inbound_ts;
     1. отбрасываем эхо наших же сообщений — иначе агент отвечает сам себе;
     1a. ОПРЕДЕЛЯЕМ item_id и прогоняем через фильтр объявлений
        (`app/channels/outbound_gate.py:is_listing_allowed` — та же функция,
@@ -109,6 +118,7 @@ from app.channels.avito_payloads import (
     describe_payload_for_logging,
     extract_chat_id,
     extract_chat_type,
+    extract_created,
     extract_item_id,
     extract_item_id_from_chat,
     extract_item_id_raw,
@@ -283,6 +293,18 @@ class MessagePipeline:
         снимается заявка дедупа и не двигается курсор поллера. Глушить
         исключения здесь значит терять сообщения молча.
         """
+        # ПОРОГ ВОЗРАСТА — сразу после дедупа (он уже отработал в
+        # `_handle_message`), до всякой бизнес-логики ниже. Инцидент
+        # 2026-08-28: курсор поллера решал «отвечать ли» и ошибся на 65
+        # чатах. Теперь «отвечать ли» решается ЗДЕСЬ, одним местом для
+        # обоих каналов (source="poller"/"webhook" — оба идут через
+        # `handle_message` -> `_accept`), независимо от курсора, флагов и
+        # номера прохода. `too_old` НЕ прерывает разбор — сообщение всё
+        # равно можно записать в историю диалога (см. использование ниже
+        # и app/config.py:agent_min_inbound_ts), просто ни один путь,
+        # порождающий исходящее, дальше по функции его не увидит.
+        too_old = self._is_too_old_to_answer(payload, source=source)
+
         our_user_id = getattr(self.settings, "avito_user_id", "") or ""
         if is_outgoing_echo(payload, our_user_id):
             # Авито шлёт вебхук и на наши собственные сообщения. Без этой
@@ -326,7 +348,7 @@ class MessagePipeline:
             if chat.is_human_takeover:
                 logger.info("pipeline: chat is with a human, agent skipped", extra={"chat_id": chat_id})
                 return
-            if is_image_message(payload):
+            if is_image_message(payload) and not too_old:
                 await self._handle_image_without_text(chat)
             return
 
@@ -358,7 +380,47 @@ class MessagePipeline:
             logger.info("pipeline: chat is with a human, agent skipped", extra={"chat_id": chat_id})
             return
 
+        if too_old:
+            # Записано в историю (save_incoming выше) — просто не отвечаем.
+            return
+
         await self.debouncer.submit(chat_id, text)
+
+    def _is_too_old_to_answer(self, payload: dict, *, source: str) -> bool:
+        """AGENT_MIN_INBOUND_TS: единственная защита от ответа в чат,
+
+        где клиент писал в последний раз давно. 0 (дефолт) — проверка
+        выключена целиком, в том числе fail-closed-ветка ниже: на стендах
+        без настроенного порога отсутствие `created` не должно ничего
+        блокировать.
+
+        Пока порог включён (> 0), сообщение с НЕИЗВЕСТНЫМ `created`
+        считается СТАРЫМ, а не свежим (fail closed — тот же приём, что у
+        `OutboundGate.is_allowed` и `OwnItemIds.__call__`): доверять
+        свежести, о которой нечего сказать, нельзя ровно там, где мы уже
+        один раз ошиблись в другую сторону.
+        """
+        threshold = getattr(self.settings, "agent_min_inbound_ts", 0) or 0
+        if threshold <= 0:
+            return False
+
+        created = extract_created(payload)
+        if created is not None and created >= threshold:
+            return False
+
+        logger.warning(
+            "pipeline: входящее старше AGENT_MIN_INBOUND_TS — исходящее не порождается",
+            extra={
+                "chat_id": extract_chat_id(payload),
+                # НЕ "created": это имя уже занято самим LogRecord (момент
+                # записи лога) — logging бросает KeyError на попытку его
+                # перезаписать через extra.
+                "inbound_created": created,
+                "agent_min_inbound_ts": threshold,
+                "source": source,
+            },
+        )
+        return True
 
     async def _resolve_item_id(self, payload: dict, chat_id: str) -> Optional[str]:
         """item_id из вебхука, а если его там нет — из чата отдельным запросом.
