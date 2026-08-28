@@ -31,7 +31,6 @@ NOW_TS = int(NOW.timestamp())
 def _settings(**overrides) -> Settings:
     base = dict(
         avito_user_id=OUR_USER_ID,
-        poller_backfill_hours=72,
         poller_chats_page_size=2,
         poller_max_offset=1000,
         poller_messages_page_size=2,
@@ -104,10 +103,22 @@ class FakeAvito:
         return {"messages": batch[offset:offset + limit]}
 
 
-def _chat(chat_id, item_id, created, author, title="Баня"):
+def _chat(chat_id, item_id, created, author, title="Баня", message_id=None):
+    """`message_id` — id ПОСЛЕДНЕГО сообщения по мнению списка чатов.
+
+    По умолчанию синтетический (`{chat_id}-last`) — большинству тестов
+    достаточно самого факта «в чате есть последнее сообщение с таким-то
+    created». Передавайте настоящий id явно там, где тест проверяет
+    seen_ids после пустого `_fetch_new_messages` (см. app/avito/poller.py:
+    `_drain_chat` продвигает курсор ЭТИМ id, если постраничный сборщик
+    ничего не вернул) — реальный Авито здесь несёт один и тот же id в
+    обоих ответах, а рассинхронизация исключительно тестовая.
+    """
     chat: dict = {
         "id": chat_id,
-        "last_message": {"id": f"{chat_id}-last", "created": created, "author_id": author},
+        "last_message": {
+            "id": message_id or f"{chat_id}-last", "created": created, "author_id": author,
+        },
     }
     if item_id is not None:
         chat["context"] = {"type": "item", "value": {"id": item_id, "title": title}}
@@ -220,7 +231,7 @@ async def test_new_message_in_the_same_second_as_the_cursor_is_not_lost():
 
 async def test_same_second_messages_are_fed_once_each():
     created = NOW_TS - 60
-    chats = [_chat("c1", "111", created, "buyer")]
+    chats = [_chat("c1", "111", created, "buyer", message_id="m2")]
     messages = {"c1": [
         _message("m2", created, author="buyer"),
         _message("m1", created, author="buyer"),
@@ -247,77 +258,41 @@ async def test_cursor_never_moves_backwards():
 
 
 # --------------------------------------------------------------------------
-# Холодный старт
+# Холодный старт — БЕЗ особого случая (инцидент 2026-08-28, см. докстринг
+# app/avito/poller.py и app/avito/cursors.py). Курсор решает только «что
+# читать»; «отвечать ли» — AGENT_MIN_INBOUND_TS в конвейере, покрыто
+# tests/test_pipeline.py и tests/test_min_inbound_invariant.py.
 # --------------------------------------------------------------------------
 
-async def test_cold_start_skips_old_chat_without_a_single_outgoing():
-    chats = [_chat("c1", "111", NOW_TS - 100 * 3600, "buyer")]
+async def test_cold_start_feeds_an_old_last_message_same_as_any_other_pass():
+    """Раньше это была ветка «пропуск: old». Курсору больше нечего решать —
+    старое сообщение подаётся в конвейер точно так же, как свежее. Не
+    отвечать на него — забота AGENT_MIN_INBOUND_TS, не поллера."""
+    old = NOW_TS - 100 * 3600
+    chats = [_chat("c1", "111", old, "buyer")]
+    messages = {"c1": [_message("m1", old, author="buyer")]}
     pipeline = FakePipeline()
     cursors = InMemoryCursorStore()
 
-    poller, _ = _poller(chats, {}, pipeline=pipeline, cursors=cursors, own_items={"111"})
-    await poller.run_pass()
-
-    assert pipeline.events == []
-    assert cursors.rows["c1"].cold_start_skipped is True
-    assert cursors.rows["c1"].skipped_reason == "old"
-
-
-async def test_cold_start_skips_chat_where_we_spoke_last():
-    chats = [_chat("c1", "111", NOW_TS - 60, OUR_USER_ID)]
-    pipeline = FakePipeline()
-    cursors = InMemoryCursorStore()
-
-    poller, _ = _poller(chats, {}, pipeline=pipeline, cursors=cursors, own_items={"111"})
-    await poller.run_pass()
-
-    assert pipeline.events == []
-    assert cursors.rows["c1"].skipped_reason == "outgoing_last"
-
-
-async def test_cold_start_processes_fresh_incoming():
-    chats = [_chat("c1", "111", NOW_TS - 60, "buyer")]
-    messages = {"c1": [_message("m1", NOW_TS - 60, author="buyer")]}
-    pipeline = FakePipeline()
-
-    poller, _ = _poller(chats, messages, pipeline=pipeline, own_items={"111"})
+    poller, _ = _poller(chats, messages, pipeline=pipeline, cursors=cursors, own_items={"111"})
     await poller.run_pass()
 
     assert pipeline.message_ids == ["m1"]
 
 
-async def test_backfill_zero_wakes_nobody():
-    """Дефолт первого деплоя: канал проверяем, людей не будим."""
-    chats = [_chat("c1", "111", NOW_TS - 60, "buyer")]
+async def test_cold_start_feeds_our_own_last_message_too():
+    """Раньше это была ветка «пропуск: outgoing_last». Эхо своих же сообщений
+    отсекает конвейер (is_outgoing_echo), не поллер — поэтому здесь курсор
+    просто подаёт то, что есть."""
+    chats = [_chat("c1", "111", NOW_TS - 60, OUR_USER_ID)]
+    messages = {"c1": [_message("m1", NOW_TS - 60, author=OUR_USER_ID)]}
     pipeline = FakePipeline()
     cursors = InMemoryCursorStore()
 
-    poller, _ = _poller(chats, {}, settings=_settings(poller_backfill_hours=0),
-                        pipeline=pipeline, cursors=cursors, own_items={"111"})
+    poller, _ = _poller(chats, messages, pipeline=pipeline, cursors=cursors, own_items={"111"})
     await poller.run_pass()
 
-    assert pipeline.events == []
-    assert cursors.rows["c1"].skipped_reason == "backfill_disabled"
-
-
-async def test_skipped_chat_still_answers_a_brand_new_message():
-    """Пропуск относится к СТАРЫМ сообщениям. Новое входящее — живой клиент,
-    пишущий сейчас, и молчать в ответ хуже любого риска."""
-    old = NOW_TS - 100 * 3600
-    chats = [_chat("c1", "111", old, "buyer")]
-    cursors = InMemoryCursorStore()
-    pipeline = FakePipeline()
-
-    poller, client = _poller(chats, {}, pipeline=pipeline, cursors=cursors,
-                             own_items={"111"})
-    await poller.run_pass()
-    assert cursors.rows["c1"].cold_start_skipped is True
-
-    client._chats = [_chat("c1", "111", NOW_TS - 30, "buyer")]
-    client._messages = {"c1": [_message("m-new", NOW_TS - 30, author="buyer")]}
-    await poller.run_pass()
-
-    assert pipeline.message_ids == ["m-new"]
+    assert pipeline.message_ids == ["m1"]
 
 
 # --------------------------------------------------------------------------
