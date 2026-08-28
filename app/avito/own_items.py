@@ -26,6 +26,17 @@
 Снимок обновляется раз в час и ПЕРЕЖИВАЕТ СБОЙ ОБНОВЛЕНИЯ: у GET /core/v1/items
 лимит 25 запросов в минуту, и разовая неудача не должна оборачиваться
 проходом, который либо молчит целиком, либо (что хуже) пропускает всех.
+
+СНИМОК ХРАНИТ ЦЕЛЫЕ Listing, А НЕ ТОЛЬКО id — ЖИВОЙ БАГ, НАЙДЕННЫЙ ПРОГОНОМ
+ПРОТИВ ПРОДА. `ItemScopeResolver` (app/channels/item_scope.py) сначала
+запрашивает у `OwnItemIds` набор id (дёшево — снимок и так в памяти), а на
+следующем шаге, для объявления, которого ещё нет в `item_scope`, шёл за
+заголовком ОТДЕЛЬНЫМ, НЕКЕШИРОВАННЫМ вызовом `list_all_items` — то есть
+классификация десятка своих объявлений подряд била по одному и тому же
+эндпоинту десяток раз за секунды и упиралась в лимит 25 запросов/минуту
+(`429 Too Many Requests`, воспроизведено 2026-08-28 живым прогоном против
+аккаунта заказчика). `get_listing` ниже отдаёт Listing из ТОГО ЖЕ снимка,
+которым уже пользуется `__call__` — второго запроса не возникает вовсе.
 """
 
 from __future__ import annotations
@@ -38,7 +49,7 @@ logger = logging.getLogger("parmangal.poller.items")
 
 
 class OwnItemIds:
-    """Кеш идентификаторов объявлений аккаунта с мягкой деградацией."""
+    """Кеш объявлений аккаунта (id и целиком) с мягкой деградацией."""
 
     def __init__(
         self,
@@ -49,11 +60,12 @@ class OwnItemIds:
         self._client = items_client
         self._settings = settings
         self._monotonic = monotonic
-        self._snapshot: Optional[set[str]] = None
+        self._snapshot: Optional[dict[str, Any]] = None  # item_id -> Listing
         self._loaded_at: float = 0.0
 
-    async def __call__(self) -> set[str]:
-        """Актуальный набор. Бросает только если снимка нет ВООБЩЕ.
+    async def _refresh(self) -> dict[str, Any]:
+        """Актуальный снимок item_id -> Listing. Бросает только если снимка
+        нет ВООБЩЕ.
 
         Исключение здесь означает «проверить принадлежность нечем», и поллер
         обязан свернуть проход, а не пропустить всех. Пока есть хоть какой-то
@@ -85,10 +97,22 @@ class OwnItemIds:
 
         # str() на границе: в API Авито item_id — число, у нас везде строка,
         # и сравнение строки с числом молча не совпадает никогда.
-        self._snapshot = {str(listing.item_id) for listing in listings}
+        self._snapshot = {str(listing.item_id): listing for listing in listings}
         self._loaded_at = self._monotonic()
         logger.info(
             "poller: объявлений аккаунта в гуарде: %d (статусы: %s)",
             len(self._snapshot), self._settings.poller_items_statuses,
         )
         return self._snapshot
+
+    async def __call__(self) -> set[str]:
+        """Актуальный набор id — тот же снимок, что и у `get_listing`."""
+        return set((await self._refresh()).keys())
+
+    async def get_listing(self, item_id: str) -> Optional[Any]:
+        """Listing (item_id, title, ...) объявления АККАУНТА из того же
+        часового снимка — или None, если объявление не наше (или его ещё
+        не видел снимок). НЕ делает отдельного запроса к Авито сверх того,
+        что и так нужен `__call__` — см. докстринг класса."""
+        snapshot = await self._refresh()
+        return snapshot.get(str(item_id))

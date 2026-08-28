@@ -364,6 +364,58 @@ async def test_own_items_survives_a_failed_refresh():
     assert await provider() == {"111"}, "устаревший снимок лучше отсутствия"
 
 
+async def test_get_listing_reuses_the_same_snapshot_as_call():
+    """Живой баг (2026-08-28): ItemScopeResolver раньше делал ОТДЕЛЬНЫЙ
+    некешированный list_all_items на каждый неизвестный item_id — классификация
+    десятка своих объявлений подряд била по /core/v1/items десяток раз за
+    секунды и упиралась в лимит 25/минуту (429 Too Many Requests). get_listing
+    обязан отдавать карточку из ТОГО ЖЕ снимка, не делая второго запроса."""
+    class Counting:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_all_items(self, status="active"):
+            self.calls += 1
+            return [
+                type("L", (), {"item_id": "111", "title": "Баня «Гараж»"})(),
+                type("L", (), {"item_id": "222", "title": "Сауна с бассейном"})(),
+            ]
+
+    client = Counting()
+    provider = OwnItemIds(client, _settings())
+
+    assert await provider() == {"111", "222"}
+    listing_111 = await provider.get_listing("111")
+    listing_222 = await provider.get_listing("222")
+    listing_missing = await provider.get_listing("999")
+
+    assert listing_111.title == "Баня «Гараж»"
+    assert listing_222.title == "Сауна с бассейном"
+    assert listing_missing is None
+    assert client.calls == 1, "get_listing не должен делать отдельный запрос"
+
+
+async def test_get_listing_refreshes_when_the_snapshot_is_stale():
+    class Counting:
+        def __init__(self):
+            self.calls = 0
+
+        async def list_all_items(self, status="active"):
+            self.calls += 1
+            return [type("L", (), {"item_id": "111", "title": f"v{self.calls}"})()]
+
+    clock = {"t": 0.0}
+    client = Counting()
+    provider = OwnItemIds(client, _settings(), monotonic=lambda: clock["t"])
+
+    first = await provider.get_listing("111")
+    assert first.title == "v1"
+    clock["t"] = 10_000.0
+    second = await provider.get_listing("111")
+    assert second.title == "v2"
+    assert client.calls == 2
+
+
 # --------------------------------------------------------------------------
 # Дедуп между каналами — главное, ради чего дедуп переехал в конвейер
 # --------------------------------------------------------------------------

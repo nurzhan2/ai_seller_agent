@@ -445,11 +445,7 @@ async def lifespan(app: FastAPI):
     # аккаунта вместо одного.
     from app.avito.own_items import OwnItemIds
     from app.channels.avito_items import AvitoItemsClient
-    from app.channels.item_scope import (
-        ItemScopeResolver,
-        SqlAlchemyItemScopeStore,
-        make_item_card_fetcher,
-    )
+    from app.channels.item_scope import ItemScopeResolver, SqlAlchemyItemScopeStore
 
     avito_items_client = AvitoItemsClient(settings=settings)
     own_item_ids = OwnItemIds(avito_items_client, settings)
@@ -458,7 +454,10 @@ async def lifespan(app: FastAPI):
         item_scope_store,
         settings,
         own_items_provider=own_item_ids,
-        fetch_item=make_item_card_fetcher(avito_items_client, settings.poller_items_statuses),
+        # get_listing — тот же часовой снимок, что и own_items_provider
+        # выше, без отдельного запроса на каждый неизвестный item_id (см.
+        # докстринг OwnItemIds — живой баг 429 Too Many Requests).
+        fetch_item=own_item_ids.get_listing,
     )
     app.state.item_scope_resolver = item_scope_resolver
     item_scope_task = asyncio.create_task(

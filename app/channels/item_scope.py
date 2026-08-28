@@ -218,25 +218,15 @@ class _HasItemIdAndTitle(Protocol):
 OwnItemIdsProvider = Callable[[], Awaitable[Any]]
 ItemCardFetcher = Callable[[str], Awaitable[Optional[_HasItemIdAndTitle]]]
 
-
-def make_item_card_fetcher(items_client: Any, statuses: str) -> ItemCardFetcher:
-    """Синхронная (в смысле — здесь и сейчас, а не по расписанию) догрузка
-    карточки ОДНОГО объявления для `ItemScopeResolver` — по количеству
-    объявлений в аккаунте это тот же полный список, что тянет часовая
-    задача, просто вне расписания, для item_id, которого таблица ещё не
-    видела. НЕ кешируется здесь: кеш живёт в самой таблице item_scope после
-    первой успешной классификации — см. докстринг модуля.
-    """
-
-    async def fetch(item_id: str) -> Optional[_HasItemIdAndTitle]:
-        item_id = str(item_id)
-        listings = await items_client.list_all_items(status=statuses)
-        for listing in listings:
-            if str(listing.item_id) == item_id:
-                return listing
-        return None
-
-    return fetch
+# ФУНКЦИИ ДОГРУЗКИ ОДНОЙ КАРТОЧКИ ЗДЕСЬ НЕТ НАМЕРЕННО. Раньше здесь был
+# `make_item_card_fetcher`, делавший СОБСТВЕННЫЙ некешированный
+# `list_all_items` на каждый неизвестный item_id — живой прогон против
+# аккаунта заказчика (2026-08-28) показал, что классификация десятка своих
+# объявлений подряд превращается в десяток запросов к /core/v1/items за
+# секунды и упирается в лимит 25/минуту (429 Too Many Requests). Правильный
+# источник `fetch_item` — `OwnItemIds.get_listing` (app/avito/own_items.py):
+# тот же часовой снимок, которым и так пользуется `own_items_provider`, без
+# единого лишнего запроса. См. его докстринг за подробностями находки.
 
 
 class ItemScopeResolver:

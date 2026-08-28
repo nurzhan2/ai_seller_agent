@@ -270,16 +270,19 @@ def _build_scope_resolver(settings: Any):
     за объявлениями."""
     from app.avito.own_items import OwnItemIds
     from app.channels.avito_items import AvitoItemsClient
-    from app.channels.item_scope import ItemScopeResolver, make_item_card_fetcher
-    from app.channels.item_scope import SqlAlchemyItemScopeStore
+    from app.channels.item_scope import ItemScopeResolver, SqlAlchemyItemScopeStore
     from app.db.session import get_sessionmaker
 
     items_client = AvitoItemsClient(settings=settings)
+    own_item_ids = OwnItemIds(items_client, settings)
     return ItemScopeResolver(
         SqlAlchemyItemScopeStore(get_sessionmaker()),
         settings,
-        own_items_provider=OwnItemIds(items_client, settings),
-        fetch_item=make_item_card_fetcher(items_client, settings.poller_items_statuses),
+        own_items_provider=own_item_ids,
+        # get_listing — тот же снимок, что и own_items_provider, без
+        # отдельного запроса на каждый неизвестный item_id (см. докстринг
+        # OwnItemIds — живой баг 429 Too Many Requests).
+        fetch_item=own_item_ids.get_listing,
     )
 
 
