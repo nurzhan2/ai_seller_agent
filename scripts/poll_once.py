@@ -22,9 +22,14 @@
      пагинация в минутный интервал; от второго — можно ли обрывать проход
      на первой странице без новых сообщений.
 
-  3. ЧТО СЛУЧИТСЯ НА ХОЛОДНОМ СТАРТЕ. Колонка «решение» показывает, кого
-     поллер обработал бы, а кого пометил бы seen молча, — до того, как он
-     это сделает по-настоящему.
+  3. КОГО ПОЛЛЕР ВООБЩЕ ПРОЧИТАЕТ. Колонка «решение» показывает гуард «своё
+     ли объявление» и фильтр объявлений — единственное, что поллер решает
+     сам ДО конвейера. Отвечать ли на прочитанное, эта колонка больше НЕ
+     предсказывает: с 2026-08-28 это решает AGENT_MIN_INBOUND_TS в
+     конвейере (app/pipeline.py), одинаково для поллера и вебхука, и у него
+     нет отдельного dry-run режима — раньше эта колонка обещала предсказать
+     решение поллера и один раз в этом ошиблась (65 сообщений в старые
+     чаты, см. app/config.py:agent_min_inbound_ts).
 
 ТЕКСТ СООБЩЕНИЙ НЕ ПЕЧАТАЕТСЯ НИГДЕ, ни в одном режиме — только длина и
 структурные поля. Это переписка живых людей, а вывод пробника уходит в
@@ -221,22 +226,19 @@ async def _fetch_all_chats(
     return chats[:max_chats], requests, complete
 
 
-def _decision(
-    chat: dict, our_id: str, now: int, backfill_hours: int, settings: Any
-) -> tuple[str, str]:
-    """(решение, причина) для чата БЕЗ курсора — то есть на холодном старте.
+def _decision(chat: dict, our_id: str, settings: Any) -> tuple[str, str]:
+    """(решение, причина) — что поллер СДЕЛАЕТ С ЧТЕНИЕМ этого чата.
 
-    Ровно то правило, которое будет в поллере: автоответ только там, где
-    последнее сообщение входящее И свежее окна. Всё остальное помечается
-    seen без единого исходящего.
-
-    ФИЛЬТР ОБЪЯВЛЕНИЙ УЧИТЫВАЕТСЯ ЗДЕСЬ — через ту же `is_listing_allowed`,
-    что стоит на входе конвейера и на границе отправки. Без него колонка
-    решения ЗАВЫШАЕТ работу поллера: в первом же прогоне 7 из 13 «свежих»
-    чатов оказались по квартире-студии, то есть по объявлению из жёсткого
-    запрета, и конвейер отбросил бы их, не заведя даже строки в базе.
-    Пробник, который этого не показывает, врёт в самую важную сторону —
-    в сторону «агент сейчас всем напишет».
+    ЭТО БОЛЬШЕ НЕ ПРЕДСКАЗАНИЕ «ОТВЕТИТ ЛИ АГЕНТ». До инцидента 2026-08-28
+    поллер сам решал, отвечать ли (окно бэкофилла), и колонка «решение»
+    была честной попыткой предсказать это заранее. Тот механизм убран —
+    курсор поллера отвечает только за «что читать» (см. app/avito/poller.py),
+    а «отвечать ли» решает AGENT_MIN_INBOUND_TS в конвейере, у которого нет
+    отдельного dry-run режима для предсказания заранее. Здесь остаётся
+    только то, что поллер РЕАЛЬНО решает сам: гуард «своё ли объявление» и
+    фильтр объявлений (та же `is_listing_allowed`, что на входе конвейера и
+    на границе отправки) — оба всё ещё останавливают чат ДО того, как он
+    вообще попадёт в конвейер.
     """
     last = _last_message(chat)
     if not last:
@@ -246,22 +248,10 @@ def _decision(
     if created is None:
         return "пропуск", "no_created"
 
-    # Фильтр — раньше проверки возраста: запрещённое объявление не станет
-    # разрешённым оттого, что сообщение свежее.
     if not is_listing_allowed(extract_item_id_from_chat(chat), settings):
         return "пропуск", "объявление под запретом"
 
-    author = _author_of(last)
-    if author is not None and our_id and author == our_id:
-        return "пропуск", "outgoing_last"
-
-    if backfill_hours <= 0:
-        return "пропуск", "backfill=0"
-
-    if now - created > backfill_hours * 3600:
-        return "пропуск", "old"
-
-    return "ОБРАБОТАТЬ", "свежее входящее"
+    return "ПРОЧИТАЕТ", "AGENT_MIN_INBOUND_TS решит в конвейере, отвечать ли"
 
 
 async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
@@ -281,7 +271,8 @@ async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
     elif len(chats) >= args.max_chats:
         print(f"ВНИМАНИЕ: упёрлись в --max-chats={args.max_chats}, "
               "в аккаунте чатов больше.")
-    print(f"Окно холодного старта: POLLER_BACKFILL_HOURS={args.backfill_hours}")
+    print("Отвечать ли на холодном старте решает AGENT_MIN_INBOUND_TS в "
+          f"конвейере (сейчас = {settings.agent_min_inbound_ts}), не этот скрипт.")
     print()
 
     # Отсортирован ли список по убыванию времени последнего сообщения. От
@@ -342,7 +333,7 @@ async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
             item_cell += " !!НЕ СТРОКА"
 
         direction = "мы" if (author and our_id and author == our_id) else "клиент"
-        decision, reason = _decision(chat, our_id, now, args.backfill_hours, settings)
+        decision, reason = _decision(chat, our_id, settings)
         counts[decision] = counts.get(decision, 0) + 1
         reasons[reason] = reasons.get(reason, 0) + 1
         if normalized == "0":
@@ -356,8 +347,8 @@ async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
               f"{reason} / {_chat_title(chat)[:40]}")
 
     print()
-    print(f"ИТОГО на холодном старте: обработать {counts.get('ОБРАБОТАТЬ', 0)}, "
-          f"пропустить {counts.get('пропуск', 0)}")
+    print(f"ИТОГО: поллер прочитает {counts.get('ПРОЧИТАЕТ', 0)}, "
+          f"пропустит {counts.get('пропуск', 0)}")
     for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
         print(f"  {reason}: {count}")
     if zero_items:
@@ -565,8 +556,6 @@ async def main() -> int:
     parser.add_argument("--ids-file", metavar="PATH",
                         help="взять вебхучные message_id из файла, а не из БД "
                              "(у Postgres на Railway нет публичного адреса)")
-    parser.add_argument("--backfill-hours", type=int, default=0,
-                        help="окно холодного старта для колонки «решение» (по умолчанию 0)")
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--max-chats", type=int, default=1000)
     args = parser.parse_args()
