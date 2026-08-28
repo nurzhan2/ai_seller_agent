@@ -227,6 +227,74 @@ async def test_resume_restores(service):
     assert allowed is True
 
 
+# --------------------------------------------------------------------------
+# Аварийный рубильник (/stop, /resume) — persisted в Redis, читает
+# OutboundGate на каждой отправке (см. app/channels/kill_switch.py).
+# --------------------------------------------------------------------------
+
+class _FakeRedis:
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, **kwargs):
+        self.store[key] = value
+        return True
+
+    async def delete(self, key):
+        self.store.pop(key, None)
+
+
+@pytest.fixture
+def service_with_redis(settings, sent):
+    async def send(chat_id, text):
+        sent.append((chat_id, text))
+
+    return OpsService(
+        store=InMemoryOpsStore(), settings=settings, send_to_avito=send, redis=_FakeRedis(),
+    )
+
+
+async def test_stop_sets_the_kill_switch(service_with_redis):
+    from app.channels import kill_switch
+
+    message = await service_with_redis.stop_sending(ALLOWED_USER, reason="проверка")
+    assert "ОСТАНОВЛЕНА" in message
+    assert await kill_switch.is_stopped(service_with_redis.redis) is True
+
+
+async def test_resume_clears_the_kill_switch(service_with_redis):
+    from app.channels import kill_switch
+
+    await service_with_redis.stop_sending(ALLOWED_USER)
+    message = await service_with_redis.resume_all(ALLOWED_USER)
+
+    assert await kill_switch.is_stopped(service_with_redis.redis) is False
+    assert "рубильник снят" in message.lower()
+
+
+async def test_resume_without_a_prior_stop_does_not_mention_the_kill_switch(service_with_redis):
+    message = await service_with_redis.resume_all(ALLOWED_USER)
+    assert "рубильник" not in message.lower()
+
+
+async def test_stop_without_redis_fails_loudly_not_silently(service):
+    """`service` (фикстура без redis) — как боевой процесс без REDIS_URL:
+    команда должна честно сказать, что рубильнику негде храниться, а не
+    сделать вид, что отправка остановлена."""
+    message = await service.stop_sending(ALLOWED_USER)
+    assert "не удалось" in message.lower()
+
+
+async def test_stop_is_logged_with_reason(service_with_redis):
+    await service_with_redis.stop_sending(ALLOWED_USER, reason="подозрение на утечку")
+    last = service_with_redis.store.actions[-1]  # type: ignore[attr-defined]
+    assert last["action"] == "stop_sending"
+    assert last["payload"]["reason"] == "подозрение на утечку"
+
+
 async def test_reply_limit_hands_chat_to_operator(service, settings):
     flags = ChatFlags(agent_reply_count=settings.max_agent_replies_per_chat)
     await service.store.set_flags("c1", flags)
@@ -392,11 +460,15 @@ def test_callback_parsing():
 # --------------------------------------------------------------------------
 # Белый список объявлений на пути «одобрено оператором»
 #
-# ВАЖНО ПРО ПРОД: `send_to_avito` у OpsService сегодня НЕ подключён в
-# app/main.py (см. там же), то есть одобрение в Telegram фактически не
-# доставляет ответ клиенту — утечь по этому пути пока нечему. Тесты ниже
-# закрывают его на будущее: когда доставку включат, она обязана идти через
-# OutboundGate, а не мимо него.
+# `send_to_avito` у OpsService теперь подключён в app/main.py
+# (`ops_service.send_to_avito = outbound.send_message`, сразу после сборки
+# гейта) — до этой правки был подключён к `None`, /approve отвечал
+# оператору «Отправлено клиенту», а сообщение не уходило вообще ни через
+# гейт, ни мимо него (см. tests/test_main.py:
+# test_lifespan_wires_operator_approval_through_the_outbound_gate). Тесты
+# ниже проверяют логику OpsService в изоляции — что ОНА сама уважает то,
+# что ей передали как send_to_avito, — поэтому собирают гейт руками, а не
+# через lifespan.
 # --------------------------------------------------------------------------
 
 async def test_approved_reply_to_a_blocked_chat_is_not_delivered():

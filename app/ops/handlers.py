@@ -104,6 +104,15 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
             return
         await message.answer(await service.resume_all(message.from_user.id))
 
+    @dp.message(Command("stop"))
+    async def on_stop(message: Message) -> None:
+        """Аварийный рубильник всей отправки — см. OpsService.stop_sending."""
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        reason = parts[1].strip() if len(parts) > 1 else ""
+        await message.answer(await service.stop_sending(message.from_user.id, reason))
+
     @dp.message(Command("dryrun"))
     async def on_dryrun(message: Message) -> None:
         if not await _guard(message, message.from_user.id):
@@ -285,7 +294,8 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("moderation", "Режим модерации"),
     ("dryrun", "DRY_RUN вкл/выкл"),
     ("pause", "Поставить агента на паузу"),
-    ("resume", "Снять агента с паузы"),
+    ("stop", "Аварийный рубильник: остановить ВСЮ отправку"),
+    ("resume", "Снять паузу и/или аварийный рубильник"),
     ("provider", "LLM-провайдер"),
     ("chat", "Статус чата по id"),
     ("reset", "Сбросить счётчик ответов в чате"),

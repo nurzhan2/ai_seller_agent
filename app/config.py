@@ -268,6 +268,17 @@ class Settings(BaseSettings):
     debounce_window_seconds: float = 10.0
     daily_cost_limit_rub: Decimal = Decimal("3000")
 
+    # Суточный лимит СООБЩЕНИЙ (не путать с daily_cost_limit_rub — тот в
+    # рублях и нигде пока не проверяется). 0 = лимита нет. Считается и
+    # срабатывает в app/channels/outbound_gate.py — единственной точке,
+    # через которую проходят все четыре пути отправки, — а не в конвейере,
+    # чтобы отложенные касания и ответы оператора не обходили его молча
+    # (тот же класс бага, что уже был у белого списка объявлений). Счётчик
+    # живёт в Redis и сбрасывается в полночь по Москве; при достижении в
+    # Telegram уходит алерт с числом отправленных и временем — см.
+    # app/channels/daily_limit.py и app/ops/notifications.py.
+    outbound_daily_limit: int = 0
+
     # Ships ON. Turning it off means the agent writes to real clients, so it
     # must be a deliberate, explicit act — never a default.
     dry_run: bool = True

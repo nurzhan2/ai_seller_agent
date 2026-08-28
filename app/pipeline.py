@@ -176,11 +176,17 @@ class MessagePipeline:
         debounce_window_seconds: Optional[float] = None,
         delay_fn: Optional[Callable[[], Awaitable[None]]] = None,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        item_scope_resolver: Any = None,
     ):
         self.store = store
         self.agent_loop = agent_loop
         self.ops_service = ops_service
         self.settings = settings
+        # app/channels/item_scope.py:ItemScopeResolver — та же классификация
+        # по заголовку, что и на границе отправки (OutboundGate). None —
+        # обратная совместимость со старым AVITO_BLOCKED_ITEMS, см.
+        # is_listing_allowed в app/channels/outbound_gate.py.
+        self.item_scope_resolver = item_scope_resolver
         # Явный параметр, а не chтение agent_loop.kb: конвейеру нужен только
         # max_concessions_per_day для уведомления об исчерпанном лимите
         # (_notify_daily_limit_exhausted), и завязываться на внутреннее
@@ -328,7 +334,7 @@ class MessagePipeline:
             return
 
         item_id = await self._resolve_item_id(payload, chat_id)
-        if not self._listing_is_allowed(item_id, chat_id):
+        if not await self._listing_is_allowed(item_id, chat_id):
             # Ничего не сохраняем и не создаём: диалога по чужому объявлению
             # у нас быть не должно вообще — ни в базе, ни в карточках
             # оператора. Возврат ДО get_or_create_chat именно поэтому.
@@ -482,7 +488,7 @@ class MessagePipeline:
         )
         return recovered
 
-    def _listing_is_allowed(self, item_id: Optional[str], chat_id: str) -> bool:
+    async def _listing_is_allowed(self, item_id: Optional[str], chat_id: str) -> bool:
         """То же правило, что и на границе отправки — буквально та же
         функция (`is_listing_allowed`), а не её копия.
 
@@ -491,7 +497,9 @@ class MessagePipeline:
         — ни строки в базе, ни карточки оператору. Гарантию «клиент не
         получит сообщение» даёт гейт; эта проверка экономит мусор.
         """
-        if is_listing_allowed(item_id, self.settings):
+        if await is_listing_allowed(
+            item_id, self.settings, scope_resolver=self.item_scope_resolver
+        ):
             return True
 
         logger.info(

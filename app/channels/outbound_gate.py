@@ -22,6 +22,12 @@
 (те же имена методов), поэтому вызывающий код не знает о его
 существовании и не может его обойти по невнимательности — ему просто
 передают гейт вместо клиента.
+
+По той же причине здесь же, а не в конвейере, живут аварийный рубильник
+(app/channels/kill_switch.py, команды /stop и /resume в Telegram-боте) и
+суточный лимит исходящих (app/channels/daily_limit.py) — оба должны
+работать одинаково для всех четырёх выходов, а не только для того, где их
+догадались проверить первым.
 """
 
 from __future__ import annotations
@@ -29,22 +35,34 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
+from app.channels.daily_limit import DailyLimitResult
+
 logger = logging.getLogger("parmangal.outbound")
 
 # chat_id -> item_id объявления (или None, если чат не по объявлению).
 ItemIdLookup = Callable[[str], Awaitable[Optional[str]]]
 # chat_id -> стоит ли на чате ручной hold (app/db/models.py:Chat.manual_hold).
 ManualHoldLookup = Callable[[str], Awaitable[bool]]
+# () -> стоит ли глобальный аварийный рубильник (app/channels/kill_switch.py).
+KillSwitchLookup = Callable[[], Awaitable[bool]]
+# () -> результат проверки суточного лимита (app/channels/daily_limit.py).
+DailyLimitCheck = Callable[[], Awaitable[DailyLimitResult]]
+# результат -> уведомление в Telegram: либо лимит только что исчерпан
+# (just_exceeded), либо не удалось его проверить (redis_unavailable) —
+# разбирать, какой из двух случаев, дело колбэка, а не гейта.
+DailyLimitAlert = Callable[[DailyLimitResult], Awaitable[None]]
 
 
-def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
+async def is_listing_allowed(
+    item_id: Optional[str], settings: Any, *, scope_resolver: Any = None
+) -> bool:
     """Единственное определение правила «по этому объявлению можно писать».
 
-    Одна функция на оба места, где правило применяется: на входе в конвейер
-    (чтобы не заводить диалог по чужому объявлению) и на границе отправки
-    (`OutboundGate`, чтобы ни один путь не написал клиенту мимо проверки).
-    Раньше это была скопированная логика в двух местах — так и разъезжаются
-    инварианты.
+    Одна функция на все места, где правило применяется: на входе в конвейер
+    (чтобы не заводить диалог по чужому объявлению), на границе отправки
+    (`OutboundGate`, чтобы ни один путь не написал клиенту мимо проверки) и
+    в диагностике (/admin/dialogs, scripts/poll_once.py). Раньше это была
+    скопированная логика в нескольких местах — так и разъезжаются инварианты.
 
     Порядок разбора:
 
@@ -55,9 +73,15 @@ def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
     2. Задан белый список `AVITO_ALLOWED_ITEMS` — он В ПРИОРИТЕТЕ и работает
        как раньше: разрешено только перечисленное. Оставлен ради стендов,
        где он уже выставлен, и как аварийный режим «пускать только вот эти».
-    3. Иначе — чёрный список `AVITO_BLOCKED_ITEMS`: запрещено только
-       перечисленное, всё остальное (включая новые объявления комплекса)
-       работает сразу.
+    3. Иначе — `scope_resolver` (см. `app/channels/item_scope.py`):
+       классификация по заголовку с жёстким deny поверх нее (пять зашитых
+       id, item_id == "0", объявления не нашего аккаунта). Резолвер async,
+       поэтому и эта функция асинхронная — единственная точка фильтрации не
+       может остаться синхронной, если решение иногда требует догрузить
+       карточку объявления.
+    4. `scope_resolver` не передан (юнит-тесты, стенды без БД/Авито) —
+       ОБРАТНАЯ СОВМЕСТИМОСТЬ со старым чёрным списком `AVITO_BLOCKED_ITEMS`:
+       запрещено только перечисленное, без классификации по заголовку.
     """
     if item_id is None:
         return bool(getattr(settings, "avito_allow_chats_without_item", True))
@@ -74,20 +98,34 @@ def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
     if allowed:
         return item_id in allowed
 
-    blocked = [str(i) for i in (getattr(settings, "avito_blocked_items", None) or [])]
-    return item_id not in blocked
+    if scope_resolver is None:
+        blocked = [str(i) for i in (getattr(settings, "avito_blocked_items", None) or [])]
+        return item_id not in blocked
+
+    row = await scope_resolver.resolve(item_id)
+    return row.decision == "allow"
 
 
-class ListingNotAllowed(RuntimeError):
-    """Попытка написать в чат по объявлению вне белого списка.
+class OutboundBlocked(RuntimeError):
+    """Общий предок всех отказов гейта.
 
-    Исключение, а не тихий `{"blocked": True}` в ответе, СОЗНАТЕЛЬНО.
-    Вызывающий код (app/pipeline.py:_deliver) после успешной отправки
-    пишет `SendStatus.sent` — то есть на молчаливый отказ он записал бы в
-    базу «отправлено» для сообщения, которого клиент никогда не получал, и
+    Исключение, а не тихий `{"blocked": True}` в ответе, СОЗНАТЕЛЬНО — как
+    и у каждого из его наследников ниже. Вызывающий код (например,
+    app/pipeline.py:_deliver) после успешной отправки пишет
+    `SendStatus.sent` — то есть на молчаливый отказ он записал бы в базу
+    «отправлено» для сообщения, которого клиент никогда не получал, и
     заметить это стало бы нечем. Исключение попадает в уже существующие
-    `except` вокруг отправки: сообщение честно помечается недоставленным,
-    а в логе видно, почему.
+    `except` вокруг отправки: сообщение честно помечается недоставленным, а
+    в логе (и, для рубильника и суточного лимита, в Telegram) видно, почему.
+
+    Общий базовый класс — чтобы вызывающему коду, которому не важна причина
+    отказа, было достаточно одного `except OutboundBlocked`, а не
+    перечисления всех подклассов.
+    """
+
+
+class ListingNotAllowed(OutboundBlocked):
+    """Попытка написать в чат по объявлению вне белого списка.
 
     Штатные пути (конвейер на входе, воркер касаний через `can_send`)
     отсекают такие чаты РАНЬШЕ, поэтому сюда долетает только то, что
@@ -95,6 +133,33 @@ class ListingNotAllowed(RuntimeError):
     шумной, а не тихой.
     """
 
+
+class SendingHalted(OutboundBlocked):
+    """Глобальный аварийный рубильник (app/channels/kill_switch.py) активен.
+
+    В отличие от `ListingNotAllowed`, это решение ВРЕМЕННОЕ и относится не
+    к конкретному чату, а ко всей отправке сразу — снимается командой
+    /resume в Telegram-боте оператора.
+    """
+
+
+class DailyLimitExceeded(OutboundBlocked):
+    """Суточный лимит исходящих (app/channels/daily_limit.py) исчерпан.
+
+    Снимается сам в полночь по Москве — вмешательство оператора не
+    требуется, только уведомление в Telegram, отправленное ровно один раз
+    в момент, когда лимит был исчерпан.
+    """
+
+
+class DailyLimitUnavailable(OutboundBlocked):
+    """Не удалось проверить суточный лимит — Redis настроен, но упал.
+
+    Fail closed, тем же принципом, что и `SendingHalted`: предохранитель
+    существует ровно на случай, когда что-то уже пошло не так, и должен
+    сработать и тогда, когда инфраструктура, которой он посчитан, тоже
+    отказала — см. докстринг app/channels/daily_limit.py.
+    """
 
 
 class OutboundGate:
@@ -106,17 +171,36 @@ class OutboundGate:
         settings: Any,
         item_id_lookup: Optional[ItemIdLookup] = None,
         manual_hold_lookup: Optional[ManualHoldLookup] = None,
+        kill_switch_lookup: Optional[KillSwitchLookup] = None,
+        daily_limit_check: Optional[DailyLimitCheck] = None,
+        daily_limit_alert: Optional[DailyLimitAlert] = None,
+        item_scope_resolver: Any = None,
     ):
         self._client = client
         self._settings = settings
         self._item_id_lookup = item_id_lookup
         self._manual_hold_lookup = manual_hold_lookup
+        self._kill_switch_lookup = kill_switch_lookup
+        self._daily_limit_check = daily_limit_check
+        self._daily_limit_alert = daily_limit_alert
+        # app/channels/item_scope.py:ItemScopeResolver — классификация по
+        # заголовку вместо зашитого в код списка. None — старое поведение
+        # чистого AVITO_BLOCKED_ITEMS (см. is_listing_allowed).
+        self._item_scope_resolver = item_scope_resolver
 
     # -- решение -----------------------------------------------------------
 
     def _filter_is_off(self) -> bool:
-        """Ни чёрного списка, ни белого, и чаты без объявления разрешены —
-        фильтровать нечего, и ходить в базу за item_id незачем."""
+        """Ни чёрного списка, ни белого, ни резолвера item_scope, и чаты без
+        объявления разрешены — фильтровать нечего, и ходить в базу за
+        item_id незачем.
+
+        С собранным `item_scope_resolver` этот короткий путь ВСЕГДА False:
+        резолвер обязан отработать хотя бы жёсткий deny (item_id == "0",
+        объявление не нашего аккаунта) даже когда AVITO_BLOCKED_ITEMS пуст.
+        """
+        if self._item_scope_resolver is not None:
+            return False
         return (
             not (getattr(self._settings, "avito_allowed_items", None) or [])
             and not (getattr(self._settings, "avito_blocked_items", None) or [])
@@ -171,7 +255,9 @@ class OutboundGate:
             )
             return False
 
-        if is_listing_allowed(item_id, self._settings):
+        if await is_listing_allowed(
+            item_id, self._settings, scope_resolver=self._item_scope_resolver
+        ):
             return True
 
         logger.info(
@@ -184,10 +270,72 @@ class OutboundGate:
     # -- отправка ----------------------------------------------------------
 
     async def _require_allowed(self, chat_id: str) -> None:
+        """Полная проверка перед РЕАЛЬНОЙ отправкой — в отличие от
+        `is_allowed`, включает и рубильник, и суточный лимит.
+
+        Оба НАМЕРЕННО не внутри `is_allowed`: он же служит `can_send`
+        воркеру отложенных касаний (app/ops/touch_scheduler.py), и `False`
+        там ГАСИТ ТАЙМЕР НАВСЕГДА — решение, уместное для постоянного
+        «чат вне белого списка объявлений», но не для временного рубильника
+        или суточного лимита, которые снимаются сами (рубильник — командой
+        /resume, лимит — в полночь по Москве). Поставь их в `is_allowed`, и
+        один инцидент навсегда стёр бы все напоминания, которые оказались
+        due в эти минуты — тот же класс бага, ради которого сам `can_send`
+        и появился (см. докстринг модуля).
+
+        Порядок проверок важен: рубильник и белый список должны сработать
+        РАНЬШЕ инкремента суточного счётчика — иначе сообщение, которое и
+        так не ушло бы, всё равно съело бы место в лимите.
+        """
+        if self._kill_switch_lookup is not None:
+            try:
+                stopped = await self._kill_switch_lookup()
+            except Exception:
+                logger.exception(
+                    "outbound: не удалось проверить kill switch — отправка заблокирована",
+                    extra={"chat_id": chat_id},
+                )
+                stopped = True
+            if stopped:
+                logger.info(
+                    "outbound: заблокировано — аварийный рубильник активен",
+                    extra={"chat_id": chat_id},
+                )
+                raise SendingHalted(
+                    "отправка остановлена аварийным рубильником — /resume в Telegram-боте"
+                )
+
         if not await self.is_allowed(chat_id):
             raise ListingNotAllowed(
                 f"чат {chat_id} не проходит белый список объявлений — отправка отменена"
             )
+
+        if self._daily_limit_check is not None:
+            result = await self._daily_limit_check()
+            if (result.just_exceeded or result.redis_unavailable) and self._daily_limit_alert is not None:
+                try:
+                    await self._daily_limit_alert(result)
+                except Exception:
+                    logger.exception(
+                        "outbound: не удалось отправить алерт о суточном лимите"
+                    )
+            if result.redis_unavailable:
+                logger.error(
+                    "outbound: заблокировано — суточный лимит не проверяется, Redis недоступен",
+                    extra={"chat_id": chat_id},
+                )
+                raise DailyLimitUnavailable(
+                    "суточный лимит исходящих недоступен для проверки — Redis не отвечает"
+                )
+            if not result.allowed:
+                logger.warning(
+                    "outbound: заблокировано — суточный лимит исчерпан (%d/%d)",
+                    result.count, result.limit,
+                    extra={"chat_id": chat_id},
+                )
+                raise DailyLimitExceeded(
+                    f"суточный лимит исходящих ({result.limit}) исчерпан"
+                )
 
     async def send_message(self, chat_id: str, text: str) -> dict:
         await self._require_allowed(chat_id)

@@ -262,17 +262,21 @@ def _listing_cell(row: dict) -> str:
     return f"{escape(str(title))} <span class='note'>({escape(str(item_id))})</span>"
 
 
-def _filter_cell(row: dict, settings: Any) -> str:
+async def _filter_cell(row: dict, settings: Any, scope_resolver: Any) -> str:
     """Отвечает ли агент в этом чате ПРЯМО СЕЙЧАС, по текущему фильтру.
 
     Статус считается на лету от актуальных настроек, а не хранится: диалог
-    мог накопить переписку ДО того, как объявление попало в чёрный список,
-    и тогда старые сообщения в нём — не признак того, что фильтр не
-    работает. Колонка отвечает ровно на вопрос «будет ли агент отвечать
-    здесь дальше», а «когда он отвечал» видно по соседней колонке со
-    временем последнего сообщения.
+    мог накопить переписку ДО того, как объявление попало под запрет, и
+    тогда старые сообщения в нём — не признак того, что фильтр не работает.
+    Колонка отвечает ровно на вопрос «будет ли агент отвечать здесь дальше»,
+    а «когда он отвечал» видно по соседней колонке со временем последнего
+    сообщения.
+
+    `is_listing_allowed` — асинхронная (item_scope может догрузить карточку
+    объявления), поэтому и эта функция, и весь цикл в `dialogs()` ниже —
+    тоже async.
     """
-    if is_listing_allowed(row.get("item_id"), settings):
+    if await is_listing_allowed(row.get("item_id"), settings, scope_resolver=scope_resolver):
         return "<span class='yes'>агент отвечает</span>"
     return "<span class='no'>заблокирован фильтром</span>"
 
@@ -283,12 +287,18 @@ async def dialogs(request: Request, _: str = Depends(require_admin)) -> HTMLResp
     if provider is None:
         return _page("Диалоги", "<p class='note'>Источник диалогов не подключён.</p>")
     settings = get_settings()
+    scope_resolver = getattr(request.app.state, "item_scope_resolver", None)
     rows = await provider.list_dialogs()
 
     if settings.avito_allowed_items:
         filter_note = (
             f"Фильтр: БЕЛЫЙ список ({len(settings.avito_allowed_items)} шт.) — "
-            "он в приоритете, чёрный не применяется."
+            "он в приоритете, item_scope не применяется."
+        )
+    elif scope_resolver is not None:
+        filter_note = (
+            "Фильтр: item_scope (классификация по заголовку) + жёсткий "
+            f"блок-лист ({len(settings.avito_blocked_items)} шт.)."
         )
     else:
         blocked = ", ".join(settings.avito_blocked_items) or "пусто"
@@ -308,11 +318,12 @@ async def dialogs(request: Request, _: str = Depends(require_admin)) -> HTMLResp
         # ровно тот инструмент, ради которого её и открыли.
         last = row.get("last_msg_at")
         last_text = last.strftime("%Y-%m-%d %H:%M") if hasattr(last, "strftime") else (str(last) if last else "—")
+        filter_cell = await _filter_cell(row, settings, scope_resolver)
         body.append(
             f"<tr><td>{escape(str(row.get('chat_id')))}</td>"
             f"<td>{_listing_cell(row)}</td>"
             f"<td>{escape(str(row.get('zone_id') or '—'))}</td>"
-            f"<td>{_filter_cell(row, settings)}</td>"
+            f"<td>{filter_cell}</td>"
             f"<td>{mode}</td><td>{row.get('messages', 0)}</td>"
             f"<td>{escape(last_text)}</td></tr>"
         )

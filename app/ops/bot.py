@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional
 
+from app.channels import kill_switch
 from app.config import Settings, get_settings
 from app.ops.state import ChatFlags, InMemoryOpsStore, OpsStore, PendingReply, should_auto_return
 
@@ -31,10 +32,15 @@ class OpsService:
         store: Optional[OpsStore] = None,
         settings: Optional[Settings] = None,
         send_to_avito: Optional[Callable[[str, str], Awaitable[Any]]] = None,
+        redis: Optional[Any] = None,
     ):
         self.store = store or InMemoryOpsStore()
         self.settings = settings or get_settings()
         self.send_to_avito = send_to_avito
+        # Хранилище аварийного рубильника (/stop, /resume) — то же Redis,
+        # что читает OutboundGate на каждой отправке. Без Redis (тесты,
+        # локальный стенд) команды честно откажут — см. kill_switch.stop.
+        self.redis = redis
 
     # -- доступ ------------------------------------------------------------
 
@@ -149,9 +155,42 @@ class OpsService:
         return "⏸ Агент на паузе. Все чаты — на операторе."
 
     async def resume_all(self, user_id: int) -> str:
+        """Возврат к нормальной работе — снимает и /pause, и /stop разом.
+
+        Один общий /resume, а не пара /unpause + /start, чтобы оператору в
+        разгар инцидента не приходилось помнить, каким именно рубильником
+        он останавливал отправку — команда снимает оба безусловно.
+        """
+        was_stopped = await kill_switch.is_stopped(self.redis)
         self.settings.agent_paused = False
-        await self.store.log_action("*", user_id, "resume", {})
+        if was_stopped:
+            await kill_switch.resume(self.redis, user_id)
+        await self.store.log_action("*", user_id, "resume", {"was_stopped": was_stopped})
+        if was_stopped:
+            return "▶️ Агент снова в работе. ✅ Аварийный рубильник снят — отправка разблокирована."
         return "▶️ Агент снова в работе."
+
+    async def stop_sending(self, user_id: int, reason: str = "") -> str:
+        """/stop — аварийный рубильник ВСЕЙ отправки, без редеплоя.
+
+        В отличие от /pause (агент просто перестаёт сочинять новые ответы),
+        это блокирует на границе (`OutboundGate`) уже готовые сообщения по
+        всем четырём путям отправки, включая ответы, одобренные оператором.
+        Персистентно в Redis — переживает рестарт процесса и виден всем
+        процессам сразу, без ожидания редеплоя (см. докстринг
+        app/channels/kill_switch.py).
+        """
+        try:
+            await kill_switch.stop(self.redis, user_id, reason)
+        except RuntimeError as exc:
+            return f"⚠️ Не удалось остановить отправку: {exc}"
+        await self.store.log_action("*", user_id, "stop_sending", {"reason": reason})
+        suffix = f"\nПричина: {reason}" if reason else ""
+        return (
+            "⛔ ОТПРАВКА ОСТАНОВЛЕНА. Ни одно сообщение клиентам не уйдёт ни по "
+            "одному из путей (агент, оператор, отложенные касания), пока не "
+            "введут /resume." + suffix
+        )
 
     async def set_dry_run(self, user_id: int, enabled: bool) -> str:
         self.settings.dry_run = enabled

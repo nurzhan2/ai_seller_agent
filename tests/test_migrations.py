@@ -36,6 +36,7 @@ EXPECTED_TABLES = {
     "chat_cursor",
     "chats",
     "concession_log",
+    "item_scope",
     "item_zone_map",
     "leads",
     "operator_actions",

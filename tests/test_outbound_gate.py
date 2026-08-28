@@ -13,7 +13,14 @@ import inspect
 import pytest
 
 from app.channels.avito import AvitoClient
-from app.channels.outbound_gate import ListingNotAllowed, OutboundGate
+from app.channels.daily_limit import DailyLimitResult
+from app.channels.outbound_gate import (
+    DailyLimitExceeded,
+    DailyLimitUnavailable,
+    ListingNotAllowed,
+    OutboundGate,
+    SendingHalted,
+)
 from app.config import Settings
 
 
@@ -210,6 +217,368 @@ async def test_reading_methods_are_not_gated():
     gate, client = _gate(items="item-1", chats={})
 
     assert await gate.get_chat("chat-1") == {"id": "chat-1"}
+
+
+# --------------------------------------------------------------------------
+# Аварийный рубильник (/stop, /resume)
+# --------------------------------------------------------------------------
+
+async def test_kill_switch_blocks_sending():
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        kill_switch_lookup=lambda: _async(True),
+    )
+
+    with pytest.raises(SendingHalted):
+        await gate.send_message("chat-1", "привет")
+
+    assert client.sent == []
+
+
+async def test_kill_switch_off_lets_messages_through():
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        kill_switch_lookup=lambda: _async(False),
+    )
+
+    await gate.send_message("chat-1", "привет")
+
+    assert client.sent == [("chat-1", "привет")]
+
+
+async def test_kill_switch_lookup_failure_blocks_rather_than_allows():
+    async def broken():
+        raise RuntimeError("Redis недоступен")
+
+    client = _FakeClient()
+    gate = OutboundGate(client, Settings(avito_blocked_items="none"), kill_switch_lookup=broken)
+
+    with pytest.raises(SendingHalted):
+        await gate.send_message("chat-1", "привет")
+
+    assert client.sent == []
+
+
+async def test_no_kill_switch_lookup_means_transparent():
+    """Гейт без колбэка (тесты, где рубильник не собирают) ведёт себя как
+    раньше — конструктор его не требует."""
+    gate, client = _gate(items="")
+
+    await gate.send_message("chat-1", "привет")
+
+    assert client.sent == [("chat-1", "привет")]
+
+
+async def test_kill_switch_does_not_affect_is_allowed():
+    """`is_allowed` — это ещё и `can_send` воркера отложенных касаний, и
+    `False` там ГАСИТ ТАЙМЕР НАВСЕГДА. Рубильник временный (снимается
+    /resume), поэтому не должен туда просачиваться — иначе один инцидент
+    навсегда стёр бы напоминания, которые были due в эти минуты."""
+    client = _FakeClient()
+    gate = OutboundGate(client, Settings(avito_blocked_items="none"), kill_switch_lookup=lambda: _async(True))
+
+    assert await gate.is_allowed("chat-1") is True
+
+
+# --------------------------------------------------------------------------
+# Суточный лимит
+# --------------------------------------------------------------------------
+
+def _limit_result(
+    allowed: bool, count: int, limit: int, just_exceeded: bool = False, redis_unavailable: bool = False,
+):
+    return DailyLimitResult(
+        allowed=allowed, count=count, limit=limit,
+        just_exceeded=just_exceeded, redis_unavailable=redis_unavailable,
+    )
+
+
+async def test_daily_limit_blocks_when_exceeded():
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, 11, 10)),
+    )
+
+    with pytest.raises(DailyLimitExceeded):
+        await gate.send_message("chat-1", "привет")
+
+    assert client.sent == []
+
+
+async def test_daily_limit_allows_when_under():
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(True, 3, 10)),
+    )
+
+    await gate.send_message("chat-1", "привет")
+
+    assert client.sent == [("chat-1", "привет")]
+
+
+async def test_daily_limit_alert_fires_on_just_exceeded():
+    alerts = []
+
+    async def alert(result):
+        alerts.append(result)
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, 11, 10, just_exceeded=True)),
+        daily_limit_alert=alert,
+    )
+
+    with pytest.raises(DailyLimitExceeded):
+        await gate.send_message("chat-1", "привет")
+
+    assert len(alerts) == 1
+    assert (alerts[0].count, alerts[0].limit) == (11, 10)
+
+
+async def test_daily_limit_alert_does_not_fire_when_not_just_exceeded():
+    """Сообщение N+2 и далее уже заблокировано, но алерт не должен
+    повторяться на каждое из них до конца суток."""
+    alerts = []
+
+    async def alert(result):
+        alerts.append(result)
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, 15, 10, just_exceeded=False)),
+        daily_limit_alert=alert,
+    )
+
+    with pytest.raises(DailyLimitExceeded):
+        await gate.send_message("chat-1", "привет")
+
+    assert alerts == []
+
+
+async def test_daily_limit_alert_failure_does_not_block_the_exception():
+    """Сбой отправки алерта в Telegram — это отдельная проблема, она не
+    должна маскировать сам факт, что лимит исчерпан."""
+    async def broken_alert(result):
+        raise RuntimeError("Telegram недоступен")
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, 11, 10, just_exceeded=True)),
+        daily_limit_alert=broken_alert,
+    )
+
+    with pytest.raises(DailyLimitExceeded):
+        await gate.send_message("chat-1", "привет")
+
+
+# --------------------------------------------------------------------------
+# Суточный лимит — авария Redis: fail closed, а не «продолжаем как обычно»
+# --------------------------------------------------------------------------
+
+async def test_daily_limit_redis_unavailable_blocks_sending():
+    """Раньше (fail open) сообщение прошло бы. Redis, которым считается
+    лимит, упал — это ровно момент, когда предохранитель нужнее всего, а
+    не повод его отключить."""
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, -1, 10, redis_unavailable=True)),
+    )
+
+    with pytest.raises(DailyLimitUnavailable):
+        await gate.send_message("chat-1", "привет")
+
+    assert client.sent == []
+
+
+async def test_daily_limit_redis_unavailable_alerts_every_time_not_once():
+    """В отличие от `just_exceeded` (алерт ровно один раз), авария Redis
+    не даёт способа отличить первую заблокированную попытку от сотой —
+    молчать после первого алерта в длящейся аварии хуже, чем повторяться."""
+    alerts = []
+
+    async def alert(result):
+        alerts.append(result)
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, -1, 10, redis_unavailable=True)),
+        daily_limit_alert=alert,
+    )
+
+    for _ in range(3):
+        with pytest.raises(DailyLimitUnavailable):
+            await gate.send_message("chat-1", "привет")
+
+    assert len(alerts) == 3
+    assert all(a.redis_unavailable for a in alerts)
+
+
+async def test_daily_limit_unavailable_is_distinguishable_from_exceeded():
+    """Вызывающий код (и алерт) должен уметь различить «лимит исчерпан» и
+    «не смогли проверить» — это разные exception и разный текст оператору."""
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        daily_limit_check=lambda: _async(_limit_result(False, -1, 10, redis_unavailable=True)),
+    )
+
+    with pytest.raises(DailyLimitUnavailable) as exc_info:
+        await gate.send_message("chat-1", "привет")
+    assert not isinstance(exc_info.value, DailyLimitExceeded)
+
+
+# --------------------------------------------------------------------------
+# Порядок проверок
+# --------------------------------------------------------------------------
+
+async def test_kill_switch_checked_before_daily_limit_counter():
+    """Рубильник должен отсечь сообщение РАНЬШЕ инкремента суточного
+    счётчика — иначе сообщение, которое и так не уйдёт, съедает лимит."""
+    calls = []
+
+    async def daily_check():
+        calls.append("daily")
+        return _limit_result(True, 1, 10)
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_blocked_items="none"),
+        kill_switch_lookup=lambda: _async(True),
+        daily_limit_check=daily_check,
+    )
+
+    with pytest.raises(SendingHalted):
+        await gate.send_message("chat-1", "привет")
+
+    assert calls == []
+
+
+async def test_listing_filter_checked_before_daily_limit_counter():
+    calls = []
+
+    async def daily_check():
+        calls.append("daily")
+        return _limit_result(True, 1, 10)
+
+    async def lookup(chat_id: str):
+        return "item-vacancy"
+
+    client = _FakeClient()
+    gate = OutboundGate(
+        client, Settings(avito_allowed_items="item-1"), lookup,
+        daily_limit_check=daily_check,
+    )
+
+    with pytest.raises(ListingNotAllowed):
+        await gate.send_message("chat-1", "привет")
+
+    assert calls == []
+
+
+# --------------------------------------------------------------------------
+# item_scope — классификация по заголовку вместо зашитого списка
+# --------------------------------------------------------------------------
+
+async def test_item_scope_resolver_decides_when_wired():
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    store = InMemoryItemScopeStore()
+    await store.upsert("item-baня", title="Баня", decision="allow", reason="title_matches_allow")
+    resolver = ItemScopeResolver(store, Settings())
+
+    async def lookup(chat_id: str):
+        return "item-baня"
+
+    client = _FakeClient()
+    gate = OutboundGate(client, Settings(), lookup, item_scope_resolver=resolver)
+
+    await gate.send_message("chat-1", "привет")
+
+    assert client.sent == [("chat-1", "привет")]
+
+
+async def test_item_scope_resolver_can_deny_even_without_a_blocklist():
+    """С резолвером фильтр никогда не «выключен полностью» — жёсткий deny
+    (item_id == "0", объявление не нашего аккаунта) обязан сработать даже
+    когда AVITO_BLOCKED_ITEMS пуст."""
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    resolver = ItemScopeResolver(InMemoryItemScopeStore(), Settings(avito_blocked_items="none"))
+
+    async def lookup(chat_id: str):
+        return "0"   # item_id == 0 — см. app/channels/item_scope.py:ZERO_ITEM_ID
+
+    client = _FakeClient()
+    gate = OutboundGate(client, Settings(avito_blocked_items="none"), lookup, item_scope_resolver=resolver)
+
+    with pytest.raises(ListingNotAllowed):
+        await gate.send_message("chat-1", "привет")
+
+    assert client.sent == []
+
+
+async def test_foreign_item_is_denied_through_the_gate():
+    """33 чата на 1100: владелец аккаунта сам покупатель. Заголовок не
+    матчит ни одно deny-слово — без гуарда «объявление не наше» такой чат
+    прошёл бы обычную классификацию (allow)."""
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    async def own_items():
+        return {"111"}   # объявления комплекса — репетитора среди них нет
+
+    resolver = ItemScopeResolver(
+        InMemoryItemScopeStore(), Settings(), own_items_provider=own_items
+    )
+
+    async def lookup(chat_id: str):
+        return "999-repetitor"
+
+    client = _FakeClient()
+    gate = OutboundGate(client, Settings(), lookup, item_scope_resolver=resolver)
+
+    with pytest.raises(ListingNotAllowed):
+        await gate.send_message("chat-1", "Здравствуйте, физика ЕГЭ?")
+
+    assert client.sent == []
+
+
+async def test_hard_blocklist_beats_item_scope_allow_classification():
+    """Требование 6: даже если item_scope уже закешировал allow (например,
+    из позавчерашнего часового прохода до правки списка), жёсткий deny по
+    id обязан победить на следующем же вызове."""
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    store = InMemoryItemScopeStore()
+    await store.upsert(
+        "7980739861", title="Продажа банного комплекса",
+        decision="allow", reason="title_matches_allow",  # устаревшее/ошибочное значение
+    )
+    settings = Settings(avito_blocked_items="7980739861")
+    resolver = ItemScopeResolver(store, settings)
+
+    async def lookup(chat_id: str):
+        return "7980739861"
+
+    client = _FakeClient()
+    gate = OutboundGate(client, settings, lookup, item_scope_resolver=resolver)
+
+    with pytest.raises(ListingNotAllowed):
+        await gate.send_message("chat-1", "Баня свободна?")
+
+    assert client.sent == []
+
+
+async def _async(value):
+    return value
 
 
 def test_every_sending_method_of_the_client_is_covered_by_the_gate():

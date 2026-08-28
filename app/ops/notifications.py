@@ -9,10 +9,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from app.channels.daily_limit import MOSCOW_TZ
 
 AVITO_CHAT_URL = "https://www.avito.ru/profile/messenger/channel/{chat_id}"
 
@@ -155,6 +158,42 @@ def render_daily_limit_notice(chat_id: str, limit: int) -> str:
             "Клиенту в этом чате скидка не предложена — агент продолжает",
             "разговор без неё. Остальные клиенты сегодня — тоже без скидки,",
             "пока лимит не сбросится (в полночь по Москве).",
+        ]
+    )
+
+
+def render_outbound_daily_limit_notice(count: int, limit: int, at: Optional[datetime] = None) -> str:
+    """Суточный лимит ВСЕХ исходящих исчерпан (app/channels/daily_limit.py) —
+    не путать с `render_daily_limit_notice` выше, тот про лимит ценовых
+    уступок. Это НЕ тихая остановка: с этого сообщения и до полуночи по
+    Москве OutboundGate отклоняет любую отправку по любому чату, и
+    оператору нужно узнать об этом сразу, а не из жалоб клиентов."""
+    at = (at or datetime.now(timezone.utc)).astimezone(MOSCOW_TZ)
+    return "\n".join(
+        [
+            f"🚨 СУТОЧНЫЙ ЛИМИТ ИСХОДЯЩИХ ИСЧЕРПАН ({limit})",
+            "",
+            f"Отправлено сегодня: {count}. Время: {at.strftime('%H:%M:%S МСК')}.",
+            "Дальнейшая отправка ЛЮБЫХ сообщений клиентам заблокирована до",
+            "полуночи по Москве. Поднять лимит — переменной OUTBOUND_DAILY_LIMIT.",
+        ]
+    )
+
+
+def render_outbound_daily_limit_unavailable_notice(limit: int, at: Optional[datetime] = None) -> str:
+    """Redis, которым считается суточный лимит, недоступен — OutboundGate
+    отказал в отправке fail closed (см. app/channels/daily_limit.py), но
+    это НЕ «лимит исчерпан», а «не смогли проверить», и оператору нужно
+    чинить Redis, а не ждать полуночи."""
+    at = (at or datetime.now(timezone.utc)).astimezone(MOSCOW_TZ)
+    return "\n".join(
+        [
+            "🚨 СУТОЧНЫЙ ЛИМИТ ИСХОДЯЩИХ НЕ ПРОВЕРЯЕТСЯ — REDIS НЕ ОТВЕЧАЕТ",
+            "",
+            f"Время: {at.strftime('%H:%M:%S МСК')}.",
+            "Отправка ЛЮБЫХ сообщений клиентам заблокирована (fail closed),",
+            "пока Redis не восстановится. Это не полуночный сброс — снимется",
+            "только чинкой инфраструктуры.",
         ]
     )
 

@@ -213,6 +213,38 @@ class ItemZoneMap(Base):
     note: Mapped[Optional[str]] = mapped_column(Text)
 
 
+class ItemScope(Base):
+    """item_id -> allow/deny — замена зашитого в код чёрного списка.
+
+    Заводилась как блок 1 из плана «объявления комплекса без ручного
+    списка» (см. app/channels/item_scope.py — там же классификация по
+    заголовку и порядок проверок). До неё область действия агента была
+    пятью id, зашитыми в `DEFAULT_BLOCKED_ITEMS` (app/config.py) — работало,
+    пока список объявлений не менялся; каждое новое объявление комплекса
+    требовало ручной правки переменной окружения.
+
+    Одна строка на item_id, ПЕРЕЗАПИСЫВАЕТСЯ при повторной классификации
+    (в отличие от `CatalogOverride`, который копит историю правок) — здесь
+    важно только текущее решение, не то, как оно менялось.
+
+    `reason` — не для агента, а для оператора и для этого же кода: почему
+    именно так решили (какое слово заголовка сработало, хардкод по id,
+    объявление не наше — см. `app/channels/item_scope.py:classify_title`
+    и `ItemScopeResolver`).
+    """
+
+    __tablename__ = "item_scope"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    item_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(512))
+    decision: Mapped[str] = mapped_column(String(8))  # "allow" | "deny"
+    reason: Mapped[Optional[str]] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ChatCursor(Base):
     """Докуда поллер уже прочитал чат. Одна строка на чат.
 

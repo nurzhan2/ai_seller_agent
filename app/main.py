@@ -29,6 +29,8 @@ from app.ops.notifications import (
     dialog_keyboard,
     render_booking_notice,
     render_dialog_card,
+    render_outbound_daily_limit_notice,
+    render_outbound_daily_limit_unavailable_notice,
 )
 from app.ops.state import SqlAlchemyOpsStore
 from app.ops.touch_scheduler import SqlAlchemyTouchStore, run_scheduler_pass
@@ -115,6 +117,31 @@ def build_booking_notifier(settings: Any, ops_bot: Any):
         )
 
     return notify
+
+
+def build_daily_limit_alert(settings: Any, ops_bot: Any):
+    """Алерт в Telegram — не тихая остановка, ни на исчерпанный лимит, ни
+    на аварию Redis, которым он считается.
+
+    Два разных сообщения через один колбэк — `DailyLimitResult` знает,
+    какой случай перед нами: `just_exceeded` (ровно (лимит + 1)-е
+    сообщение, дальше до конца суток не повторяется) или
+    `redis_unavailable` (fail closed на каждой попытке, пока Redis не
+    поднимется — см. докстринг app/channels/daily_limit.py про то, почему
+    именно на каждой).
+    """
+    if ops_bot is None or not getattr(settings, "telegram_ops_chat_id", ""):
+        return None
+
+    async def alert(result: Any) -> None:
+        text = (
+            render_outbound_daily_limit_unavailable_notice(result.limit)
+            if result.redis_unavailable
+            else render_outbound_daily_limit_notice(result.count, result.limit)
+        )
+        await ops_bot.send_message(chat_id=settings.telegram_ops_chat_id, text=text)
+
+    return alert
 
 
 async def supervised_touch_scheduler(
@@ -210,6 +237,31 @@ async def supervised_concession_timeout_scheduler(
             raise
         except Exception:
             logger.exception("concession timeout scheduler: pass failed")
+        await asyncio.sleep(interval_seconds)
+
+
+async def supervised_item_scope_refresh(
+    items_client: Any,
+    store: Any,
+    settings: Any,
+    *,
+    interval_seconds: int,
+) -> None:
+    """Часовой проход классификации объявлений — см.
+    app/channels/item_scope.py:run_item_scope_refresh_pass. Тот же приём
+    изоляции сбоя, что и у остальных `supervised_*`: временная недоступность
+    Авито/БД не должна останавливать все последующие проходы, а до первого
+    успешного прохода `ItemScopeResolver` всё равно классифицирует
+    неизвестные item_id синхронно (см. его докстринг)."""
+    from app.channels.item_scope import run_item_scope_refresh_pass
+
+    while True:
+        try:
+            await run_item_scope_refresh_pass(items_client, store, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("item_scope refresh: pass failed")
         await asyncio.sleep(interval_seconds)
 
 
@@ -351,7 +403,9 @@ async def lifespan(app: FastAPI):
     # ops_service заводится всегда (не только при наличии токена бота) — он
     # же нужен воркеру отложенных касаний ниже для очереди на одобрение в
     # DRY_RUN, независимо от того, есть ли кому её показать в Telegram.
-    ops_service = OpsService(store=SqlAlchemyOpsStore(get_sessionmaker()), settings=settings)
+    ops_service = OpsService(
+        store=SqlAlchemyOpsStore(get_sessionmaker()), settings=settings, redis=redis_client,
+    )
     app.state.ops_service = ops_service
 
     # `ops_bot` (клиент aiogram) заводится здесь, РАНЬШЕ диспетчера — тот
@@ -379,8 +433,48 @@ async def lifespan(app: FastAPI):
     # access-токена — второй обновлял бы токен, не зная про первый.
     avito_client = AvitoClient(settings=settings, redis=redis_client)
 
+    # item_scope — классификация объявлений по заголовку вместо зашитого в
+    # код списка (app/channels/item_scope.py). Собирается ЗДЕСЬ, безусловно
+    # (не только при POLLER_ENABLED=true): им пользуется is_listing_allowed
+    # на границе отправки и на входе конвейера, а эти пути живы и с
+    # выключенным поллером, через один только вебхук.
+    #
+    # AvitoItemsClient и OwnItemIds — ОДИН экземпляр на процесс, тот же,
+    # которым ниже (если POLLER_ENABLED) пользуется гуард поллера: второй
+    # независимый кеш означал бы два часовых обновления списка объявлений
+    # аккаунта вместо одного.
+    from app.avito.own_items import OwnItemIds
+    from app.channels.avito_items import AvitoItemsClient
+    from app.channels.item_scope import (
+        ItemScopeResolver,
+        SqlAlchemyItemScopeStore,
+        make_item_card_fetcher,
+    )
+
+    avito_items_client = AvitoItemsClient(settings=settings)
+    own_item_ids = OwnItemIds(avito_items_client, settings)
+    item_scope_store = SqlAlchemyItemScopeStore(get_sessionmaker())
+    item_scope_resolver = ItemScopeResolver(
+        item_scope_store,
+        settings,
+        own_items_provider=own_item_ids,
+        fetch_item=make_item_card_fetcher(avito_items_client, settings.poller_items_statuses),
+    )
+    app.state.item_scope_resolver = item_scope_resolver
+    item_scope_task = asyncio.create_task(
+        supervised_item_scope_refresh(
+            avito_items_client, item_scope_store, settings,
+            interval_seconds=settings.poller_items_refresh_seconds,
+        )
+    )
+    logger.info(
+        "item_scope: часовая классификация объявлений запущена (интервал %d с)",
+        settings.poller_items_refresh_seconds,
+    )
+
     # dialog_store создаётся ЗДЕСЬ, а не ниже вместе с конвейером: он нужен
     # гейту исходящих, а гейт — воркеру касаний, который стартует раньше.
+    from app.channels import daily_limit, kill_switch
     from app.channels.outbound_gate import OutboundGate
     from app.dialog_store import SqlAlchemyBookingSink, SqlAlchemyDialogStore
 
@@ -395,7 +489,30 @@ async def lifespan(app: FastAPI):
         settings,
         dialog_store.get_chat_item_id,
         dialog_store.get_chat_manual_hold,
+        # Аварийный рубильник (/stop, /resume) и суточный лимит — та же
+        # причина, что у белого списка объявлений строкой выше: должны
+        # работать одинаково для всех четырёх путей отправки, а не только
+        # там, где их проверили первыми. Оба читают Redis на каждом
+        # проходе, а не только переменную окружения при старте — см.
+        # докстринги app/channels/kill_switch.py и app/channels/daily_limit.py.
+        kill_switch_lookup=lambda: kill_switch.is_stopped(redis_client),
+        daily_limit_check=lambda: daily_limit.check_and_increment(
+            redis_client, settings.outbound_daily_limit
+        ),
+        daily_limit_alert=build_daily_limit_alert(settings, ops_bot),
+        item_scope_resolver=item_scope_resolver,
     )
+
+    # Четвёртый путь отправки — ответ, одобренный оператором в Telegram
+    # (`OpsService.approve`/`send_edited`). ДОЛГО оставался неподключённым:
+    # `ops_service` собирается выше без `send_to_avito`, и без этой строки
+    # /approve отвечал оператору «Отправлено клиенту», а
+    # `self.send_to_avito` было `None` — сообщение не уходило вообще (см.
+    # тесты tests/test_ops.py и tests/test_main.py:
+    # test_lifespan_wires_operator_approval_through_the_outbound_gate).
+    # Присваивание, а не параметр конструктора: `ops_service` нужен воркеру
+    # касаний ВЫШЕ по коду, до того как здесь появляется гейт.
+    ops_service.send_to_avito = outbound.send_message
 
     touch_store = SqlAlchemyTouchStore(get_sessionmaker())
     touch_sender = build_touch_sender(settings, ops_service, ops_bot, outbound)
@@ -453,6 +570,7 @@ async def lifespan(app: FastAPI):
         # Пауза «как живой человек» перед реальной отправкой — не в DRY_RUN,
         # там ответ и так ждёт кнопки оператора (см. MessagePipeline.delay_fn).
         delay_fn=human_delay,
+        item_scope_resolver=item_scope_resolver,
     )
     app.state.pipeline = pipeline
 
@@ -478,9 +596,7 @@ async def lifespan(app: FastAPI):
     poller_task: asyncio.Task | None = None
     if settings.poller_enabled:
         from app.avito.cursors import SqlAlchemyCursorStore
-        from app.avito.own_items import OwnItemIds
         from app.avito.poller import AvitoPoller, supervised_poller
-        from app.channels.avito_items import AvitoItemsClient
 
         cursor_store = SqlAlchemyCursorStore(get_sessionmaker())
         app.state.cursor_store = cursor_store
@@ -494,9 +610,10 @@ async def lifespan(app: FastAPI):
             cursors=cursor_store,
             settings=settings,
             redis=redis_client,
-            items_provider=OwnItemIds(
-                AvitoItemsClient(settings=settings), settings
-            ),
+            # own_item_ids — тот же экземпляр, что у item_scope_resolver
+            # выше: один часовой кеш списка объявлений аккаунта на процесс,
+            # а не два независимых.
+            items_provider=own_item_ids,
         )
         app.state.poller = poller
         poller_task = asyncio.create_task(
@@ -598,6 +715,9 @@ async def lifespan(app: FastAPI):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+    item_scope_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await item_scope_task
     concession_timeout_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await concession_timeout_task
@@ -605,6 +725,7 @@ async def lifespan(app: FastAPI):
     with contextlib.suppress(asyncio.CancelledError):
         await touch_task
     await avito_client.aclose()
+    await avito_items_client.aclose()
     if bot_task is not None:
         bot_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

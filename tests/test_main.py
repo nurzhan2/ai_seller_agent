@@ -252,6 +252,39 @@ def test_lifespan_wires_the_menu_service():
     assert isinstance(state.menu_service.editor.store, SqlAlchemyOverrideStore)
 
 
+def test_lifespan_wires_operator_approval_through_the_outbound_gate():
+    """Четвёртый из четырёх путей отправки (см. докстринг
+    app/channels/outbound_gate.py): ответ, одобренный оператором в
+    Telegram (`OpsService.approve`/`send_edited`), обязан уходить через
+    `OutboundGate`, а не через необвязанный колбэк.
+
+    До этого теста `OpsService.send_to_avito` нигде в `app/main.py` не
+    выставлялся: /approve в Telegram отвечал оператору «Отправлено
+    клиенту», но `self.send_to_avito` было `None`, и `approve()` тихо
+    ничего не отправляла (см. app/ops/bot.py:approve — `if self.
+    send_to_avito is not None`). Не «утечка мимо гейта» в буквальном
+    смысле, а нечто худшее для этого пути: одобренный ответ не доходил до
+    клиента ВООБЩЕ, при этом оператору врали, что он ушёл. Живое
+    приложение теперь обязано подключать `send_to_avito` к тому же
+    `OutboundGate`, что и остальные три пути — рубильник и суточный лимит
+    (app/channels/kill_switch.py, app/channels/daily_limit.py) иначе не
+    подействуют именно на этот путь.
+    """
+    from app.channels.outbound_gate import OutboundGate
+
+    state = _real_app_state()
+
+    assert state.ops_service.send_to_avito is not None, (
+        "OpsService.send_to_avito не подключён — одобрение оператора не "
+        "доставляет ответ клиенту (и не подчиняется kill switch/лимиту)"
+    )
+    # Тот же объект, что и `pipeline.avito_client` — единственный гейт на
+    # процесс, а не отдельный клиент Авито в обход него.
+    bound_gate = getattr(state.ops_service.send_to_avito, "__self__", None)
+    assert isinstance(bound_gate, OutboundGate)
+    assert bound_gate is state.pipeline.avito_client
+
+
 def test_lifespan_kb_reload_updates_agent_loop_and_pipeline():
     """Правка каталога из Telegram обязана долетать до живого агента без
     рестарта — иначе следующий ход считает по старой цене, пока кто-то не

@@ -226,7 +226,7 @@ async def _fetch_all_chats(
     return chats[:max_chats], requests, complete
 
 
-def _decision(chat: dict, our_id: str, settings: Any) -> tuple[str, str]:
+async def _decision(chat: dict, our_id: str, settings: Any, scope_resolver: Any = None) -> tuple[str, str]:
     """(решение, причина) — что поллер СДЕЛАЕТ С ЧТЕНИЕМ этого чата.
 
     ЭТО БОЛЬШЕ НЕ ПРЕДСКАЗАНИЕ «ОТВЕТИТ ЛИ АГЕНТ». До инцидента 2026-08-28
@@ -239,6 +239,12 @@ def _decision(chat: dict, our_id: str, settings: Any) -> tuple[str, str]:
     фильтр объявлений (та же `is_listing_allowed`, что на входе конвейера и
     на границе отправки) — оба всё ещё останавливают чат ДО того, как он
     вообще попадёт в конвейер.
+
+    `scope_resolver` — app/channels/item_scope.py:ItemScopeResolver. Без
+    него (по умолчанию) `is_listing_allowed` работает по старому чёрному
+    списку AVITO_BLOCKED_ITEMS, без классификации по заголовку и без
+    гуарда «объявление не наше» — то есть покажет то же, что видел бы стенд
+    без БД.
     """
     last = _last_message(chat)
     if not last:
@@ -248,16 +254,40 @@ def _decision(chat: dict, our_id: str, settings: Any) -> tuple[str, str]:
     if created is None:
         return "пропуск", "no_created"
 
-    if not is_listing_allowed(extract_item_id_from_chat(chat), settings):
+    allowed = await is_listing_allowed(
+        extract_item_id_from_chat(chat), settings, scope_resolver=scope_resolver
+    )
+    if not allowed:
         return "пропуск", "объявление под запретом"
 
     return "ПРОЧИТАЕТ", "AGENT_MIN_INBOUND_TS решит в конвейере, отвечать ли"
+
+
+def _build_scope_resolver(settings: Any):
+    """item_scope во всей красе: таблица в БД + живая догрузка карточек
+    неизвестных объявлений. Отдельная функция ради --no-item-scope: без неё
+    `_decision` откатывается на старый чёрный список, без похода в БД/Авито
+    за объявлениями."""
+    from app.avito.own_items import OwnItemIds
+    from app.channels.avito_items import AvitoItemsClient
+    from app.channels.item_scope import ItemScopeResolver, make_item_card_fetcher
+    from app.channels.item_scope import SqlAlchemyItemScopeStore
+    from app.db.session import get_sessionmaker
+
+    items_client = AvitoItemsClient(settings=settings)
+    return ItemScopeResolver(
+        SqlAlchemyItemScopeStore(get_sessionmaker()),
+        settings,
+        own_items_provider=OwnItemIds(items_client, settings),
+        fetch_item=make_item_card_fetcher(items_client, settings.poller_items_statuses),
+    )
 
 
 async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
     settings = get_settings()
     our_id = settings.avito_user_id
     now = int(datetime.now(timezone.utc).timestamp())
+    scope_resolver = None if args.no_item_scope else _build_scope_resolver(settings)
 
     chats, requests, complete = await _fetch_all_chats(
         client, args.page_size, args.max_chats
@@ -333,13 +363,14 @@ async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
             item_cell += " !!НЕ СТРОКА"
 
         direction = "мы" if (author and our_id and author == our_id) else "клиент"
-        decision, reason = _decision(chat, our_id, settings)
+        decision, reason = await _decision(chat, our_id, settings, scope_resolver)
         counts[decision] = counts.get(decision, 0) + 1
         reasons[reason] = reasons.get(reason, 0) + 1
         if normalized == "0":
-            # context.type == "item", но value.id == 0. Для фильтра это
-            # ОБЫЧНОЕ объявление со строковым id "0" (не None!), которого
-            # нет в чёрном списке, — то есть разрешённое.
+            # context.type == "item", но value.id == 0. С item_scope это
+            # жёсткий deny (см. app/channels/item_scope.py:ZERO_ITEM_ID);
+            # без резолвера (--no-item-scope) — старый баг: строка "0" не
+            # входит в чёрный список и читается как разрешённое объявление.
             zero_items += 1
 
         print(f"{chat_id:<26} {_chat_type(chat):<8} {item_cell:<22} "
@@ -353,10 +384,14 @@ async def run_dry(client: AvitoClient, args: argparse.Namespace) -> int:
         print(f"  {reason}: {count}")
     if zero_items:
         print()
-        print(f"ВНИМАНИЕ: чатов с item_id == 0: {zero_items}. "
-              "extract_item_id_from_chat отдаёт для них")
-        print("строку \"0\", а не None — значит фильтр считает их обычным "
-              "разрешённым объявлением.")
+        if scope_resolver is not None:
+            print(f"Чатов с item_id == 0: {zero_items} — item_scope считает это "
+                  "жёстким deny (см. ZERO_ITEM_ID).")
+        else:
+            print(f"ВНИМАНИЕ: чатов с item_id == 0: {zero_items}. "
+                  "extract_item_id_from_chat отдаёт для них")
+            print("строку \"0\", а не None, и БЕЗ item_scope (--no-item-scope) "
+                  "фильтр считает их обычным разрешённым объявлением.")
     print()
     print("Ни одного исходящего сообщения не отправлено — это пробник.")
     return 0
@@ -558,6 +593,11 @@ async def main() -> int:
                              "(у Postgres на Railway нет публичного адреса)")
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--max-chats", type=int, default=1000)
+    parser.add_argument(
+        "--no-item-scope", action="store_true",
+        help="--dry: не собирать ItemScopeResolver (без БД/дозагрузки карточек) — "
+             "решение по старому чёрному списку AVITO_BLOCKED_ITEMS",
+    )
     args = parser.parse_args()
 
     settings = get_settings()

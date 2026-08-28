@@ -766,6 +766,72 @@ async def test_allowlist_still_wins_when_set():
 
 
 # --------------------------------------------------------------------------
+# item_scope — та же классификация, что на границе отправки
+# --------------------------------------------------------------------------
+
+def _build_with_scope_resolver(resolver, *, settings=None):
+    settings = settings or _settings()
+    store = InMemoryDialogStore()
+    agent = _FakeAgentLoop()
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    pipeline = MessagePipeline(
+        store=store, agent_loop=agent, ops_service=ops_service, settings=settings,
+        debounce_window_seconds=0, now_fn=lambda: NOW, item_scope_resolver=resolver,
+    )
+    return pipeline, store, agent, ops_service
+
+
+async def test_pipeline_uses_item_scope_when_wired():
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    store = InMemoryItemScopeStore()
+    await store.upsert("item-1", title="Баня", decision="allow", reason="title_matches_allow")
+    resolver = ItemScopeResolver(store, _settings())
+
+    pipeline, _, agent, _ = _build_with_scope_resolver(resolver)
+
+    await pipeline.handle_message(_payload(item_id="item-1"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_pipeline_denies_zero_item_id_through_item_scope():
+    """109 чатов на 1100: context.value.id == 0 — жёсткий deny, не «обычное
+    разрешённое объявление»."""
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    resolver = ItemScopeResolver(InMemoryItemScopeStore(), _settings())
+    pipeline, store, agent, _ = _build_with_scope_resolver(resolver)
+
+    await pipeline.handle_message(_payload(item_id="0"))
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+async def test_pipeline_denies_foreign_listing_through_item_scope():
+    """33 чата на 1100: владелец аккаунта сам покупатель — заголовок не
+    матчит ни одно deny-слово, гуард «объявление не наше» обязателен."""
+    from app.channels.item_scope import InMemoryItemScopeStore, ItemScopeResolver
+
+    async def own_items():
+        return {"item-1"}   # объявления комплекса — репетитора среди них нет
+
+    resolver = ItemScopeResolver(
+        InMemoryItemScopeStore(), _settings(), own_items_provider=own_items
+    )
+    pipeline, store, agent, _ = _build_with_scope_resolver(resolver)
+
+    await pipeline.handle_message(_payload(item_id="999-repetitor", text="Физика ЕГЭ?"))
+    await _settle()
+
+    assert agent.calls == []
+    assert store.chats == {}
+
+
+# --------------------------------------------------------------------------
 # Фолбэк item_id через get_chat
 # --------------------------------------------------------------------------
 
