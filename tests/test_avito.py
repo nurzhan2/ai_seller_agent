@@ -22,7 +22,7 @@ from app.channels.avito import (
     truncate_for_avito,
 )
 from app.config import Settings
-from app.webhooks import is_duplicate
+from app.channels import inbound_dedup as dedup
 
 # asyncio_mode=auto in pytest.ini handles the async tests; a module-level
 # marker would also (wrongly) tag the synchronous ones.
@@ -303,32 +303,51 @@ async def test_dry_run_off_actually_sends(settings):
 
 
 # --------------------------------------------------------------------------
-# Webhook idempotency
+# Идемпотентность входящих
+#
+# Живёт в app/channels/inbound_dedup.py, а не в app/webhooks.py: каналов
+# приёма два (вебхук и поллер), и разводить их обязана одна общая точка.
 # --------------------------------------------------------------------------
 
 async def test_duplicate_message_id_is_dropped():
     redis = FakeRedis()
-    assert await is_duplicate("m-1", redis) is False   # first delivery
-    assert await is_duplicate("m-1", redis) is True    # Avito retried
+    assert await dedup.claim("m-1", redis) is True    # первая доставка
+    assert await dedup.claim("m-1", redis) is False   # Авито повторило
 
 
 async def test_distinct_message_ids_both_pass():
     redis = FakeRedis()
-    assert await is_duplicate("m-1", redis) is False
-    assert await is_duplicate("m-2", redis) is False
+    assert await dedup.claim("m-1", redis) is True
+    assert await dedup.claim("m-2", redis) is True
 
 
 async def test_missing_message_id_is_not_treated_as_duplicate():
-    """Undeduplicable is not the same as duplicate — the DB unique
-    constraint is the backstop."""
-    assert await is_duplicate(None, FakeRedis()) is False
+    """Нечем дедуплицировать — не то же, что дубль: страхует уникальный
+    индекс в БД. Обратное означало бы, что сообщение без идентификатора
+    молча исчезает."""
+    assert await dedup.claim(None, FakeRedis()) is True
 
 
-async def test_idempotency_key_carries_a_ttl():
+async def test_claim_is_provisional_until_confirmed():
+    """Заявка живёт минуту, а не сутки, — иначе упавшая обработка теряет
+    сообщение навсегда: ключ стоит, курсор поллера не двинулся, следующий
+    проход молча отбросит его как дубль."""
     redis = FakeRedis()
-    await is_duplicate("m-1", redis)
+    await dedup.claim("m-1", redis)
     key = "avito:seen_message:m-1"
+    assert redis.ttls[key] == dedup.PROVISIONAL_TTL_SECONDS
+
+    await dedup.confirm("m-1", redis, Settings().webhook_idempotency_ttl_seconds)
     assert redis.ttls[key] == Settings().webhook_idempotency_ttl_seconds
+
+
+async def test_release_returns_the_message_to_circulation():
+    redis = FakeRedis()
+    assert await dedup.claim("m-1", redis) is True
+    await dedup.release("m-1", redis)
+    # Обработка упала, заявка снята — следующий проход обязан снова взять
+    # это сообщение, а не отбросить его как уже виденное.
+    assert await dedup.claim("m-1", redis) is True
 
 
 def test_message_id_extraction_tolerates_envelope_shapes():

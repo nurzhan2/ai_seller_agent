@@ -105,6 +105,68 @@ def extract_item_id_raw(payload: dict) -> Any:
     return None
 
 
+def build_event_from_polled_message(
+    message: dict,
+    *,
+    chat_id: str,
+    item_id: Optional[str],
+    chat_type: Optional[str],
+) -> dict:
+    """Сообщение из `GET /messenger/v3/.../messages/` → событие вебхука.
+
+    ПОЧЕМУ СБОРКА ЖИВЁТ ЗДЕСЬ, А НЕ В ПОЛЛЕРЕ. Весь этот модуль — знание о
+    том, по каким путям в конверте лежат поля. Если собирать событие в
+    `app/avito/poller.py`, то же знание окажется в двух файлах, и разъедутся
+    они не сразу, а в тот день, когда кто-нибудь поправит один путь в
+    экстракторе. Тогда поллер начнёт отдавать событие, из которого конвейер
+    молча не прочитает, скажем, chat_type, — и симптомом будет не ошибка, а
+    «агент почему-то отвечает не так». Сборщик и разборщики стоят рядом и
+    покрыты тестом на эквивалентность (tests/test_poller.py).
+
+    Форма — та же, что у вебхука: payload.value.*. Все экстракторы выше
+    обязаны читать отсюда ровно то же, что прочитали бы из настоящего
+    вебхука по тому же сообщению.
+
+    item_id ПРИВОДИТСЯ К СТРОКЕ. В API Авито это число, у нас везде строка,
+    и сравнение строки с числом молча не совпадает — то есть запрещённое
+    объявление тихо становится разрешённым. На этом в проекте уже горели,
+    поэтому приведение стоит на границе, а не у вызывающих.
+    """
+    author_id = None
+    for key in ("author_id", "authorId", "user_id"):
+        value = message.get(key)
+        if isinstance(value, (str, int)) and str(value):
+            author_id = str(value)
+            break
+
+    created = message.get("created")
+    if not isinstance(created, int):
+        created = int(created) if isinstance(created, str) and created.isdigit() else None
+
+    value: dict[str, Any] = {
+        "id": str(message.get("id")) if message.get("id") is not None else None,
+        "chat_id": str(chat_id),
+        "author_id": author_id,
+        "created": created,
+        "type": message.get("type"),
+        "content": message.get("content") if isinstance(message.get("content"), dict) else {},
+    }
+    if chat_type is not None:
+        value["chat_type"] = chat_type
+    # Ключа item_id у чата без объявления быть НЕ ДОЛЖНО вовсе, а не должен
+    # он быть равным None: `_first_scalar` отличает «поля нет» от «поле
+    # пустое» только отсутствием, и пустое значение читалось бы как строка.
+    if item_id is not None:
+        value["item_id"] = str(item_id)
+
+    return {
+        "id": value["id"],
+        "version": "v3.0.0",
+        "timestamp": created,
+        "payload": {"type": "message", "value": value},
+    }
+
+
 def extract_chat_type(payload: dict) -> Optional[str]:
     """Тип чата: "u2i" (по объявлению), "u2u"/"a2u" (по профилю).
 

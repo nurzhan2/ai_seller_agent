@@ -18,6 +18,15 @@
   * обрабатываем каждое сообщение один раз — ретраи и at-least-once доставка
     нормальны, а дубль входящего означает, что агент дважды ответит на один
     вопрос.
+
+ДЕДУПЛИКАЦИЯ ЗДЕСЬ БОЛЬШЕ НЕ ЖИВЁТ, и это не упрощение, а исправление. Она
+переехала в `app/channels/inbound_dedup.py` и вызывается конвейером, потому
+что каналов приёма стало два: поллер (`app/avito/poller.py`) зовёт конвейер
+напрямую и мимо этого модуля. Проверка, оставшаяся здесь, разводила бы только
+вебхук сам с собой, а вебхук с поллером — нет, и агент отвечал бы на одно
+сообщение дважды. Не возвращайте её сюда: тогда сообщение будет заявлено
+дважды — здесь и в конвейере, — и конвейер отбросит собственное входящее как
+дубль самого себя.
 """
 
 from __future__ import annotations
@@ -35,17 +44,17 @@ logger = logging.getLogger("parmangal.webhook")
 
 router = APIRouter()
 
-SEEN_KEY = "avito:seen_message:{message_id}"
 WEBHOOK_PATH_TEMPLATE = "/webhook/avito/{secret}"
 
-# Проставляются фабрикой приложения; инъекция нужна, чтобы тестам не требовался Redis.
-_redis: Any = None
+# Проставляется фабрикой приложения; инъекция нужна, чтобы тестам не требовалось
+# поднимать конвейер целиком.
 _handler: Optional[Callable[[dict], Awaitable[None]]] = None
 
 
-def configure(redis: Any = None, handler: Optional[Callable[[dict], Awaitable[None]]] = None) -> None:
-    global _redis, _handler
-    _redis = redis
+def configure(handler: Optional[Callable[[dict], Awaitable[None]]] = None) -> None:
+    """Redis сюда больше не передаётся: дедупликация переехала в конвейер
+    (см. шапку модуля и app/channels/inbound_dedup.py)."""
+    global _handler
     _handler = handler
 
 
@@ -60,20 +69,6 @@ def secret_matches(candidate: str) -> bool:
     if not expected:
         return False
     return secrets_mod.compare_digest(candidate, expected)
-
-
-async def is_duplicate(message_id: Optional[str], redis: Any) -> bool:
-    """True, если это сообщение уже видели.
-
-    Атомарность даёт SET NX: два воркера, получившие один и тот же ретрай,
-    состязаются на одной операции, и выигрывает ровно один.
-    """
-    if message_id is None or redis is None:
-        return False
-    settings = get_settings()
-    key = SEEN_KEY.format(message_id=message_id)
-    was_set = await redis.set(key, "1", nx=True, ex=settings.webhook_idempotency_ttl_seconds)
-    return not bool(was_set)
 
 
 @router.post("/webhook/avito/{secret}", status_code=status.HTTP_200_OK)
@@ -95,9 +90,6 @@ async def avito_webhook(
         return Response(status_code=status.HTTP_200_OK)
 
     message_id = extract_message_id(payload)
-    if await is_duplicate(message_id, _redis):
-        logger.info("webhook duplicate dropped", extra={"message_id": message_id})
-        return Response(status_code=status.HTTP_200_OK)
 
     if _handler is not None:
         background.add_task(_handler, payload)

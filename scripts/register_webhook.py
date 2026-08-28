@@ -7,6 +7,10 @@
 Аргумент — ПУБЛИЧНАЯ БАЗА сайта, без пути. Секретный сегмент подставляется
 из AVITO_WEBHOOK_SECRET автоматически, чтобы секрет не попал в историю
 команд оболочки.
+
+Сама логика запросов живёт в `app/channels/avito_webhook_admin.py`: с тех
+пор как перепривязка делается ещё и по расписанию (раз в сутки, см.
+app/main.py), у скрипта и у планировщика обязан быть один код.
 """
 
 from __future__ import annotations
@@ -15,38 +19,13 @@ import argparse
 import asyncio
 import sys
 
-import httpx
-
-from app.channels import avito_endpoints as ep
-from app.channels.avito import AvitoAuth
-from app.config import get_settings
-from app.webhooks import webhook_path
-
-
-async def _call(spec: tuple[str, str], payload: dict) -> dict:
-    settings = get_settings()
-    token = await AvitoAuth(settings).get_token()
-    method, path = spec
-
-    async with httpx.AsyncClient(
-        base_url=ep.BASE_URL, timeout=settings.avito_timeout_seconds
-    ) as client:
-        response = await client.request(
-            method,
-            path,
-            headers={ep.AUTH_HEADER: f"{ep.AUTH_SCHEME} {token}"},
-            json=payload,
-        )
-        response.raise_for_status()
-        return response.json()
-
-
-def _full_url(base: str) -> str:
-    secret = get_settings().require_webhook_secret()
-    return base.rstrip("/") + webhook_path(secret)
+from app.channels import avito_webhook_admin as admin
 
 
 async def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_url", nargs="?", help="публичная база, например https://example.ru")
     parser.add_argument("--list", action="store_true", help="показать активные подписки")
@@ -55,18 +34,17 @@ async def main() -> int:
 
     try:
         if args.list:
-            print(await _call(ep.LIST_SUBSCRIPTIONS, {}))
+            print(await admin.list_subscriptions())
         elif args.unsubscribe:
-            url = _full_url(args.unsubscribe)
-            print(await _call(ep.WEBHOOK_UNSUBSCRIBE, {"url": url}))
+            print(await admin.unsubscribe(args.unsubscribe))
         elif args.base_url:
             if not args.base_url.startswith("https://"):
                 print("Авито требует HTTPS для вебхука", file=sys.stderr)
                 return 2
-            url = _full_url(args.base_url)
-            result = await _call(ep.WEBHOOK_SUBSCRIBE, {"url": url})
+            result = await admin.subscribe(args.base_url)
             # Секрет в консоль не печатаем.
-            print(f"Подписка зарегистрирована на {args.base_url.rstrip('/')}/webhook/avito/***")
+            print(f"Подписка зарегистрирована на "
+                  f"{admin.webhook_url_for_display(args.base_url)}")
             print(result)
         else:
             parser.print_help()

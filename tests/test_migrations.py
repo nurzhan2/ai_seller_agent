@@ -33,6 +33,7 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 EXPECTED_TABLES = {
+    "chat_cursor",
     "chats",
     "concession_log",
     "item_zone_map",

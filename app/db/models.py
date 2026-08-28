@@ -207,6 +207,53 @@ class ItemZoneMap(Base):
     note: Mapped[Optional[str]] = mapped_column(Text)
 
 
+class ChatCursor(Base):
+    """Докуда поллер уже прочитал чат. Одна строка на чат.
+
+    В POSTGRES, А НЕ В ФАЙЛЕ. Файловая система контейнера на Railway
+    эфемерная: курсоры в файле или YAML пережили бы ровно до следующего
+    деплоя и исчезли бы МОЛЧА — а исчезнувший курсор означает, что поллер
+    считает весь аккаунт непрочитанным и разом отвечает по сотням старых
+    чатов. Та же причина, по которой в БД живут `catalog_overrides` и
+    `pending_replies`.
+
+    `last_message_created` — BIGINT, unix-секунды, ровно как их отдаёт API
+    Авито, а не timestamptz. Сравнение целых не зависит ни от часового
+    пояса, ни от того, как драйвер разберёт дату; здесь это ключ
+    корректности, а не вкусовщина.
+
+    `last_message_ids` — идентификаторы сообщений, попавших ровно на
+    `last_message_created`. Нужны потому, что гранулярность времени
+    СЕКУНДНАЯ: два сообщения в одну секунду — обычное дело, когда клиент
+    дробит мысль. Поллер поэтому забирает сообщения по `created >= курсор`
+    (а не `>`, иначе второе сообщение той же секунды теряется навсегда) и
+    отсеивает уже виденные по этому списку. Полагаться вместо этого на
+    дедуп по message_id нельзя: его заявка живёт сутки, а чат может стоять
+    на одном и том же курсоре неделями.
+
+    `cold_start_skipped` — чат помечен прочитанным при первом проходе БЕЗ
+    единого исходящего (см. POLLER_BACKFILL_HOURS). Такие чаты показываются
+    в /admin/dialogs отдельным списком с кнопкой «обработать»: реанимация
+    старой переписки — решение человека, а не побочный эффект запуска.
+    """
+
+    __tablename__ = "chat_cursor"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    last_message_created: Mapped[int] = mapped_column(BigInteger, default=0)
+    last_message_ids: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), default=list)
+    cold_start_skipped: Mapped[bool] = mapped_column(Boolean, default=False)
+    # old | outgoing_last | no_messages | backfill_disabled | not_our_listing
+    skipped_reason: Mapped[Optional[str]] = mapped_column(String(64))
+    # Заголовок и объявление — только чтобы оператор видел в /admin/dialogs,
+    # что именно он собирается разбудить, словами, а не голым chat_id.
+    item_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ConcessionLog(Base):
     """One row per concession decision — granting AND denying (rule R12).
 

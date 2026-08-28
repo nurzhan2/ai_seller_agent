@@ -160,6 +160,41 @@ async def supervised_touch_scheduler(
         await asyncio.sleep(interval_seconds)
 
 
+async def supervised_webhook_resubscribe(
+    base_url: str,
+    *,
+    interval_hours: int,
+) -> None:
+    """Перепривязка вебхука раз в сутки.
+
+    Переподписка однажды уже оживляла молчащий вебхук — ненадолго, но
+    оживляла, — и раз доказательного объяснения молчанию нет, дешевле
+    переподписываться по расписанию, чем выяснять причину у поддержки.
+
+    Первая перепривязка идёт СРАЗУ ПОСЛЕ ПАУЗЫ, а не на старте: старт и так
+    самое нагруженное место (миграции, база знаний, бот, первый проход
+    поллера), и лишний внешний запрос там ничего не даёт — подписка на
+    момент деплоя уже актуальна.
+
+    Сбой изолирован так же, как у остальных воркеров: неудачная попытка не
+    должна отменять все последующие.
+    """
+    from app.channels import avito_webhook_admin as webhook_admin
+
+    while True:
+        await asyncio.sleep(interval_hours * 3600)
+        try:
+            await webhook_admin.subscribe(base_url)
+            logger.info(
+                "webhook resubscribe: подписка обновлена на %s",
+                webhook_admin.webhook_url_for_display(base_url),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("webhook resubscribe: не удалось переподписаться")
+
+
 async def supervised_concession_timeout_scheduler(
     pipeline: Any,
     *,
@@ -406,14 +441,78 @@ async def lifespan(app: FastAPI):
         kb=app.state.kb,
         avito_client=outbound,
         ops_bot=ops_bot,
+        # Дедупликация входящих переехала сюда из вебхука: каналов приёма
+        # два, и разводить их обязана одна общая точка. См.
+        # app/channels/inbound_dedup.py.
+        redis=redis_client,
         # Пауза «как живой человек» перед реальной отправкой — не в DRY_RUN,
         # там ответ и так ждёт кнопки оператора (см. MessagePipeline.delay_fn).
         delay_fn=human_delay,
     )
     app.state.pipeline = pipeline
 
-    webhooks.configure(redis=redis_client, handler=pipeline.handle_message)
+    webhooks.configure(handler=pipeline.handle_message)
     logger.info("incoming pipeline: wired to the Avito webhook")
+
+    # Поллер — ОСНОВНОЙ канал; вебхук выше остаётся вторым. Причина в том,
+    # что вебхуки по объявлениям комплекса не доставляются: за всю историю
+    # базы 49 входящих, и все u2i-чаты среди них — по объявлениям из чёрного
+    # списка. Подробности и живые числа — в докстринге app/avito/poller.py.
+    poller_task: asyncio.Task | None = None
+    if settings.poller_enabled:
+        from app.avito.cursors import SqlAlchemyCursorStore
+        from app.avito.own_items import OwnItemIds
+        from app.avito.poller import AvitoPoller, supervised_poller
+        from app.channels.avito_items import AvitoItemsClient
+
+        cursor_store = SqlAlchemyCursorStore(get_sessionmaker())
+        app.state.cursor_store = cursor_store
+        poller = AvitoPoller(
+            # avito_client, а НЕ outbound: поллер только читает, а гейт
+            # исходящих защищает отправку. Заворачивать чтение в гейт значило
+            # бы ходить в базу за item_id на каждый список чатов без всякой
+            # пользы.
+            client=avito_client,
+            pipeline=pipeline,
+            cursors=cursor_store,
+            settings=settings,
+            redis=redis_client,
+            items_provider=OwnItemIds(
+                AvitoItemsClient(settings=settings), settings
+            ),
+        )
+        app.state.poller = poller
+        poller_task = asyncio.create_task(
+            supervised_poller(poller, interval_seconds=settings.poller_interval_seconds)
+        )
+        logger.info(
+            "poller: запущен, интервал %d с, окно холодного старта %d ч%s",
+            settings.poller_interval_seconds, settings.poller_backfill_hours,
+            " (никого не будим — только новые сообщения)"
+            if settings.poller_backfill_hours <= 0 else "",
+        )
+    else:
+        logger.warning(
+            "POLLER_ENABLED=false — сообщения приходят ТОЛЬКО вебхуком, "
+            "который по объявлениям комплекса не доставляется."
+        )
+
+    resubscribe_task: asyncio.Task | None = None
+    if settings.public_base_url:
+        resubscribe_task = asyncio.create_task(
+            supervised_webhook_resubscribe(
+                settings.public_base_url,
+                interval_hours=settings.webhook_resubscribe_interval_hours,
+            )
+        )
+        logger.info(
+            "webhook resubscribe: раз в %d ч",
+            settings.webhook_resubscribe_interval_hours,
+        )
+    else:
+        logger.warning(
+            "PUBLIC_BASE_URL не задан — суточная перепривязка вебхука не запущена."
+        )
 
     # Воркер таймаута запроса на скидку — отдельной задачей, не частью
     # воркера касаний выше: разный ритм (минуты, а не полчаса-час) и разная
@@ -478,6 +577,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    for task in (poller_task, resubscribe_task):
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     concession_timeout_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await concession_timeout_task

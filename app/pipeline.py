@@ -117,6 +117,7 @@ from app.channels.avito_payloads import (
     is_image_message,
     is_outgoing_echo,
 )
+from app.channels import inbound_dedup as dedup
 from app.channels.outbound_gate import is_listing_allowed
 from app.db.models import SendStatus
 from app.dialog_store import HISTORY_LIMIT, DialogStore
@@ -161,6 +162,7 @@ class MessagePipeline:
         kb: Any = None,
         avito_client: Any = None,
         ops_bot: Any = None,
+        redis: Any = None,
         debounce_window_seconds: Optional[float] = None,
         delay_fn: Optional[Callable[[], Awaitable[None]]] = None,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
@@ -178,6 +180,13 @@ class MessagePipeline:
         self.kb = kb
         self.avito_client = avito_client
         self.ops_bot = ops_bot
+        # Нужен только дедупликации входящих (app/channels/inbound_dedup.py).
+        # None — рабочее состояние для тестов: заявка выдаётся всегда, а от
+        # двойного сохранения текста по-прежнему защищает уникальный индекс
+        # `uq_messages_avito_message_id`. Чего None НЕ закрывает — повторный
+        # шаблонный ответ на фото: строки в `messages` для сообщения без
+        # текста нет, и ловить дубль там нечем.
+        self._redis = redis
         self.now_fn = now_fn
         # Пауза «как живой человек» — только перед реальной отправкой в Авито.
         # В DRY_RUN ответ уходит в очередь модерации, и задерживать там нечего:
@@ -192,22 +201,39 @@ class MessagePipeline:
 
     # -- шаг 1-6: приём входящего ------------------------------------------
 
-    async def handle_message(self, payload: dict) -> None:
-        """Обработчик для `webhooks.configure(handler=...)`.
+    async def handle_message(self, payload: dict, *, source: str = "webhook") -> None:
+        """Обработчик для `webhooks.configure(handler=...)` И для поллера.
 
         Никогда не бросает наружу: это фоновая задача FastAPI, и исключение
         отсюда не долетит ни до Авито (мы уже ответили 200), ни до оператора —
         оно просто утонет. Поэтому логируем и выходим.
+
+        ПОЛЛЕР — ИСКЛЮЧЕНИЕ, ЕМУ ИСХОД НУЖЕН. Он двигает курсор чата по
+        каждому обработанному сообщению, и «обработано» ему надо отличать от
+        «упало»: иначе одно испорченное сообщение уносит курсор за все
+        следующие. Поэтому возвращается bool, а не None, — но вебхук его
+        по-прежнему игнорирует.
+
+        True здесь — ОБРАБОТАНО, а не «агент ответил». Эхо, чужое объявление,
+        чат у оператора, дубль по уникальному индексу — всё это штатные
+        исходы: повторять их бессмысленно, курсор двигать надо. False бывает
+        ровно в одном случае — что-то упало, и тогда сообщение обязано
+        вернуться следующим проходом.
+
+        `source` идёт в журнал приёма: с двумя каналами «сообщение не дошло»
+        и «дошло не тем путём, каким ждали» перестали быть одним и тем же
+        вопросом.
         """
         try:
-            await self._handle_message(payload)
+            return await self._handle_message(payload, source=source)
         except Exception:
             logger.exception(
                 "pipeline: incoming message failed",
-                extra={"chat_id": extract_chat_id(payload)},
+                extra={"chat_id": extract_chat_id(payload), "source": source},
             )
+            return False
 
-    async def _handle_message(self, payload: dict) -> None:
+    async def _handle_message(self, payload: dict, *, source: str = "webhook") -> bool:
         # ЖУРНАЛ ПРИЁМА: одна строка на КАЖДОЕ входящее, до всех проверок.
         # Без неё нельзя отличить «событие не дошло» от «дошло и молча
         # отброшено»: в базе в обоих случаях пусто. Именно этот вопрос —
@@ -216,12 +242,47 @@ class MessagePipeline:
         # число, у нас строка, и «строка против числа» — первое, что
         # проверяют, когда фильтр «не сработал».
         raw_item_id = extract_item_id_raw(payload)
+        message_id = extract_message_id(payload)
         logger.info(
-            "pipeline: входящее chat_id=%s item_id=%r(%s) chat_type=%s msg_id=%s",
-            extract_chat_id(payload), raw_item_id, type(raw_item_id).__name__,
-            extract_chat_type(payload), extract_message_id(payload),
+            "pipeline: входящее source=%s chat_id=%s item_id=%r(%s) chat_type=%s msg_id=%s",
+            source, extract_chat_id(payload), raw_item_id, type(raw_item_id).__name__,
+            extract_chat_type(payload), message_id,
         )
 
+        # ДЕДУПЛИКАЦИЯ — ЗДЕСЬ, А НЕ В ВЕБХУКЕ. Единственная точка, через
+        # которую проходят оба канала приёма; подробности и почему заявка
+        # ставится на минуту, а не на сутки, — в app/channels/inbound_dedup.py.
+        if not await dedup.claim(message_id, self._redis):
+            logger.info(
+                "pipeline: отброшен дубликат по message_id (уже в обработке или обработан)",
+                extra={"chat_id": extract_chat_id(payload), "message_id": message_id,
+                       "source": source},
+            )
+            return False
+
+        handled = False
+        try:
+            await self._accept(payload, source=source)
+            handled = True
+            return True
+        finally:
+            if handled:
+                await dedup.confirm(
+                    message_id, self._redis,
+                    self.settings.webhook_idempotency_ttl_seconds,
+                )
+            else:
+                # Упало — заявку снимаем, чтобы сообщение вернулось следующим
+                # проходом поллера, а не исчезло навсегда под видом дубля.
+                await dedup.release(message_id, self._redis)
+
+    async def _accept(self, payload: dict, *, source: str = "webhook") -> None:
+        """Разбор одного входящего. Штатные отказы — просто `return`.
+
+        Любой НЕштатный сбой обязан улететь исключением наверх: там по нему
+        снимается заявка дедупа и не двигается курсор поллера. Глушить
+        исключения здесь значит терять сообщения молча.
+        """
         our_user_id = getattr(self.settings, "avito_user_id", "") or ""
         if is_outgoing_echo(payload, our_user_id):
             # Авито шлёт вебхук и на наши собственные сообщения. Без этой
@@ -271,7 +332,10 @@ class MessagePipeline:
 
         saved = await self.store.save_incoming(chat_id, text, avito_message_id=message_id)
         if not saved:
-            # Второй рубеж дедупликации (первый — Redis в app/webhooks.py).
+            # Второй рубеж дедупликации; первый — заявка в Redis несколькими
+            # строками выше (`dedup.claim`). Он остаётся нужен: заявка живёт
+            # сутки, а уникальный индекс — вечно, и после истечения ключа
+            # (или при пустом Redis) только он не даёт сохранить текст дважды.
             # Уже обработанное сообщение не должно ни сбрасывать таймер, ни
             # доходить до агента второй раз.
             #
