@@ -33,6 +33,8 @@ logger = logging.getLogger("parmangal.outbound")
 
 # chat_id -> item_id объявления (или None, если чат не по объявлению).
 ItemIdLookup = Callable[[str], Awaitable[Optional[str]]]
+# chat_id -> стоит ли на чате ручной hold (app/db/models.py:Chat.manual_hold).
+ManualHoldLookup = Callable[[str], Awaitable[bool]]
 
 
 def is_listing_allowed(item_id: Optional[str], settings: Any) -> bool:
@@ -103,10 +105,12 @@ class OutboundGate:
         client: Any,
         settings: Any,
         item_id_lookup: Optional[ItemIdLookup] = None,
+        manual_hold_lookup: Optional[ManualHoldLookup] = None,
     ):
         self._client = client
         self._settings = settings
         self._item_id_lookup = item_id_lookup
+        self._manual_hold_lookup = manual_hold_lookup
 
     # -- решение -----------------------------------------------------------
 
@@ -128,6 +132,25 @@ class OutboundGate:
         (`AVITO_ALLOW_CHATS_WITHOUT_ITEM`), второе означает, что проверка не
         отработала, и подменять её результат догадкой нельзя.
         """
+        if self._manual_hold_lookup is not None:
+            try:
+                if await self._manual_hold_lookup(chat_id):
+                    logger.info(
+                        "outbound: заблокировано — ручной hold",
+                        extra={"chat_id": chat_id},
+                    )
+                    return False
+            except Exception:
+                # Как и с item_id ниже: сбой проверки — это запрет, а не
+                # разрешение. Chat.manual_hold ставят именно на инцидент —
+                # молча пропустить отправку из-за упавшего SELECT было бы
+                # ровно той ошибкой, ради которой hold и заводили.
+                logger.exception(
+                    "outbound: не удалось проверить manual_hold — отправка заблокирована",
+                    extra={"chat_id": chat_id},
+                )
+                return False
+
         if self._filter_is_off():
             return True
 

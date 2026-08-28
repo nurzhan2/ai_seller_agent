@@ -390,7 +390,12 @@ async def lifespan(app: FastAPI):
     # физически не мог обойти белый список объявлений (см. докстринг
     # app/channels/outbound_gate.py: касание уже однажды ушло клиенту,
     # которому агент писать не должен).
-    outbound = OutboundGate(avito_client, settings, dialog_store.get_chat_item_id)
+    outbound = OutboundGate(
+        avito_client,
+        settings,
+        dialog_store.get_chat_item_id,
+        dialog_store.get_chat_manual_hold,
+    )
 
     touch_store = SqlAlchemyTouchStore(get_sessionmaker())
     touch_sender = build_touch_sender(settings, ops_service, ops_bot, outbound)

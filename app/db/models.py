@@ -81,6 +81,12 @@ class Chat(Base):
     # Operator took the wheel; the agent stays silent until this clears.
     is_human_takeover: Mapped[bool] = mapped_column(Boolean, default=False)
     ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Ручной hold, отдельный от is_human_takeover: снимается ТОЛЬКО вручную,
+    # никаким кулдауном или таймером не очищается (в отличие от
+    # is_human_takeover, чья семантика меняется в отдельной работе на
+    # 15-минутный кулдаун — см. incident-заметку 2026-08-27/28). Проверяется
+    # в единственной точке выхода исходящих — app/channels/outbound_gate.py.
+    manual_hold: Mapped[bool] = mapped_column(Boolean, default=False)
     agent_reply_count: Mapped[int] = mapped_column(Integer, default=0)
     takeover_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

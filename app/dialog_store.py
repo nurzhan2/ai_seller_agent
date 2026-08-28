@@ -58,6 +58,7 @@ class ChatRecord:
     buyer_name: Optional[str] = None
     is_human_takeover: bool = False
     ai_enabled: bool = True
+    manual_hold: bool = False
     agent_reply_count: int = 0
 
 
@@ -95,6 +96,8 @@ class DialogStore(Protocol):
     # имеем ли мы право писать в этот чат. `get_or_create_chat` тут не
     # годится — проверка перед отправкой не должна заводить строку в базе.
     async def get_chat_item_id(self, chat_id: str) -> Optional[str]: ...
+
+    async def get_chat_manual_hold(self, chat_id: str) -> bool: ...
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
@@ -139,6 +142,7 @@ class InMemoryDialogStore:
                 buyer_name=existing.buyer_name or buyer_name,
                 is_human_takeover=existing.is_human_takeover,
                 ai_enabled=existing.ai_enabled,
+                manual_hold=existing.manual_hold,
                 agent_reply_count=existing.agent_reply_count,
             )
             self.chats[chat_id] = updated
@@ -242,6 +246,10 @@ class InMemoryDialogStore:
         existing = self.chats.get(chat_id)
         return existing.item_id if existing else None
 
+    async def get_chat_manual_hold(self, chat_id: str) -> bool:
+        existing = self.chats.get(chat_id)
+        return existing.manual_hold if existing else False
+
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         return self.item_zones.get(item_id)
 
@@ -314,6 +322,7 @@ class SqlAlchemyDialogStore:
                 buyer_name=chat.buyer_name,
                 is_human_takeover=chat.is_human_takeover,
                 ai_enabled=chat.ai_enabled,
+                manual_hold=chat.manual_hold,
                 agent_reply_count=chat.agent_reply_count,
             )
 
@@ -487,6 +496,25 @@ class SqlAlchemyDialogStore:
                     select(Chat.item_id).where(Chat.chat_id == chat_id)
                 )
             ).scalar_one_or_none()
+
+    async def get_chat_manual_hold(self, chat_id: str) -> bool:
+        """Ручной hold — для `OutboundGate` перед отправкой клиенту.
+
+        Отдельный SELECT по той же причине, что и у `get_chat_item_id`:
+        проверка права писать не должна заводить строку в базе. Отсутствие
+        чата означает «hold не ставили» — False, а не отказ в отправке.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Chat
+
+        async with self._session_factory() as session:
+            value = (
+                await session.execute(
+                    select(Chat.manual_hold).where(Chat.chat_id == chat_id)
+                )
+            ).scalar_one_or_none()
+            return bool(value)
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         """Реализация `ItemZoneLookup` — какому объявлению какая зона
