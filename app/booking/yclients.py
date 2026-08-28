@@ -353,10 +353,13 @@ class YClientsProvider:
     # -- бронирование ------------------------------------------------------
 
     async def create_booking(self, request: BookingRequest) -> BookingResult:
-        """Реализовано, но к агенту НЕ подключено.
+        """Подключено к агенту — вызывается из
+        `app/agent/tools.py:_tool_create_booking`, когда включён
+        `AUTO_BOOKING_ENABLED`.
 
-        AUTO_BOOKING_ENABLED остаётся False до стабильных метрик модерации:
-        неверная автобронь стоит дороже, чем неотвеченное сообщение.
+        AUTO_BOOKING_ENABLED выключен по умолчанию (см. app/config.py):
+        аудит 2026-08-28 показал, что этот метод ставит реальную запись в
+        YCLIENTS без единой проверки оплаты — только занятости.
         """
         row = self.mapping.get(request.zone_id)
         if row is None:

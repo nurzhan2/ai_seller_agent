@@ -921,9 +921,11 @@ async def _executor_with_quote(kb, provider, hours=3, **kw):
     return ex
 
 
-async def test_booking_is_created_and_rechecked_first(kb):
+async def test_booking_is_created_and_rechecked_first(kb, monkeypatch):
     """Перед постановкой занятость спрашивается ЗАНОВО: между «свободно»
     пять реплик назад и этой секундой слот мог уйти."""
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     ex = await _executor_with_quote(kb, provider)
     await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-08-29",
@@ -938,10 +940,12 @@ async def test_booking_is_created_and_rechecked_first(kb):
     assert len(provider.bookings) == 1
 
 
-async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb):
+async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb, monkeypatch):
     """Первый ответ FREE, второй BUSY — ровно гонка, ради которой
     перепроверка и существует. Бронь ставиться не должна."""
     from app.booking.base import AvailabilityStatus
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider(statuses=[AvailabilityStatus.FREE, AvailabilityStatus.BUSY])
     ex = await _executor_with_quote(kb, provider)
     # Агент сказал клиенту «свободно» — это первый ответ провайдера.
@@ -958,9 +962,11 @@ async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb):
     assert "Не эскалируй" in result["instruction"]
 
 
-async def test_booking_blocks_occupied_hours_not_paid_ones(kb):
+async def test_booking_blocks_occupied_hours_not_paid_ones(kb, monkeypatch):
     """Акция «6-й час в подарок»: гость занимает 6 часов, платит за 5.
     Заблокировать 5 значит отдать шестой час другому клиенту."""
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     ex = await _executor_with_quote(kb, provider, hours=6)
     assert ex.last_quote.billable_hours == 5 and ex.last_quote.occupied_hours == 6
@@ -972,7 +978,9 @@ async def test_booking_blocks_occupied_hours_not_paid_ones(kb):
     assert result["occupied_hours"] == 6
 
 
-async def test_booking_is_written_to_our_db_with_both_hour_counts(kb):
+async def test_booking_is_written_to_our_db_with_both_hour_counts(kb, monkeypatch):
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     sink = _BookingSink()
     ex = await _executor_with_quote(kb, provider, hours=6, booking_sink=sink)
@@ -987,7 +995,9 @@ async def test_booking_is_written_to_our_db_with_both_hour_counts(kb):
     assert saved["applied_promo"] == "sixth_hour_free"
 
 
-async def test_booking_notifies_the_operator(kb):
+async def test_booking_notifies_the_operator(kb, monkeypatch):
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     notices = []
 
@@ -1002,9 +1012,12 @@ async def test_booking_notifies_the_operator(kb):
     assert notices[0]["zone_id"] == "bath_russian"
 
 
-async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb):
+async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb, monkeypatch):
     """Бронь уже в YCLIENTS. Уронить ход из-за нашей таблицы — оставить
     клиента без подтверждения при существующей броне."""
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
+
     class _BrokenSink:
         async def save(self, **record):
             raise RuntimeError("БД недоступна")
@@ -1017,8 +1030,10 @@ async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb):
     assert result["booked"] is True
 
 
-async def test_booking_requires_a_price_quote_first(kb):
+async def test_booking_requires_a_price_quote_first(kb, monkeypatch):
     """Без котировки неизвестны часы занятости — гадать их нельзя."""
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: date(2026, 8, 27))
 
@@ -1055,6 +1070,8 @@ async def test_booking_failure_is_never_reported_as_success(kb):
     assert "escalate_to_human" in result["instruction"]
 
 
-def test_auto_booking_is_on_by_default():
+def test_auto_booking_is_off_by_default():
+    """Выключено с 2026-08-28: create_booking ставит реальную запись в
+    YCLIENTS без проверки оплаты — см. app/config.py:auto_booking_enabled."""
     from app.config import Settings
-    assert Settings().auto_booking_enabled is True
+    assert Settings().auto_booking_enabled is False
