@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -299,3 +300,64 @@ def test_lifespan_kb_reload_updates_agent_loop_and_pipeline():
     assert state.kb is new_kb
     assert state.pipeline.agent_loop.kb is new_kb
     assert state.pipeline.kb is new_kb
+
+
+# --------------------------------------------------------------------------
+# AUTO_BOOKING_ENABLED в стартовом логе
+# --------------------------------------------------------------------------
+#
+# Флаг читается лениво, в момент вызова инструмента
+# (app/agent/tools.py:_tool_create_booking), поэтому до первой попытки брони
+# он никак себя не проявляет. Оба состояния обязаны быть в логе старта:
+# «выключено» — чтобы отсутствие переменной не читалось как «забыли на
+# деплое» (ровно тот класс ошибки, что уже стоил 65 сообщений), «включено» —
+# чтобы включение без проверки оплаты нельзя было проглядеть.
+
+
+def _startup_log(monkeypatch, value):
+    """Возвращает WARNING'и старта при заданном AUTO_BOOKING_ENABLED.
+
+    Не через `caplog`: `configure_logging()` в lifespan делает
+    `root.handlers = [stream_handler]` (app/logging_setup.py) и сносит
+    хендлер caplog вместе со всем остальным. Свой хендлер вешаем на сам
+    логгер "parmangal" — его настройка приложения не трогает.
+    """
+    from app.config import get_settings
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Collect(level=logging.WARNING)
+    app_logger = logging.getLogger("parmangal")
+
+    monkeypatch.setenv("AUTO_BOOKING_ENABLED", value)
+    get_settings.cache_clear()
+    app_logger.addHandler(handler)
+    try:
+        _real_app_state()
+    finally:
+        app_logger.removeHandler(handler)
+        get_settings.cache_clear()
+
+    return chr(10).join(r.getMessage() for r in records)
+
+
+def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
+    """Выключенное автобронирование обязано быть НАПИСАНО в логе, а не
+    выводиться из отсутствия переменной."""
+    text = _startup_log(monkeypatch, "false")
+
+    assert "AUTO_BOOKING_ENABLED=false" in text
+    assert "проверка оплаты" in text
+
+
+def test_startup_warns_that_auto_booking_is_enabled(monkeypatch):
+    """Включённое автобронирование — не «всё в порядке», а состояние, в
+    котором бронь ставится без проверки оплаты. Тоже WARNING, не info."""
+    text = _startup_log(monkeypatch, "true")
+
+    assert "AUTO_BOOKING_ENABLED=true" in text
+    assert "БЕЗ проверки оплаты" in text
