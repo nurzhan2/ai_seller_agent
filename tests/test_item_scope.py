@@ -75,6 +75,31 @@ def test_unrelated_titles_are_denied(title):
     assert reason == "title_matches_deny"
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "1-к. апартаменты, 36,6 м², 1/2 эт.",                       # реальный заголовок, 8012379561
+        'Глемпинг "4 стихии" - 45 соток',                            # реальный заголовок, 7948766358 ("е", не "э")
+        "Горничная в загородный комплекс (с проживанием)",           # реальный заголовок, 8236753856
+        "Рабочий по обслуживанию зданий и территорий",               # реальный заголовок, 8236127647
+        "Готовый арендный бизнес с якорем Пятёрочка",                # реальный заголовок, 8076019723
+        "Бизнес в аренду, готовое помещение",
+        "Требуется уборщица, полная занятость",
+        "В штат требуется персонал",
+        "Продажа бизнеса под ключ",
+        'Банный комплекс "Чайка" инвестиционная возможность',        # реальный заголовок, 7948732527
+        "Ищем инвестиции в развитие комплекса",
+    ],
+)
+def test_newly_found_unrelated_titles_are_denied(title):
+    """Классы, найденные живым прогоном scripts/sync_item_scope.py
+    2026-08-28 против прода (55 объявлений, 1100 чатов): реальные заголовки
+    аккаунта, которые раньше проходили как no_keyword_match (allow)."""
+    decision, reason = classify_title(title)
+    assert decision == DENY
+    assert reason == "title_matches_deny"
+
+
 def test_unknown_title_defaults_to_allow():
     """Ни один список не матчит — allow, а не тишина. Тот же принцип, что у
     AVITO_BLOCKED_ITEMS: список deny — основной инструмент, отсутствие
@@ -102,7 +127,7 @@ def test_deny_wins_when_a_title_matches_both_lists():
 # --------------------------------------------------------------------------
 # Требование 6: жёсткий deny побеждает allow-классификацию ПРИ ЛЮБОМ
 # заголовке — включая тот самый живой случай, где чистая классификация по
-# словам ошиблась бы: «Продажа банного комплекса» содержит слово «банный».
+# словам ошиблась бы: «Банный комплекс, продажа...» содержит слово «банный».
 # --------------------------------------------------------------------------
 
 HARD_DENIED_ITEM = "7980739861"  # продажа банного комплекса — из DEFAULT_BLOCKED_ITEMS
@@ -110,7 +135,7 @@ HARD_DENIED_ITEM = "7980739861"  # продажа банного комплек�
 @pytest.mark.parametrize(
     "title",
     [
-        "Продажа банного комплекса, участок 15 соток",  # матчит allow-слово "банный"
+        "Банный комплекс, продажа участка 15 соток",  # матчит allow-слово "банный"
         "Баня, сауна, парная — весь комплекс целиком",   # матчит сразу три allow-слова
         "Вакансия менеджера по продажам",                 # матчит deny-слово
         "Подставка для чайника Tefal KI270",              # не матчит ничего
@@ -133,6 +158,51 @@ async def test_resolver_hard_blocklist_beats_any_title_classification():
 
     for title in ("Баня, сауна, парная — весь комплекс целиком", None, "Подставка для чайника"):
         row = await resolver.resolve(HARD_DENIED_ITEM, known_title=title)
+        assert row.decision == DENY
+        assert row.reason == "hard_blocklist"
+
+
+# Второе объявление о продаже ВСЕГО комплекса, найденное живым прогоном
+# scripts/sync_item_scope.py 2026-08-28 против прода: «Банный комплекс
+# "Чайка" инвестиционная возможность» — тоже матчит allow-слово «банный»,
+# и без хардкода получило бы allow ровно как и 7980739861 выше. Реальный
+# заголовок теперь ДОПОЛНИТЕЛЬНО матчит и новое deny-слово «инвестиционная
+# возможность» (пункт 1 правки) — поэтому для проверки «без хардкода
+# классификация ошиблась бы» ниже используется короткий синтетический
+# вариант заголовка БЕЗ этого слова: хардкод по id остаётся нужен для
+# любой будущей переформулировки того же объявления, а не только для уже
+# виденной сегодня.
+SECOND_HARD_DENIED_ITEM = "7948732527"
+
+
+def test_both_complex_sale_listings_deny_despite_the_banny_allow_word():
+    """DEFAULT_BLOCKED_ITEMS (без единой переменной окружения) — оба
+    объявления о продаже комплекса денятся, хотя оба содержат слово
+    «банный» из allow-списка и НИ ОДНОГО deny-слова."""
+    hard_deny_ids = hard_deny_ids_from_settings(Settings())  # никаких переменных — чистые дефолты
+
+    for item_id, title in (
+        (HARD_DENIED_ITEM, "Банный комплекс, продажа участка 15 соток"),
+        (SECOND_HARD_DENIED_ITEM, "Банный комплекс «Чайка», продажа целиком"),
+    ):
+        decision, reason = classify_listing(item_id, title, hard_deny_ids)
+        assert decision == DENY, f"{item_id} должен денаться жёстким блок-листом"
+        assert reason == "hard_blocklist"
+        # Заголовок и правда матчит ТОЛЬКО allow-слово, ни одного deny —
+        # иначе тест ничего не доказывает: без хардкода по id классификация
+        # ошибочно открыла бы оба объявления.
+        assert classify_title(title) == (ALLOW, "title_matches_allow")
+
+
+async def test_both_complex_sale_listings_deny_through_the_resolver():
+    settings = Settings()  # DEFAULT_BLOCKED_ITEMS как есть, без переменных
+    resolver = ItemScopeResolver(InMemoryItemScopeStore(), settings)
+
+    for item_id, title in (
+        (HARD_DENIED_ITEM, "Банный комплекс, продажа участка 15 соток"),
+        (SECOND_HARD_DENIED_ITEM, 'Банный комплекс "Чайка" инвестиционная возможность'),
+    ):
+        row = await resolver.resolve(item_id, known_title=title)
         assert row.decision == DENY
         assert row.reason == "hard_blocklist"
 

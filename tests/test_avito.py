@@ -543,11 +543,15 @@ def test_blocklist_values_are_strings_not_numbers():
     assert all(isinstance(item, str) for item in parsed)
 
 
-def test_default_blocklist_holds_the_five_known_foreign_listings():
+def test_default_blocklist_holds_the_known_foreign_listings():
+    """7948732527 — второе объявление о продаже всего комплекса, найденное
+    живым прогоном scripts/sync_item_scope.py 2026-08-28 против прода (см.
+    app/config.py:DEFAULT_BLOCKED_ITEMS)."""
     from app.config import DEFAULT_BLOCKED_ITEMS
 
     assert set(DEFAULT_BLOCKED_ITEMS) == {
         "8204183112", "8076244626", "8076019723", "7980739861", "8172444564",
+        "7948732527",
     }
 
 

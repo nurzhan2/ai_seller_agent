@@ -142,11 +142,13 @@ async def test_a_listing_outside_the_blocklist_passes():
     assert client.sent == [("chat-1", "Здравствуйте!")]
 
 
-async def test_the_five_default_blocked_listings_are_blocked_without_any_env_var():
+async def test_the_default_blocked_listings_are_blocked_without_any_env_var():
     """Переменную могут забыть выставить на новом стенде — тогда посторонние
-    объявления снова начнут получать прайс на бани. Пять id зашиты
-    значением по умолчанию именно поэтому."""
-    for item_id in ("8204183112", "8076244626", "8076019723", "7980739861", "8172444564"):
+    объявления снова начнут получать прайс на бани. DEFAULT_BLOCKED_ITEMS
+    зашит значением по умолчанию именно поэтому."""
+    from app.config import DEFAULT_BLOCKED_ITEMS
+
+    for item_id in DEFAULT_BLOCKED_ITEMS:
         async def lookup(chat_id: str, _item=item_id):
             return _item
 
