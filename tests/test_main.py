@@ -314,8 +314,10 @@ def test_lifespan_kb_reload_updates_agent_loop_and_pipeline():
 # чтобы включение без проверки оплаты нельзя было проглядеть.
 
 
-def _startup_log(monkeypatch, value):
-    """Возвращает WARNING'и старта при заданном AUTO_BOOKING_ENABLED.
+def _startup_log(monkeypatch, env, level=logging.WARNING):
+    """Возвращает строки стартового лога при заданных переменных окружения.
+
+    `env` — словарь переменных, `level` — минимальный уровень записи.
 
     Не через `caplog`: `configure_logging()` в lifespan делает
     `root.handlers = [stream_handler]` (app/logging_setup.py) и сносит
@@ -330,16 +332,22 @@ def _startup_log(monkeypatch, value):
         def emit(self, record):
             records.append(record)
 
-    handler = _Collect(level=logging.WARNING)
+    handler = _Collect(level=level)
     app_logger = logging.getLogger("parmangal")
+    # Логгер приложения по умолчанию наследует уровень root; если тест ждёт
+    # INFO, а root настроен строже, запись до хендлера просто не дойдёт.
+    previous_level = app_logger.level
+    app_logger.setLevel(level)
 
-    monkeypatch.setenv("AUTO_BOOKING_ENABLED", value)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
     get_settings.cache_clear()
     app_logger.addHandler(handler)
     try:
         _real_app_state()
     finally:
         app_logger.removeHandler(handler)
+        app_logger.setLevel(previous_level)
         get_settings.cache_clear()
 
     return chr(10).join(r.getMessage() for r in records)
@@ -348,7 +356,7 @@ def _startup_log(monkeypatch, value):
 def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
     """Выключенное автобронирование обязано быть НАПИСАНО в логе, а не
     выводиться из отсутствия переменной."""
-    text = _startup_log(monkeypatch, "false")
+    text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "false"})
 
     assert "AUTO_BOOKING_ENABLED=false" in text
     assert "проверка оплаты" in text
@@ -357,7 +365,45 @@ def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
 def test_startup_warns_that_auto_booking_is_enabled(monkeypatch):
     """Включённое автобронирование — не «всё в порядке», а состояние, в
     котором бронь ставится без проверки оплаты. Тоже WARNING, не info."""
-    text = _startup_log(monkeypatch, "true")
+    text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "true"})
 
     assert "AUTO_BOOKING_ENABLED=true" in text
     assert "БЕЗ проверки оплаты" in text
+
+
+# --------------------------------------------------------------------------
+# OUTBOUND_DAILY_LIMIT в стартовом логе
+# --------------------------------------------------------------------------
+#
+# Тот же принцип, что у автобронирования: состояние читается из лога, а не
+# выводится из наличия переменной. Асимметрия по уровню намеренная —
+# выключенный лимит (`0`) это WARNING, потому что снятый потолок исходящих
+# ничем себя не проявит, пока не уйдёт лишняя тысяча сообщений; настроенный
+# лимит достаточно показать числом в INFO, иначе WARNING перестанет что-либо
+# значить.
+
+
+def test_startup_warns_when_the_daily_limit_is_switched_off(monkeypatch):
+    text = _startup_log(monkeypatch, {"OUTBOUND_DAILY_LIMIT": "0"})
+
+    assert "OUTBOUND_DAILY_LIMIT=0" in text
+    assert "ОТКЛЮЧЁН" in text
+
+
+def test_startup_names_the_daily_limit_when_it_is_set(monkeypatch):
+    """Настроенный лимит тоже виден: без этой строки «300» и «лимита нет»
+    выглядят в логе одинаково — никак."""
+    text = _startup_log(
+        monkeypatch, {"OUTBOUND_DAILY_LIMIT": "300"}, level=logging.INFO,
+    )
+
+    assert "OUTBOUND_DAILY_LIMIT=300" in text
+    assert "ОТКЛЮЧЁН" not in text
+
+
+def test_a_set_daily_limit_is_not_a_warning(monkeypatch):
+    """Обратная сторона той же асимметрии: нормально настроенный лимит не
+    должен попадать в WARNING'и, иначе они обесцениваются."""
+    warnings = _startup_log(monkeypatch, {"OUTBOUND_DAILY_LIMIT": "300"})
+
+    assert "OUTBOUND_DAILY_LIMIT" not in warnings

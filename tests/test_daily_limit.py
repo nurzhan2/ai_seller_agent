@@ -171,3 +171,58 @@ async def test_redis_failure_is_distinct_from_limit_exceeded():
     result = await daily_limit.check_and_increment(BrokenRedis(), limit=1, now=NOW)
     assert result.redis_unavailable is True
     assert result.just_exceeded is False
+
+
+# --------------------------------------------------------------------------
+# Дефолт настройки: потолок, а не «выключено»
+# --------------------------------------------------------------------------
+#
+# `limit <= 0` выключает проверку целиком (тесты выше), поэтому 0 в дефолте
+# означал бы «забыли переменную на деплое — потолка исходящих нет». Ровно
+# тот класс ошибки, что уже стоил 65 сообщений: пустой AVITO_BLOCKED_ITEMS и
+# незаданный AGENT_MIN_INBOUND_TS читались так же. Дефолт обязан быть
+# работающим лимитом, а выключение — осознанным нулём.
+
+
+def _settings_without_the_variable(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.delenv("OUTBOUND_DAILY_LIMIT", raising=False)
+    # _env_file=None: иначе pydantic-settings подхватит .env разработчика и
+    # тест начнёт проверять чужую машину вместо дефолта в коде.
+    return Settings(_env_file=None)
+
+
+def test_default_limit_is_a_working_ceiling_not_disabled(monkeypatch):
+    settings = _settings_without_the_variable(monkeypatch)
+
+    assert settings.outbound_daily_limit > 0, (
+        "дефолт 0 означает «лимита нет» — забытая переменная тихо снимает "
+        "потолок исходящих целиком"
+    )
+    assert settings.outbound_daily_limit == 300
+
+
+async def test_the_default_actually_blocks_at_its_own_ceiling(monkeypatch):
+    """Не только «> 0» на бумаге: дефолт прогоняется через ту же проверку,
+    что и живой гейт, и на (N+1)-м сообщении действительно закрывается."""
+    settings = _settings_without_the_variable(monkeypatch)
+    limit = settings.outbound_daily_limit
+    redis = FakeRedis()
+
+    for _ in range(limit):
+        assert (await daily_limit.check_and_increment(redis, limit, NOW)).allowed
+
+    over = await daily_limit.check_and_increment(redis, limit, NOW)
+    assert over.allowed is False
+    assert over.just_exceeded is True
+
+
+def test_zero_remains_available_as_an_explicit_opt_out(monkeypatch):
+    """Ноль не запрещён — он перестал быть ДЕФОЛТОМ. Явно выставленный
+    OUTBOUND_DAILY_LIMIT=0 по-прежнему выключает лимит (о чём app/main.py
+    кричит WARNING при старте — см. tests/test_main.py)."""
+    from app.config import Settings
+
+    monkeypatch.setenv("OUTBOUND_DAILY_LIMIT", "0")
+    assert Settings(_env_file=None).outbound_daily_limit == 0
