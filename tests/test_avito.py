@@ -544,14 +544,18 @@ def test_blocklist_values_are_strings_not_numbers():
 
 
 def test_default_blocklist_holds_the_known_foreign_listings():
-    """7948732527 — второе объявление о продаже всего комплекса, найденное
-    живым прогоном scripts/sync_item_scope.py 2026-08-28 против прода (см.
+    """7948732527 — второе объявление о продаже всего комплекса. Пять
+    остальных ниже — no_keyword_match объявления, денутся по id БЕЗ новых
+    ключевых слов (решение заказчика 2026-08-29, чтобы не рисковать ложным
+    deny будущих объявлений комплекса). Все найдены живым прогоном
+    scripts/sync_item_scope.py против прода (см.
     app/config.py:DEFAULT_BLOCKED_ITEMS)."""
     from app.config import DEFAULT_BLOCKED_ITEMS
 
     assert set(DEFAULT_BLOCKED_ITEMS) == {
         "8204183112", "8076244626", "8076019723", "7980739861", "8172444564",
         "7948732527",
+        "7980333044", "8236197068", "7980615746", "8076853804", "7948469179",
     }
 
 
