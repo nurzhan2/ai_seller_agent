@@ -33,6 +33,16 @@ from app.pricing.quote_gate import apply_dialog_floor
 
 logger = logging.getLogger("parmangal.tools")
 
+# Причина эскалации на этапе оплаты. Один текст на код, карточку оператору
+# и лог — чтобы «оплата» не расползлась по проекту тремя формулировками.
+#
+# ВАЖНО для будущей чистки эскалаций: этот повод звать человека —
+# РАЗРЕШЁННЫЙ, второй после ценовых уступок. Решение заказчика: агент не
+# ставит бронь сам, он доводит диалог до оплаты и передаёт оператору.
+# Снимать его вместе с «лишними» эскалациями нельзя — без него агент
+# останется на этапе оплаты один.
+PAYMENT_HANDOFF_REASON = "этап оплаты — бронь в календаре ставит оператор"
+
 
 # --------------------------------------------------------------------------
 # Схемы инструментов для Anthropic API
@@ -194,13 +204,18 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "create_booking",
         "description": (
-            "Поставить бронь в системе бронирования. Вызывай ТОЛЬКО когда "
+            "Передать собранную бронь дальше: либо в систему бронирования, "
+            "либо менеджеру — решает инструмент, не ты. Вызывай ТОЛЬКО когда "
             "клиент подтвердил всё сразу: зону, дату, время начала и "
             "длительность, и оставил имя с телефоном. До этого — не вызывай. "
-            "Перед постановкой инструмент сам перепроверяет занятость, "
-            "поэтому отдельный check_availability прямо перед ним не нужен. "
-            "Если вернулось booked=false — брони НЕТ: скажи клиенту ровно то, "
-            "что написано в instruction, и не выдавай это за подтверждённую бронь."
+            "Перед этим инструмент сам перепроверяет занятость, поэтому "
+            "отдельный check_availability прямо перед ним не нужен. "
+            "booked=true — время придержано. booked=false — брони НЕТ: скажи "
+            "клиенту ровно то, что написано в instruction, и не выдавай это за "
+            "подтверждённую бронь. Отдельный случай "
+            "status=\"handed_off_to_operator\": данные ушли менеджеру, он "
+            "свяжется с клиентом и поставит бронь сам — это нормальный исход, "
+            "а не сбой."
         ),
         "input_schema": {
             "type": "object",
@@ -410,6 +425,7 @@ class ToolExecutor:
         today_fn: Callable[[], DateType] = DateType.today,
         booking_sink: Any = None,
         booking_notifier: Any = None,
+        booking_handoff_notifier: Any = None,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
@@ -446,6 +462,17 @@ class ToolExecutor:
         # уведомление важны, но они ПОСЛЕ факта, а не условие для него.
         self.booking_sink = booking_sink
         self.booking_notifier = booking_notifier
+        # Отдельный колбэк, а не тот же booking_notifier с флагом в записи:
+        # это уведомления о ПРОТИВОПОЛОЖНЫХ событиях. `booking_notifier` —
+        # «бронь уже стоит, подтверждать нечего», а этот — «брони нет и не
+        # будет, пока вы её не поставите руками». Путать их в одном
+        # обработчике значит рано или поздно отправить оператору не тот
+        # текст. None (тесты, харнесс) не отменяет ни передачу, ни
+        # эскалацию: карточка — способ доставки, а не условие.
+        self.booking_handoff_notifier = booking_handoff_notifier
+        # Последняя карточка передачи оператору за ход. Нужна конвейеру и
+        # тестам, чтобы увидеть ПОЛЯ карточки, а не только факт вызова.
+        self.booking_handoff: Optional[dict] = None
         self.escalated = False
         self.escalation_reason: Optional[str] = None
         self.last_quote: Optional[PriceQuote] = None
@@ -902,17 +929,23 @@ class ToolExecutor:
     # -- бронирование ---------------------------------------------------------
 
     async def _tool_create_booking(self, args: dict) -> dict:
-        """Ставит бронь — но только после ПОВТОРНОЙ проверки занятости.
+        """Ставит бронь — но только после ПОВТОРНОЙ проверки занятости, и
+        только если этап оплаты не передан живому оператору.
 
         Порядок здесь целиком про то, чтобы не подтвердить клиенту бронь,
         которой нет:
 
+        0. `payment.handoff_on_payment_step` из app/kb/payment.yaml — при
+           true агент до YCLIENTS не доходит НИКОГДА: бронь в календаре
+           ставит человек, а инструмент собирает оператору карточку и
+           поднимает эскалацию (см. `_hand_booking_to_operator`);
         1. рубильник AUTO_BOOKING_ENABLED — выключен, значит бронь ставит
            человек, и агент не должен обещать её сам;
         2. цена должна быть посчитана в этом же диалоге. Не ради денег: из
            котировки берутся ЧАСЫ ЗАНЯТОСТИ (при акции «6-й час в подарок»
            их 6, а оплаченных 5) — блокировать оплаченные значит отдать
-           шестой час другому клиенту;
+           шестой час другому клиенту. При передаче оператору котировка
+           нужна не меньше: из неё же берутся сумма и предоплата в карточку;
         3. занятость перепроверяется ЗАНОВО, мимо кеша хода: между «свободно»
            пять реплик назад и этой секундой слот мог уйти;
         4. и только потом — запись в YCLIENTS, в нашу БД и уведомление
@@ -922,22 +955,33 @@ class ToolExecutor:
         формулировкой: инструмент никогда не отдаёт «успех» без реальной
         брони.
         """
-        if not get_settings().auto_booking_enabled:
-            return {
-                "booked": False,
-                "instruction": (
-                    "Автобронирование выключено. Скажи, что придержишь время и "
-                    "менеджер подтвердит, и вызови escalate_to_human."
-                ),
-            }
-        if self.booking_provider is None:
-            return {
-                "booked": False,
-                "instruction": (
-                    "Система бронирования недоступна. Скажи, что уточнишь у "
-                    "менеджера, и вызови escalate_to_human."
-                ),
-            }
+        # Флаг читается ЗДЕСЬ, на границе перед вызовом провайдера, а не в
+        # системном промте: промт можно обмануть репликой клиента, границу
+        # в коде — нет. Пока он true, ниже по функции нет ни одной ветки,
+        # которая доходит до booking_provider.create_booking.
+        handoff = self.kb.payment.payment.handoff_on_payment_step
+
+        if not handoff:
+            # Оба рубильника ниже отвечают на вопрос «можно ли агенту
+            # ставить бронь самому». При handoff этот вопрос уже решён —
+            # нельзя, — и отвечать на него отказом «уточню у менеджера»
+            # вместо готовой карточки оператору было бы хуже для всех.
+            if not get_settings().auto_booking_enabled:
+                return {
+                    "booked": False,
+                    "instruction": (
+                        "Автобронирование выключено. Скажи, что придержишь время и "
+                        "менеджер подтвердит, и вызови escalate_to_human."
+                    ),
+                }
+            if self.booking_provider is None:
+                return {
+                    "booked": False,
+                    "instruction": (
+                        "Система бронирования недоступна. Скажи, что уточнишь у "
+                        "менеджера, и вызови escalate_to_human."
+                    ),
+                }
 
         booking_date = _parse_date(args.get("date"))
         start_time = _parse_time(args.get("start_time"))
@@ -980,16 +1024,11 @@ class ToolExecutor:
         availability = await self._availability_for(
             zone_id, booking_date, start_time, occupied_hours
         )
-        if availability is None or not availability.is_known:
-            return {
-                "booked": False,
-                "status": "unknown",
-                "instruction": (
-                    "Занятость сейчас не подтверждается — бронь НЕ поставлена. "
-                    "Скажи, что уточнишь у менеджера, и вызови escalate_to_human."
-                ),
-            }
-        if availability.status.value == "busy":
+        slot_is_known = availability is not None and availability.is_known
+        if slot_is_known and availability.status.value == "busy":
+            # Проверяется и при передаче оператору тоже: сажать человека за
+            # бронь на уже занятый слот незачем, а клиенту куда полезнее
+            # услышать альтернативу прямо сейчас, чем «менеджер свяжется».
             return {
                 "booked": False,
                 "status": "busy",
@@ -1000,6 +1039,31 @@ class ToolExecutor:
                     "и предложи ближайшие свободные даты. Не эскалируй."
                 ),
             }
+        if not slot_is_known and not handoff:
+            return {
+                "booked": False,
+                "status": "unknown",
+                "instruction": (
+                    "Занятость сейчас не подтверждается — бронь НЕ поставлена. "
+                    "Скажи, что уточнишь у менеджера, и вызови escalate_to_human."
+                ),
+            }
+
+        if handoff:
+            # Единственный выход из функции при handoff, кроме отказов выше.
+            # Ниже этой строки — вызов YCLIENTS, и сюда мы его не пускаем.
+            # «Занятость неизвестна» здесь не блокирует: бронь всё равно
+            # ставит человек, календарь он видит сам, и в карточке об этом
+            # написано отдельной строкой.
+            return await self._hand_booking_to_operator(
+                args=args,
+                zone_id=zone_id,
+                booking_date=booking_date,
+                start_time=start_time,
+                occupied_hours=int(occupied_hours),
+                quote=quote_for_hours,
+                slot_is_known=slot_is_known,
+            )
 
         from app.booking.base import BookingRequest
 
@@ -1073,19 +1137,126 @@ class ToolExecutor:
             ),
         }
 
+    async def _hand_booking_to_operator(
+        self,
+        *,
+        args: dict,
+        zone_id: str,
+        booking_date: DateType,
+        start_time: TimeType,
+        occupied_hours: int,
+        quote: PriceQuote,
+        slot_is_known: bool,
+    ) -> dict:
+        """Этап оплаты: бронь не ставится, диалог уходит человеку.
+
+        Заказчик решил так: агент доводит клиента до оплаты и передаёт
+        оператору, бронь в календаре ставит человек. Соответственно здесь
+        не «мягкий отказ», а полноценная передача — карточка со всеми
+        собранными данными и эскалация.
+
+        Карточка собирается ЗДЕСЬ, где все данные уже есть и уже проверены
+        (дата разобрана, котировка посчитана, часы занятости взяты из неё,
+        а не из аргументов модели). Смысл ровно один: чтобы поставить бронь
+        руками, оператору не должно требоваться листать переписку.
+        """
+        card = {
+            "chat_id": self.dialog_id,
+            "zone_id": zone_id,
+            "zone_name": self._zone_name(zone_id),
+            "booking_date": booking_date,
+            "start_time": start_time.strftime("%H:%M"),
+            "occupied_hours": occupied_hours,
+            "billable_hours": quote.billable_hours,
+            "guests": args.get("guests"),
+            "total": quote.total,
+            # Предоплата — из котировки, а не из головы модели: правило её
+            # расчёта живёт в app/pricing/engine.py (первый час у почасовых
+            # зон, фиксированная сумма у суточных).
+            "prepayment": quote.prepayment,
+            "client_name": args.get("client_name"),
+            "client_phone": args.get("client_phone"),
+            "comment": args.get("comment"),
+            "applied_promo": quote.applied_promo,
+            # Занятость на момент передачи. False — провайдер не ответил;
+            # оператор обязан увидеть это словами, а не принять молчание за
+            # «свободно».
+            "slot_confirmed_free": slot_is_known,
+        }
+        self.booking_handoff = card
+        # Эскалация ставится ДО отправки карточки: недоступный Telegram не
+        # должен превращать передачу в обычный ход агента.
+        self.escalated = True
+        self.escalation_reason = PAYMENT_HANDOFF_REASON
+
+        if self.booking_handoff_notifier is not None:
+            try:
+                await self.booking_handoff_notifier(card)
+            except Exception:
+                # Карточка — не единственный канал: чат уже помечен
+                # эскалированным, и оператор увидит его и в карточке
+                # диалога, и в админке. Ронять ход из-за Telegram нельзя.
+                logger.exception(
+                    "booking handoff card was not delivered",
+                    extra={"chat_id": self.dialog_id},
+                )
+
+        logger.info(
+            "booking handed off to an operator",
+            extra={
+                "chat_id": self.dialog_id,
+                "zone_id": zone_id,
+                "booking_date": str(booking_date),
+                "occupied_hours": occupied_hours,
+            },
+        )
+        return {
+            "booked": False,
+            "status": "handed_off_to_operator",
+            "handed_off": True,
+            "prepayment": _jsonable(quote.prepayment),
+            "instruction": (
+                "Бронь НЕ поставлена и агентом не ставится: этап оплаты ведёт "
+                "менеджер, он же ставит бронь в календаре. Скажи клиенту, что "
+                "передала данные менеджеру и он свяжется, чтобы подтвердить "
+                "время и прислать оплату. Сумму предоплаты назвать можно, "
+                "ссылку на оплату и реквизиты — нельзя. Слова «забронировала», "
+                "«бронь подтверждена», «место за вами» запрещены."
+            ),
+        }
+
+    def _zone_name(self, zone_id: str) -> Optional[str]:
+        """Человеческое название зоны для карточки оператору — читать
+        «Русская баня» быстрее, чем сопоставлять bath_russian с календарём."""
+        for zone in self.kb.catalog.zones:
+            if zone.id == zone_id:
+                return zone.name
+        return None
+
     # -- фото ---------------------------------------------------------------
 
     async def _tool_get_photos(self, args: dict) -> dict:
+        """Фотографии зоны — или честное «их нет».
+
+        Пустой ответ и отсутствующий провайдер отвечают ОДИНАКОВО, и это
+        главное в этом инструменте. «Провайдера нет» и «провайдер есть, но
+        по этой зоне пусто» — разные причины с одним следствием: прислать
+        нечего. Разведи их на два разных ответа, и во втором случае модель
+        получит `photos: []` без единого слова о том, что с этим делать, —
+        и пообещает клиенту фото, которых не придёт. В разобранных
+        переписках именно необещанное-и-неприсланное фото обрывало диалоги.
+        """
         zone_id = args.get("zone_id", "")
-        if self.photo_provider is None:
+        photos = await self.photo_provider.get(zone_id) if self.photo_provider else []
+        if not photos:
             return {
                 "photos": [],
+                "count": 0,
                 "instruction": (
                     "Фотографий пока нет в системе. Не обещай прислать их — "
                     "предложи приехать посмотреть территорию."
                 ),
             }
-        photos = await self.photo_provider.get(zone_id)
         return {"photos": photos, "count": len(photos)}
 
     # -- лид ----------------------------------------------------------------

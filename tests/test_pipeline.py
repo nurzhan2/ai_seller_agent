@@ -294,13 +294,20 @@ async def test_duplicate_does_not_reset_the_touch_timer_again():
 async def test_our_own_message_echo_is_ignored():
     """Авито шлёт вебхук и на наши исходящие — без этой проверки агент
     отвечает сам себе по кругу."""
-    pipeline, store, agent, _ = _build()
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+    await store.save_outgoing("chat-1", "наш ответ клиенту", SendStatus.sent)
+    before = len(store.messages["chat-1"])
 
-    await pipeline.handle_message(_payload(author_id=OUR_USER_ID))
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="наш ответ клиенту")
+    )
     await _settle()
 
     assert agent.calls == []
-    assert store.messages == {}
+    assert len(store.messages["chat-1"]) == before, "эхо не должно попадать в историю"
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False, "своё эхо — не перехват"
 
 
 # --------------------------------------------------------------------------
@@ -1707,11 +1714,20 @@ async def test_blocklist_is_checked_before_the_chat_is_created():
 async def test_echo_drop_is_logged(caplog):
     """Единственное место, где сообщение исчезало БЕЗ следа в логе. При
     неверном AVITO_USER_ID сюда уходили бы все входящие подряд, и снаружи
-    это неотличимо от «вебхуки не приходят»."""
+    это неотличимо от «вебхуки не приходят».
+
+    Отправка сохраняется заранее не для красоты: с нашей стороны аккаунта
+    приходят два разных события — эхо нашего же ответа и текст, который
+    менеджер написал руками. Без своей записи в `messages` это сообщение —
+    второе, а не первое, и тест проверял бы не ту ветку."""
     pipeline, store, agent, _ = _build()
+    await store.get_or_create_chat("chat-1")
+    await store.save_outgoing("chat-1", "наш ответ клиенту", SendStatus.sent)
 
     with caplog.at_level("INFO", logger="parmangal.pipeline"):
-        await pipeline.handle_message(_payload(author_id=OUR_USER_ID))
+        await pipeline.handle_message(
+            _payload(author_id=OUR_USER_ID, text="наш ответ клиенту")
+        )
     await _settle()
 
     assert agent.calls == []
@@ -1803,9 +1819,13 @@ async def test_intake_log_fires_even_for_an_echo(caplog):
     иначе при неверном AVITO_USER_ID пропадут вообще все входящие."""
     settings = _settings()
     pipeline, store, agent, _ = _build(settings=settings)
+    await store.get_or_create_chat("c-echo")
+    await store.save_outgoing("c-echo", "наш ответ клиенту", SendStatus.sent)
 
     with caplog.at_level("INFO", logger="parmangal.pipeline"):
-        await pipeline.handle_message(_payload(author_id=OUR_USER_ID, chat_id="c-echo"))
+        await pipeline.handle_message(
+            _payload(author_id=OUR_USER_ID, chat_id="c-echo", text="наш ответ клиенту")
+        )
     await _settle()
 
     assert "входящее" in caplog.text and "c-echo" in caplog.text
@@ -1824,3 +1844,117 @@ async def test_duplicate_message_drop_is_logged(caplog):
     await _settle()
 
     assert "дубликат" in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Сообщение с нашей стороны: наш агент или живой менеджер
+#
+# У обоих `author_id` равен нашему аккаунту — тот самый признак, по которому
+# отсекается эхо. Различить их можно только по тому, писали мы этот текст
+# сами или нет.
+# --------------------------------------------------------------------------
+
+async def test_a_manager_typing_in_avito_takes_the_chat_over():
+    """Текст с нашей стороны, которого мы не отправляли, — это менеджер
+    написал руками из интерфейса Авито. Инцидент 2026-08-27/28: агент
+    продолжал отвечать поверх него."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="Здравствуйте, это Валерия, отвечу сама")
+    )
+    await _settle()
+
+    assert agent.calls == []
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is True
+    assert flags.takeover_at is not None
+
+
+async def test_our_own_answer_coming_back_does_not_take_the_chat_over():
+    """Ошибка в эту сторону страшнее всего: приняв собственное эхо за
+    менеджера, агент замолкал бы на окно кулдауна после КАЖДОГО ответа."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+    await store.save_outgoing("chat-1", "Здравствуйте! На какое число?", SendStatus.sent)
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="Здравствуйте! На какое число?")
+    )
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False
+    assert agent.calls == []
+
+
+async def test_a_manager_writing_in_a_foreign_listing_chat_is_not_a_takeover():
+    """Заказчик сам покупатель в 33 чатах из 1100 («Репетитор по физике»,
+    «Покос травы»). Менеджер отвечает и там — но агента в этих чатах нет,
+    перехватывать нечего, и заводить им строку в базе тоже незачем."""
+    settings = _settings()
+    settings.avito_blocked_items = ["item-чужой"]
+    pipeline, store, agent, ops = _build(settings=settings)
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, item_id="item-чужой", text="это не наш чат")
+    )
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False
+
+
+async def test_a_photo_from_the_manager_counts_as_a_takeover():
+    """Картинка без текста: сравнивать нечего, но агент картинок не шлёт —
+    значит писал человек."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(_payload(author_id=OUR_USER_ID, text=""))
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is True
+
+
+async def test_a_broken_echo_check_keeps_the_agent_working():
+    """Сбой проверки — считаем сообщение своим: ошибка в другую сторону
+    заставила бы агента замолчать из-за упавшего SELECT."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    async def broken(chat_id, text):
+        raise RuntimeError("БД недоступна")
+
+    store.was_sent_by_us = broken
+
+    await pipeline.handle_message(_payload(author_id=OUR_USER_ID, text="что угодно"))
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False
+
+
+async def test_the_agent_answers_again_after_the_cooldown_window():
+    """Сквозной сценарий режима: менеджер написал → агент молчит → окно
+    истекло → агент отвечает сам, без единого действия оператора."""
+    settings = _settings()
+    settings.takeover_mode = "cooldown"
+    settings.takeover_cooldown_minutes = 15
+    pipeline, store, agent, ops = _build(settings=settings)
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(_payload(author_id=OUR_USER_ID, text="я сам отвечу"))
+    await _settle()
+    allowed, _ = await ops.should_agent_reply("chat-1")
+    assert allowed is False
+
+    # Окно прошло — двигаем метку перехвата назад во времени.
+    flags = await ops.store.get_flags("chat-1")
+    flags.takeover_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+    await ops.store.set_flags("chat-1", flags)
+
+    allowed, _ = await ops.should_agent_reply("chat-1")
+    assert allowed is True

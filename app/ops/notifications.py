@@ -198,6 +198,33 @@ def render_outbound_daily_limit_unavailable_notice(limit: int, at: Optional[date
     )
 
 
+def render_daily_cost_limit_notice(
+    spent_rub: Decimal, limit_rub: Decimal, at: Optional[datetime] = None
+) -> str:
+    """Дневной лимит расхода на модели исчерпан — агент уже на паузе.
+
+    Третий суточный потолок проекта, и единственный, который ОСТАНАВЛИВАЕТ
+    агента: лимит уступок только снимает скидки, лимит исходящих блокирует
+    отправку до полуночи, а этот ставит диалоги на людей и сам не отпускает.
+    Поэтому в тексте прямо сказано, чем снимается, — иначе полуночного
+    сброса будут ждать зря (счётчик обнулится, пауза останется).
+    """
+    at = (at or datetime.now(timezone.utc)).astimezone(MOSCOW_TZ)
+    return "\n".join(
+        [
+            f"🚨 ДНЕВНОЙ ЛИМИТ РАСХОДА НА МОДЕЛИ ИСЧЕРПАН ({limit_rub} ₽)",
+            "",
+            f"Потрачено сегодня: {spent_rub} ₽. Время: {at.strftime('%H:%M:%S МСК')}.",
+            "Агент поставлен на паузу — новые ответы он не сочиняет, диалоги",
+            "переходят к вам. Расход по дням и моделям: /admin/costs.",
+            "",
+            "Сам не снимется: полночь обнулит счётчик, но не паузу.",
+            "Вернуть агента в работу — /resume. Поднять потолок —",
+            "DAILY_COST_LIMIT_RUB и перезапуск.",
+        ]
+    )
+
+
 def render_escalation(chat_id: str, reason: str, urgency: str = "normal") -> str:
     mark = {"high": "🔴🔴", "normal": "🔴", "low": "🟠"}.get(urgency, "🔴")
     return "\n".join(
@@ -304,6 +331,68 @@ def render_digest(
         for topic in unanswered_topics[:10]:
             lines.append(f"  • {topic}")
 
+    return _clip("\n".join(lines), MAX_TELEGRAM_LEN)
+
+
+def render_booking_handoff(record: dict) -> str:
+    """Бронь НЕ поставлена — её ставит оператор руками, прямо сейчас.
+
+    Противоположность `render_booking_notice` ниже: там факт, здесь работа.
+    Поэтому здесь есть всё, что нужно занести в календарь, и ни одного поля
+    меньше — смысл карточки ровно в том, чтобы оператору не пришлось листать
+    переписку. Пустые места помечены прочерком намеренно: «имя: —» видно
+    сразу, а молча пропущенная строка выглядит как «всё собрано».
+
+    Кнопок нет по той же причине, что и у уведомления о броне, но с другой
+    стороны: одобрять нечего — нужно идти и ставить. Кнопка «Взять на себя»
+    приходит отдельной карточкой диалога (эскалация), там же и ссылка на чат.
+
+    Непроверенная занятость стоит ОТДЕЛЬНОЙ строкой сразу под заголовком, а
+    не пометкой в поле: оператор читает карточку сверху вниз и ставит бронь
+    по ней, и предупреждение, замеченное после записи в календарь, уже
+    бесполезно. Случай не гипотетический: у зон без связки с YCLIENTS
+    (`zone_service_map`) занятость приходит UNKNOWN всегда — сегодня это
+    house_relax, и каждая его передача идёт с этой строкой.
+    """
+    occupied = record.get("occupied_hours")
+    billable = record.get("billable_hours")
+    if billable is not None and occupied is not None and billable != occupied:
+        hours_line = f"Часы: занять {occupied}, оплачено {billable}"
+        promo = record.get("applied_promo")
+        if promo:
+            hours_line += f" (акция: {promo})"
+    else:
+        hours_line = f"Часы: {occupied if occupied is not None else '—'}"
+
+    zone = record.get("zone_name") or record.get("zone_id") or "—"
+    if record.get("zone_name") and record.get("zone_id"):
+        zone = f"{record['zone_name']} ({record['zone_id']})"
+
+    prepayment = record.get("prepayment")
+    total = record.get("total")
+
+    lines = [
+        f"💰 ЭТАП ОПЛАТЫ · ПОСТАВЬТЕ БРОНЬ РУКАМИ · чат {record.get('chat_id')}",
+    ]
+    if not record.get("slot_confirmed_free"):
+        lines.append("")
+        lines.append("⚠️ ЗАНЯТОСТЬ НЕ ПРОВЕРЕНА — сверьтесь с календарём перед постановкой")
+    lines += [
+        "",
+        f"Зона: {zone}",
+        f"Дата: {record.get('booking_date') or '—'} в {record.get('start_time') or '—'}",
+        hours_line,
+        f"Гостей: {record.get('guests') if record.get('guests') else '—'}",
+        f"Имя: {record.get('client_name') or '—'}",
+        f"Телефон: {record.get('client_phone') or '—'}",
+        f"Сумма: {total} ₽" if total is not None else "Сумма: —",
+        f"Предоплата: {prepayment} ₽" if prepayment is not None else "Предоплата: —",
+    ]
+    if record.get("comment"):
+        lines.append(f"Пожелания: {_clip(str(record['comment']), 300)}")
+    lines.append("")
+    lines.append("Агент бронь не ставил и не поставит: оплату ведёте вы.")
+    lines.append("Клиенту сказано, что вы свяжетесь и подтвердите время.")
     return _clip("\n".join(lines), MAX_TELEGRAM_LEN)
 
 

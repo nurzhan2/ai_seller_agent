@@ -441,6 +441,51 @@ def test_booking_past_closing_hour_escalates_without_a_question_id(kb):
     assert "продлить" in r.human_readable
 
 
+def test_arrival_before_opening_hour_escalates_too(kb):
+    """Раньше проверялся только закрывающий час, и заезд в 7:00 проходил
+    насквозь: территория закрыта, а котировка выдавалась как обычная. Ранний
+    заезд — то же «нужно, чтобы кто-то открыл», что и поздний выезд."""
+    r = q(kb, zone_id="dome_bags", date=SAT, start_time=time(7, 0), hours=3, guests=6)
+
+    assert r.status == "blocked"
+    assert r.blocking_question_ids == ()          # решённое правило, не дыра в базе
+    assert "09:00" in r.human_readable
+    assert r.total is None                        # цену клиенту не называем
+
+
+def test_arrival_exactly_at_opening_hour_is_ok(kb):
+    r = q(kb, zone_id="dome_bags", date=SAT, start_time=time(9, 0), hours=3, guests=6)
+    assert r.status == "ok"
+
+
+def test_a_zone_without_its_own_window_falls_back_to_the_complex_hours(kb):
+    """У юрты `booking_window: null`. Это значит «своего окна нет», а не
+    «работает круглосуточно»: применяется общее окно комплекса
+    (constants.working_window), а не отсутствие проверки."""
+    zone = next(z for z in kb.catalog.zones if z.id == "yurt")
+    assert zone.booking_window is None, "фикстура протухла — у юрты появилось своё окно"
+
+    # Юрта суточная, часов у неё нет вовсе — заодно видно, что ранний заезд
+    # проверяется сам по себе, а не как побочный эффект расчёта длительности.
+    early = q(kb, zone_id="yurt", date=SAT, start_time=time(7, 0), guests=2)
+
+    assert early.status == "blocked"
+    assert "09:00" in early.human_readable
+
+
+def test_the_complex_hours_are_the_ones_from_the_knowledge_base(kb):
+    """Окно берётся из базы знаний, а не зашито числом: оператор правит его
+    из Telegram ($.catalog.constants.working_window), и правка обязана
+    доезжать до расчёта."""
+    loosened = kb.model_copy(deep=True)
+    loosened.catalog.constants.working_window.from_ = "06:00"
+    next(z for z in loosened.catalog.zones if z.id == "yurt").booking_window = None
+
+    r = q(loosened, zone_id="yurt", date=SAT, start_time=time(7, 0), guests=2)
+
+    assert r.status != "blocked", "правка окна в базе знаний не доехала до движка"
+
+
 def test_booking_ending_exactly_at_closing_hour_is_ok(kb):
     r = q(kb, zone_id="dome_bags", date=SAT, start_time=time(19, 0), hours=3, guests=6)
     assert r.status == "ok"

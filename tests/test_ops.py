@@ -16,6 +16,8 @@ from app.ops.handlers import parse_callback
 from app.ops.notifications import (
     DialogCard,
     dialog_keyboard,
+    render_booking_handoff,
+    render_booking_notice,
     render_concession,
     render_dialog_card,
     render_digest,
@@ -186,18 +188,40 @@ async def test_return_to_ai_restores_agent(service):
     assert allowed is True
 
 
-async def test_auto_return_after_24h(service):
+async def test_auto_return_after_24h():
+    """Страховка «взял и забыл» — и проверяется она в режиме `permanent`,
+    где сработать может ТОЛЬКО она. В `cooldown` те же сутки возвращают чат
+    по истёкшему окну, и тест зеленел бы, даже если суточное правило
+    сломано."""
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True,
+                          takeover_mode="permanent"),
+    )
     flags = ChatFlags(
         is_human_takeover=True,
         takeover_at=datetime.now(timezone.utc) - timedelta(hours=25),
     )
     await service.store.set_flags("c1", flags)
+
     assert await service.auto_return_if_stale("c1") is True
     allowed, _ = await service.should_agent_reply("c1")
     assert allowed is True
+    assert any(
+        a["action"] == "auto_return" and a["payload"]["reason"] == "24h без активности"
+        for a in service.store.actions
+    )
 
 
-async def test_no_auto_return_before_timeout(service):
+async def test_no_auto_return_before_timeout(sent):
+    """Суточная страховка — про режим `permanent`: там перехват держится до
+    кнопки, и два часа не повод возвращать чат агенту. В `cooldown` те же
+    два часа означают давно истёкшее окно (см. тесты режимов ниже)."""
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True,
+                          takeover_mode="permanent"),
+    )
     flags = ChatFlags(
         is_human_takeover=True,
         takeover_at=datetime.now(timezone.utc) - timedelta(hours=2),
@@ -628,3 +652,388 @@ def test_reply_limit_defaults_to_25(monkeypatch):
     monkeypatch.delenv("AGENT_MAX_REPLIES_PER_CHAT", raising=False)
     monkeypatch.delenv("MAX_AGENT_REPLIES_PER_CHAT", raising=False)
     assert Settings().max_agent_replies_per_chat == 25
+
+
+# --------------------------------------------------------------------------
+# Карточка «поставьте бронь руками» (этап оплаты)
+# --------------------------------------------------------------------------
+
+HANDOFF_CARD = {
+    "chat_id": "c1",
+    "zone_id": "bath_russian",
+    "zone_name": "Русская баня",
+    "booking_date": "2026-08-29",
+    "start_time": "14:00",
+    "occupied_hours": 3,
+    "billable_hours": 3,
+    "guests": 6,
+    "total": Decimal("9000"),
+    "prepayment": Decimal("3000"),
+    "client_name": "Иван",
+    "client_phone": "+79990000000",
+    "comment": "нужны веники",
+    "applied_promo": None,
+    "slot_confirmed_free": True,
+}
+
+
+def test_handoff_card_has_everything_needed_to_book_by_hand():
+    """Смысл карточки ровно один: не листать переписку. Значит каждое поле
+    из неё должно быть видно глазами, а не подразумеваться."""
+    text = render_booking_handoff(HANDOFF_CARD)
+    for fragment in [
+        "Русская баня",
+        "2026-08-29",
+        "14:00",
+        "Часы: 3",
+        "Гостей: 6",
+        "Иван",
+        "+79990000000",
+        "9000 ₽",
+        "3000 ₽",
+        "нужны веники",
+    ]:
+        assert fragment in text, fragment
+
+
+def test_handoff_card_says_the_booking_does_not_exist_yet():
+    """Главное отличие от уведомления о поставленной броне: там факт, здесь
+    работа. Перепутать их значит оставить клиента без брони."""
+    text = render_booking_handoff(HANDOFF_CARD)
+    assert "ПОСТАВЬТЕ БРОНЬ РУКАМИ" in text
+    assert "не ставил и не поставит" in text
+
+
+def test_handoff_card_shows_promo_hours_both_ways():
+    text = render_booking_handoff(
+        {**HANDOFF_CARD, "occupied_hours": 6, "billable_hours": 5,
+         "applied_promo": "sixth_hour_free"}
+    )
+    assert "занять 6" in text
+    assert "оплачено 5" in text
+    assert "sixth_hour_free" in text
+
+
+def test_handoff_card_marks_missing_fields_instead_of_hiding_them():
+    """Пропущенная строка читается как «всё собрано». Прочерк — как «нет»."""
+    text = render_booking_handoff({"chat_id": "c1", "zone_id": "yurt"})
+    assert "Имя: —" in text
+    assert "Телефон: —" in text
+    assert "Предоплата: —" in text
+
+
+UNKNOWN_SLOT_WARNING = "⚠️ ЗАНЯТОСТЬ НЕ ПРОВЕРЕНА"
+
+
+def test_handoff_card_warns_when_availability_is_unknown():
+    """Занятость UNKNOWN — предупреждение обязано быть. Живой случай:
+    house_relax не связан с YCLIENTS (`zone_service_map`), и занятость по
+    нему не приходит НИКОГДА, сколько ни спрашивай."""
+    text = render_booking_handoff({**HANDOFF_CARD, "slot_confirmed_free": False})
+
+    assert UNKNOWN_SLOT_WARNING in text
+    assert "сверьтесь с календарём" in text
+
+
+def test_handoff_card_has_no_warning_when_the_slot_is_free():
+    """И обратное: слот подтверждён свободным — предупреждения нет.
+    Предупреждение, которое висит всегда, оператор перестаёт читать через
+    неделю, и тогда оно не сработает там, где нужно."""
+    assert UNKNOWN_SLOT_WARNING not in render_booking_handoff(HANDOFF_CARD)
+
+
+def test_the_unknown_slot_warning_stands_above_the_booking_data():
+    """Отдельной строкой в начале, а не пометкой в поле: оператор читает
+    карточку сверху вниз и заносит бронь по ней. Предупреждение, замеченное
+    после записи в календарь, уже ничего не спасает."""
+    lines = render_booking_handoff({**HANDOFF_CARD, "slot_confirmed_free": False}).splitlines()
+
+    warning_at = next(i for i, line in enumerate(lines) if UNKNOWN_SLOT_WARNING in line)
+    first_field_at = next(i for i, line in enumerate(lines) if line.startswith("Зона:"))
+
+    assert warning_at < first_field_at
+    assert warning_at <= 2                       # сразу под заголовком, не в подвале
+
+
+# --------------------------------------------------------------------------
+# Уведомление о поставленной агентом броне
+#
+# Третья дыра из мутационного разбора: карточка «бронь уже стоит» не была
+# покрыта ничем. Часы акции можно было слить в одно число — оператор
+# перестал бы видеть, что заблокировано 6 часов, а оплачено 5, — и ни один
+# тест бы не упал.
+# --------------------------------------------------------------------------
+
+BOOKED_RECORD = {
+    "chat_id": "c-1",
+    "record_id": "rec-42",
+    "zone_id": "bath_russian",
+    "booking_date": "2026-08-29",
+    "start_time": "14:00",
+    "occupied_hours": 3,
+    "billable_hours": 3,
+    "guests": 6,
+    "total": Decimal("9000"),
+    "client_name": "Иван",
+    "client_phone": "+79990000000",
+    "applied_promo": None,
+}
+
+
+def test_booking_notice_carries_the_facts_of_the_booking():
+    text = render_booking_notice(BOOKED_RECORD)
+
+    for fragment in ["bath_russian", "2026-08-29", "14:00", "Часы: 3", "Гостей: 6",
+                     "9000 ₽", "Иван", "+79990000000", "rec-42"]:
+        assert fragment in text, fragment
+
+
+def test_booking_notice_says_the_booking_already_exists():
+    """Противоположность карточке передачи: там работа, здесь факт. Кнопок
+    нет намеренно — одобрять уже нечего."""
+    text = render_booking_notice(BOOKED_RECORD)
+
+    assert "БРОНЬ ПОСТАВЛЕНА АГЕНТОМ" in text
+    assert "Подтверждать не нужно" in text
+
+
+def test_booking_notice_shows_promo_hours_both_ways():
+    """Акция «6-й час в подарок»: занято 6, оплачено 5. Одно число вместо
+    двух — и шестой час выглядит как ошибка агента, которую пойдут
+    «исправлять» в календаре."""
+    text = render_booking_notice(
+        {**BOOKED_RECORD, "occupied_hours": 6, "billable_hours": 5,
+         "applied_promo": "sixth_hour_free"}
+    )
+
+    assert "занято 6" in text
+    assert "оплачено 5" in text
+    assert "sixth_hour_free" in text
+
+
+def test_booking_notice_does_not_split_hours_when_they_match():
+    """Без акции два одинаковых числа рядом только сбивают с толку."""
+    text = render_booking_notice(BOOKED_RECORD)
+
+    assert "Часы: 3" in text
+    assert "оплачено" not in text
+
+
+def test_booking_notice_marks_what_the_agent_did_not_collect():
+    """Пустое поле должно быть видно прочерком: бронь уже стоит, и оператор
+    по этой карточке решает, чего в ней не хватает."""
+    text = render_booking_notice(
+        {**BOOKED_RECORD, "client_name": None, "client_phone": None, "record_id": None}
+    )
+
+    assert "Клиент: —, —" in text
+    assert "ID записи в YCLIENTS: —" in text
+
+
+# --------------------------------------------------------------------------
+# TAKEOVER_MODE в операторском контуре
+# --------------------------------------------------------------------------
+
+def _service(mode: str, minutes: int = 15) -> OpsService:
+    return OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(
+            telegram_allowed_users=[ALLOWED_USER],
+            takeover_mode=mode,
+            takeover_cooldown_minutes=minutes,
+        ),
+    )
+
+
+async def _took_over(service: OpsService, chat_id: str, minutes_ago: float) -> None:
+    await service.store.set_flags(chat_id, ChatFlags(
+        is_human_takeover=True,
+        takeover_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+    ))
+
+
+async def test_mode_off_keeps_the_agent_answering_over_a_manager():
+    service = _service("off")
+    await _took_over(service, "c1", minutes_ago=0)
+
+    allowed, reason = await service.should_agent_reply("c1")
+
+    assert allowed is True, reason
+
+
+async def test_mode_cooldown_silences_the_agent_inside_the_window():
+    service = _service("cooldown", minutes=15)
+    await _took_over(service, "c1", minutes_ago=5)
+
+    allowed, reason = await service.should_agent_reply("c1")
+
+    assert allowed is False
+    assert reason == "чат у оператора"
+
+
+async def test_mode_cooldown_returns_the_chat_to_the_agent_after_the_window():
+    """«После окна продолжает сам» — и флаг при этом снимается, иначе /chat
+    вечно показывает «у оператора» на чате, где агент давно отвечает."""
+    service = _service("cooldown", minutes=15)
+    await _took_over(service, "c1", minutes_ago=20)
+
+    allowed, _ = await service.should_agent_reply("c1")
+
+    assert allowed is True
+    flags = await service.store.get_flags("c1")
+    assert flags.is_human_takeover is False
+    assert flags.takeover_at is None
+    assert any(a["action"] == "auto_return" for a in service.store.actions)
+
+
+async def test_mode_permanent_keeps_the_chat_until_the_button():
+    service = _service("permanent")
+    await _took_over(service, "c1", minutes_ago=60 * 5)
+
+    allowed, _ = await service.should_agent_reply("c1")
+    assert allowed is False
+
+    await service.return_to_ai("c1", ALLOWED_USER)
+    allowed, _ = await service.should_agent_reply("c1")
+    assert allowed is True
+
+
+async def test_a_manager_message_extends_the_silence_window():
+    """Окно считается от ПОСЛЕДНЕГО сообщения менеджера: пока он пишет,
+    агент молчит, сколько бы времени ни прошло с первого сообщения."""
+    service = _service("cooldown", minutes=15)
+    await _took_over(service, "c1", minutes_ago=14)
+
+    await service.note_operator_message("c1")
+
+    allowed, _ = await service.should_agent_reply("c1")
+    assert allowed is False
+    flags = await service.store.get_flags("c1")
+    assert (datetime.now(timezone.utc) - flags.takeover_at) < timedelta(seconds=5)
+
+
+async def test_note_operator_message_raises_the_same_flag_as_the_button():
+    """Для системы «человек в чате» — одно состояние, а не два похожих:
+    сообщение менеджера и кнопка «Взять на себя» поднимают один флаг, а
+    сколько он держится, решает режим на границе исходящих."""
+    service = _service("permanent")
+
+    await service.note_operator_message("c1")
+
+    flags = await service.store.get_flags("c1")
+    assert flags.is_human_takeover is True
+    assert flags.takeover_at is not None
+    allowed, _ = await service.should_agent_reply("c1")
+    assert allowed is False
+
+
+# --------------------------------------------------------------------------
+# Ручной hold: отдельный флаг, кулдаун его не трогает
+# --------------------------------------------------------------------------
+
+class _HoldStore:
+    """Минимальная замена dialog_store для /hold и /unhold."""
+
+    def __init__(self):
+        self.holds: dict[str, bool] = {}
+
+    async def set_chat_manual_hold(self, chat_id: str, value: bool) -> bool:
+        self.holds[chat_id] = value
+        return value
+
+
+async def test_hold_and_unhold_set_the_manual_flag():
+    holds = _HoldStore()
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER]),
+        manual_hold_setter=holds.set_chat_manual_hold,
+    )
+
+    await service.hold("c1", ALLOWED_USER)
+    assert holds.holds["c1"] is True
+
+    await service.unhold("c1", ALLOWED_USER)
+    assert holds.holds["c1"] is False
+    assert [a["action"] for a in service.store.actions] == ["hold", "unhold"]
+
+
+async def test_hold_refuses_honestly_without_a_database():
+    """Без доступа к базе команда обязана сказать «не могу», а не сделать
+    вид, что чат заткнут: оператор ставит hold по инциденту."""
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER]),
+    )
+
+    answer = await service.hold("c1", ALLOWED_USER)
+
+    assert "недоступен" in answer
+
+
+async def test_manual_hold_is_not_touched_by_the_cooldown_in_any_mode():
+    """Главное свойство ручного hold: он живёт до /unhold. Кулдаун
+    истекает, чат возвращается агенту — а hold остаётся, и граница
+    исходящих по-прежнему не пропускает ни одного сообщения.
+
+    Флаг для 65 чатов инцидента 2026-08-28: там нужно было заткнуть насмерть,
+    а не «на 15 минут»."""
+    holds = _HoldStore()
+    for mode in ("off", "cooldown", "permanent"):
+        service = OpsService(
+            store=InMemoryOpsStore(),
+            settings=Settings(
+                telegram_allowed_users=[ALLOWED_USER],
+                takeover_mode=mode,
+                takeover_cooldown_minutes=15,
+            ),
+            manual_hold_setter=holds.set_chat_manual_hold,
+        )
+        await service.hold("c1", ALLOWED_USER)
+        await _took_over(service, "c1", minutes_ago=60)      # окно давно истекло
+
+        await service.should_agent_reply("c1")               # ленивый возврат
+        await service.return_to_ai("c1", ALLOWED_USER)       # и явный возврат
+
+        assert holds.holds["c1"] is True, f"режим {mode} снял ручной hold"
+
+
+async def test_the_in_memory_store_holds_a_chat_like_the_real_one():
+    """InMemoryDialogStore — то, на чём стоят тесты конвейера. Если его
+    `set_chat_manual_hold` разойдётся с боевой реализацией, тесты будут
+    зелёными на поведении, которого в бою нет."""
+    from app.dialog_store import InMemoryDialogStore
+
+    store = InMemoryDialogStore()
+    await store.get_or_create_chat("c1")
+
+    assert await store.get_chat_manual_hold("c1") is False
+    await store.set_chat_manual_hold("c1", True)
+    assert await store.get_chat_manual_hold("c1") is True
+    await store.set_chat_manual_hold("c1", False)
+    assert await store.get_chat_manual_hold("c1") is False
+
+
+async def test_the_outbound_gate_holds_the_chat_even_when_the_takeover_expired():
+    """Тот же инвариант, но на границе: истёкший перехват не открывает
+    дорогу сообщению в чат, стоящий на ручном hold."""
+    from app.channels.outbound_gate import OutboundGate, TakeoverState
+
+    async def manual_hold(chat_id):
+        return True
+
+    async def takeover(chat_id):
+        return TakeoverState(is_human_takeover=False, takeover_at=None)
+
+    class _Client:
+        async def send_message(self, chat_id, text):
+            raise AssertionError("отправки быть не должно")
+
+    gate = OutboundGate(
+        _Client(),
+        Settings(takeover_mode="cooldown", avito_blocked_items="none"),
+        manual_hold_lookup=manual_hold,
+        takeover_lookup=takeover,
+    )
+
+    assert await gate.is_allowed("c1") is False

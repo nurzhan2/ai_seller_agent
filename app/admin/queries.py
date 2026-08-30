@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
@@ -230,6 +230,47 @@ class SqlAlchemyAdminQueries:
                 }
             )
         return result
+
+    async def cost_spent_today(self) -> Decimal:
+        """Расход на модели за ТЕКУЩИЕ московские сутки.
+
+        Нужен предохранителю (app/metrics.py:DailyCostGuard) при старте
+        процесса: без этого дневной лимит считался бы «с последнего
+        рестарта», а не за сутки. Читает то же поле той же таблицы, что и
+        `list_costs` выше, — расхождению «в отчёте одно, в предохранителе
+        другое» взяться неоткуда.
+
+        Сравнение по метке времени, а не группировка по дате: московские
+        сутки — это конкретный момент в UTC, и SQL про него спросить проще и
+        надёжнее, чем приводить часовые пояса на стороне базы.
+        """
+        from sqlalchemy import select
+
+        from app.channels.daily_limit import MOSCOW_TZ
+        from app.db.models import Direction, Message
+
+        now_msk = datetime.now(timezone.utc).astimezone(MOSCOW_TZ)
+        midnight_msk = datetime.combine(
+            now_msk.date(), time(0, 0), tzinfo=MOSCOW_TZ
+        )
+        since = midnight_msk.astimezone(timezone.utc)
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Message.llm_meta).where(
+                        Message.direction == Direction.outgoing,
+                        Message.llm_meta.is_not(None),
+                        Message.created_at >= since,
+                    )
+                )
+            ).all()
+
+        total = Decimal("0")
+        for (meta,) in rows:
+            if isinstance(meta, dict):
+                total += _to_decimal(meta.get("cost_rub"))
+        return total
 
     # -- /stats в Telegram --------------------------------------------------
 

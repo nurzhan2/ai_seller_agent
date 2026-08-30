@@ -266,6 +266,13 @@ def _free_hours(occupied: int, min_paid: int, repeatable: bool) -> int:
 # Main entry point
 # --------------------------------------------------------------------------
 
+def _hhmm_to_minutes(value: str) -> int:
+    """«09:00» -> 540. Формат чинит валидация базы знаний (app/kb/editable.py),
+    здесь он уже гарантирован."""
+    hours, minutes = (int(part) for part in value.split(":"))
+    return hours * 60 + minutes
+
+
 def quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
     ctx = _Ctx(blocking=[], advisory=[], warnings=[], lines=[])
 
@@ -349,20 +356,46 @@ def quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
         ctx.advise(zone.capacity.disputed.question_id)
         ctx.warn("Вместимость зоны не подтверждена — не называть клиенту точную цифру.")
 
-    # ---- closing hour ----------------------------------------------------
+    # ---- рабочее окно: и заезд, и выезд -----------------------------------
     # 8.1/14.2: рабочее окно (9:00-23:00) подтверждено. Бронь, выходящая за
-    # него, — больше не дыра в базе знаний (нет question_id, никого не
-    # спрашиваем): это решённое операционное правило — такая бронь ВСЕГДА
-    # эскалируется на подтверждение менеджера, а не считается по какому-то
-    # особому тарифу. Заодно закрывает 8.3: перехода через полночь с расчётом
-    # по двум тарифам в системе больше не бывает.
-    if req.start_time is not None and req.hours is not None and zone.booking_window is not None:
-        end_minutes = req.start_time.hour * 60 + req.start_time.minute + req.hours * 60
-        close_h, close_m = (int(p) for p in zone.booking_window.to.split(":"))
-        if end_minutes > close_h * 60 + close_m:
+    # него, — не дыра в базе знаний (нет question_id, никого не спрашиваем):
+    # это решённое операционное правило — такая бронь ВСЕГДА эскалируется на
+    # подтверждение менеджера, а не считается по какому-то особому тарифу.
+    # Заодно закрывает 8.3: перехода через полночь с расчётом по двум
+    # тарифам в системе больше не бывает.
+    #
+    # ПРОВЕРЯЮТСЯ ОБА КРАЯ. Раньше — только закрывающий час, и заезд в 7:00
+    # проходил насквозь: территория закрыта, а котировка выдавалась как
+    # обычная. Ранний заезд ничем не отличается от позднего выезда — это то
+    # же «нужно, чтобы кто-то открыл и был на месте», и решает это человек.
+    #
+    # У зоны без своего `booking_window` берётся ОБЩЕЕ окно комплекса
+    # (constants.working_window), а не «проверки нет»: отсутствие поля у
+    # юрты значит «отдельного окна нет», а не «работает круглосуточно».
+    # Пропуск проверки на этом основании — ровно тот молчаливый обход,
+    # из-за которого правило и не срабатывало на половине случаев.
+    window = zone.booking_window or kb.catalog.constants.working_window
+    if req.start_time is not None and window is not None:
+        open_minutes = _hhmm_to_minutes(window.from_)
+        close_minutes = _hhmm_to_minutes(window.to)
+        start_minutes = req.start_time.hour * 60 + req.start_time.minute
+        end_minutes = start_minutes + (req.hours or 0) * 60
+        if start_minutes < open_minutes:
             return _blocked(
                 ctx,
-                f"Бронь заканчивается позже {zone.booking_window.to} — "
+                f"Заезд раньше {window.from_} — требуется подтверждение "
+                "менеджера, что зону откроют к этому времени",
+                zone_id=zone.id,
+                day_type=day_type,
+                human_readable=(
+                    f"Мы работаем с {window.from_}. Уточню у менеджера, можно ли "
+                    "заехать раньше, и вернусь с ответом."
+                ),
+            )
+        if req.hours is not None and end_minutes > close_minutes:
+            return _blocked(
+                ctx,
+                f"Бронь заканчивается позже {window.to} — "
                 "требуется подтверждение менеджера на возможность продления",
                 zone_id=zone.id,
                 day_type=day_type,

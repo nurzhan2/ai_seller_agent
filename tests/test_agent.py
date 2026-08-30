@@ -623,6 +623,18 @@ async def test_booking_provider_reaches_the_default_executor(kb):
     assert executor.booking_provider is sentinel_provider
 
 
+async def test_handoff_notifier_reaches_the_default_executor(kb):
+    """Тот же путь для карточки оператору: не доедет через фабрику — на
+    этапе оплаты человек не получит ничего, кроме карточки диалога, и
+    поставит бронь, листая переписку. Ради этого всё и делалось."""
+    sentinel_notifier = object()
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("ок")])])
+    agent = AgentLoop(client, kb, booking_handoff_notifier=sentinel_notifier)
+
+    executor = agent.executor_factory("d1", None)
+    assert executor.booking_handoff_notifier is sentinel_notifier
+
+
 def test_unknown_model_costs_zero_rather_than_crashing():
     assert estimate_cost_rub("some-future-model", 1000, 100) == Decimal("0")
 
@@ -867,6 +879,95 @@ def test_system_prompt_describes_one_question_disambiguation(kb):
 
 
 # --------------------------------------------------------------------------
+# Фотографии зон
+# --------------------------------------------------------------------------
+
+async def test_photo_provider_returns_the_ids_from_the_knowledge_base(kb):
+    """Провайдер читает `catalog.yaml → zone.photos` — те самые image_id,
+    которые туда пишет scripts/import_photos.py после загрузки в Авито."""
+    from app.media.photos import KbPhotoProvider
+
+    loaded = kb.model_copy(deep=True)
+    zone = next(z for z in loaded.catalog.zones if z.id == "bath_russian")
+    zone.photos = ["img-1", "img-2"]
+
+    provider = KbPhotoProvider(lambda: loaded)
+
+    assert await provider.get("bath_russian") == ["img-1", "img-2"]
+    assert await provider.get("нет такой зоны") == []
+
+
+async def test_photo_provider_sees_a_reloaded_catalog(kb):
+    """База знаний перезагружается на лету, когда оператор правит каталог из
+    Telegram. Провайдер, захвативший объект при старте, отдавал бы
+    фотографии из версии на момент запуска процесса."""
+    from app.media.photos import KbPhotoProvider
+
+    first = kb.model_copy(deep=True)
+    second = kb.model_copy(deep=True)
+    next(z for z in second.catalog.zones if z.id == "bath_russian").photos = ["img-новый"]
+    current = [first]
+
+    provider = KbPhotoProvider(lambda: current[0])
+    assert await provider.get("bath_russian") == []
+
+    current[0] = second
+    assert await provider.get("bath_russian") == ["img-новый"]
+
+
+async def test_get_photos_returns_the_real_ids_when_they_exist(kb):
+    from app.media.photos import KbPhotoProvider
+
+    loaded = kb.model_copy(deep=True)
+    next(z for z in loaded.catalog.zones if z.id == "yurt").photos = ["img-1", "img-2", "img-3"]
+    ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded))
+
+    result = await ex.run("get_photos", {"zone_id": "yurt"})
+
+    assert result["photos"] == ["img-1", "img-2", "img-3"]
+    assert result["count"] == 3
+
+
+async def test_an_empty_photo_list_answers_exactly_like_no_provider_at_all(kb):
+    """«Провайдера нет» и «провайдер есть, но пусто» — одно следствие:
+    прислать нечего. Разные ответы означали бы, что во втором случае модель
+    получает `photos: []` без единого слова о том, что с этим делать, и
+    обещает клиенту фото, которых не придёт."""
+    from app.media.photos import KbPhotoProvider
+
+    without = await ToolExecutor(kb, "d1").run("get_photos", {"zone_id": "yurt"})
+    # Боевое состояние на 2026-08-30: провайдер подключён, `photos: []` у всех зон.
+    with_empty = await ToolExecutor(
+        kb, "d1", photo_provider=KbPhotoProvider(lambda: kb)
+    ).run("get_photos", {"zone_id": "yurt"})
+
+    assert with_empty == without
+    assert "Не обещай прислать их" in with_empty["instruction"]
+
+
+async def test_photo_provider_reaches_the_default_executor(kb):
+    """Та же проводка, что у booking_provider: не доедет через фабрику —
+    инструмент навсегда отвечает «фотографий нет», сколько их ни импортируй."""
+    sentinel = object()
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("ок")])])
+    agent = AgentLoop(client, kb, photo_provider=sentinel)
+
+    executor = agent.executor_factory("d1", None)
+
+    assert executor.photo_provider is sentinel
+
+
+def test_the_shipped_catalog_still_has_no_photos():
+    """Напоминание, а не запрет: пока это верно, проводка провайдера ничего
+    не меняет для клиента — нужен прогон scripts/import_photos.py по
+    media/photos/. Начнут импортировать — тест упадёт и его надо удалить."""
+    from app.kb.loader import load_catalog
+
+    loaded = load_catalog()
+    assert all(not z.photos for z in loaded.catalog.zones)
+
+
+# --------------------------------------------------------------------------
 # Бронирование (AUTO_BOOKING_ENABLED)
 # --------------------------------------------------------------------------
 
@@ -912,6 +1013,20 @@ BOOKING_ARGS = {
 }
 
 
+@pytest.fixture(scope="module")
+def kb_agent_books(kb):
+    """База знаний с ВЫКЛЮЧЕННЫМ handoff_on_payment_step.
+
+    Боевая настройка обратная (app/kb/payment.yaml: true — бронь ставит
+    оператор), и именно её проверяют тесты передачи ниже. Но ветка
+    автобронирования из кода никуда не делась, и покрытие ей нужно: без
+    него она поедет вслепую в тот день, когда заказчик решит флаг вернуть.
+    Копия глубокая — фикстура `kb` модульная, общая на весь файл."""
+    other = kb.model_copy(deep=True)
+    other.payment.payment.handoff_on_payment_step = False
+    return other
+
+
 async def _executor_with_quote(kb, provider, hours=3, **kw):
     """Котировка обязательна до брони — из неё берутся часы занятости."""
     ex = ToolExecutor(kb, "d1", booking_provider=provider,
@@ -921,13 +1036,13 @@ async def _executor_with_quote(kb, provider, hours=3, **kw):
     return ex
 
 
-async def test_booking_is_created_and_rechecked_first(kb, monkeypatch):
+async def test_booking_is_created_and_rechecked_first(kb_agent_books, monkeypatch):
     """Перед постановкой занятость спрашивается ЗАНОВО: между «свободно»
     пять реплик назад и этой секундой слот мог уйти."""
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
-    ex = await _executor_with_quote(kb, provider)
+    ex = await _executor_with_quote(kb_agent_books, provider)
     await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-08-29",
                                         "start_time": "14:00", "hours": 3})
     calls_before = len(provider.availability_calls)
@@ -940,14 +1055,14 @@ async def test_booking_is_created_and_rechecked_first(kb, monkeypatch):
     assert len(provider.bookings) == 1
 
 
-async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb, monkeypatch):
+async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb_agent_books, monkeypatch):
     """Первый ответ FREE, второй BUSY — ровно гонка, ради которой
     перепроверка и существует. Бронь ставиться не должна."""
     from app.booking.base import AvailabilityStatus
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider(statuses=[AvailabilityStatus.FREE, AvailabilityStatus.BUSY])
-    ex = await _executor_with_quote(kb, provider)
+    ex = await _executor_with_quote(kb_agent_books, provider)
     # Агент сказал клиенту «свободно» — это первый ответ провайдера.
     first = await ex.run("check_availability", {"zone_id": "bath_russian", "date": "2026-08-29",
                                                 "start_time": "14:00", "hours": 3})
@@ -962,13 +1077,13 @@ async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb, monkeypa
     assert "Не эскалируй" in result["instruction"]
 
 
-async def test_booking_blocks_occupied_hours_not_paid_ones(kb, monkeypatch):
+async def test_booking_blocks_occupied_hours_not_paid_ones(kb_agent_books, monkeypatch):
     """Акция «6-й час в подарок»: гость занимает 6 часов, платит за 5.
     Заблокировать 5 значит отдать шестой час другому клиенту."""
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
-    ex = await _executor_with_quote(kb, provider, hours=6)
+    ex = await _executor_with_quote(kb_agent_books, provider, hours=6)
     assert ex.last_quote.billable_hours == 5 and ex.last_quote.occupied_hours == 6
 
     result = await ex.run("create_booking", BOOKING_ARGS)
@@ -978,12 +1093,12 @@ async def test_booking_blocks_occupied_hours_not_paid_ones(kb, monkeypatch):
     assert result["occupied_hours"] == 6
 
 
-async def test_booking_is_written_to_our_db_with_both_hour_counts(kb, monkeypatch):
+async def test_booking_is_written_to_our_db_with_both_hour_counts(kb_agent_books, monkeypatch):
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
     sink = _BookingSink()
-    ex = await _executor_with_quote(kb, provider, hours=6, booking_sink=sink)
+    ex = await _executor_with_quote(kb_agent_books, provider, hours=6, booking_sink=sink)
 
     await ex.run("create_booking", BOOKING_ARGS)
 
@@ -995,7 +1110,7 @@ async def test_booking_is_written_to_our_db_with_both_hour_counts(kb, monkeypatc
     assert saved["applied_promo"] == "sixth_hour_free"
 
 
-async def test_booking_notifies_the_operator(kb, monkeypatch):
+async def test_booking_notifies_the_operator(kb_agent_books, monkeypatch):
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
@@ -1004,7 +1119,7 @@ async def test_booking_notifies_the_operator(kb, monkeypatch):
     async def notifier(record):
         notices.append(record)
 
-    ex = await _executor_with_quote(kb, provider, booking_notifier=notifier)
+    ex = await _executor_with_quote(kb_agent_books, provider, booking_notifier=notifier)
 
     await ex.run("create_booking", BOOKING_ARGS)
 
@@ -1012,7 +1127,7 @@ async def test_booking_notifies_the_operator(kb, monkeypatch):
     assert notices[0]["zone_id"] == "bath_russian"
 
 
-async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb, monkeypatch):
+async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb_agent_books, monkeypatch):
     """Бронь уже в YCLIENTS. Уронить ход из-за нашей таблицы — оставить
     клиента без подтверждения при существующей броне."""
     from app.config import Settings
@@ -1023,19 +1138,19 @@ async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb, monkeypat
             raise RuntimeError("БД недоступна")
 
     provider = _BookingProvider()
-    ex = await _executor_with_quote(kb, provider, booking_sink=_BrokenSink())
+    ex = await _executor_with_quote(kb_agent_books, provider, booking_sink=_BrokenSink())
 
     result = await ex.run("create_booking", BOOKING_ARGS)
 
     assert result["booked"] is True
 
 
-async def test_booking_requires_a_price_quote_first(kb, monkeypatch):
+async def test_booking_requires_a_price_quote_first(kb_agent_books, monkeypatch):
     """Без котировки неизвестны часы занятости — гадать их нельзя."""
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
-    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: date(2026, 8, 27))
+    ex = ToolExecutor(kb_agent_books, "d1", booking_provider=provider, today_fn=lambda: date(2026, 8, 27))
 
     result = await ex.run("create_booking", BOOKING_ARGS)
 
@@ -1044,11 +1159,11 @@ async def test_booking_requires_a_price_quote_first(kb, monkeypatch):
     assert "calculate_price" in result["instruction"]
 
 
-async def test_booking_is_refused_when_the_switch_is_off(kb, monkeypatch):
+async def test_booking_is_refused_when_the_switch_is_off(kb_agent_books, monkeypatch):
     from app.config import Settings, get_settings
 
     provider = _BookingProvider()
-    ex = await _executor_with_quote(kb, provider)
+    ex = await _executor_with_quote(kb_agent_books, provider)
     monkeypatch.setattr(
         "app.agent.tools.get_settings",
         lambda: Settings(auto_booking_enabled=False),
@@ -1060,9 +1175,61 @@ async def test_booking_is_refused_when_the_switch_is_off(kb, monkeypatch):
     assert provider.bookings == []
 
 
-async def test_booking_failure_is_never_reported_as_success(kb):
+async def test_booking_is_refused_when_availability_is_unknown(kb_agent_books, monkeypatch):
+    """Дыра, найденная мутацией: правило «занятость не подтвердилась — не
+    бронируем» не было закреплено ни одним тестом. Провайдер отвечает
+    UNKNOWN (нет маппинга зоны, сбой сети, неразобранный ответ) — записи в
+    YCLIENTS быть не должно, а клиенту уходит «уточню у менеджера»."""
+    from app.booking.base import AvailabilityStatus
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    provider = _BookingProvider(statuses=[AvailabilityStatus.UNKNOWN])
+    ex = await _executor_with_quote(kb_agent_books, provider)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert result["status"] == "unknown"
+    assert provider.bookings == []
+    assert "escalate_to_human" in result["instruction"]
+
+
+async def test_booking_without_a_provider_refuses_before_touching_anything(kb_agent_books, monkeypatch):
+    """Вторая дыра: ветка «системы бронирования нет вообще». Без неё
+    инструмент дошёл бы до `None.create_booking` и отдал бы модели голую
+    ошибку вместо готовой формулировки для клиента."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    sink = _BookingSink()
+    ex = ToolExecutor(kb_agent_books, "d1", today_fn=lambda: date(2026, 8, 27),
+                      booking_sink=sink)
+    await ex.run("calculate_price", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                     "start_time": "14:00", "hours": 3, "guests": 6})
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["booked"] is False
+    assert "error" not in result              # это отказ, а не сбой инструмента
+    assert sink.saved == []                   # «брони нет» не пишется в нашу таблицу
+    # Проверяется ИМЕННО эта ветка, а не «хоть какой-нибудь отказ»: без
+    # гейта ход дошёл бы до проверки занятости, получил бы от отсутствующего
+    # провайдера None и вернул бы «занятость не подтверждается» — тоже отказ,
+    # тоже с escalate_to_human, и тест зеленел бы, ничего не проверяя.
+    assert "Система бронирования недоступна" in result["instruction"]
+    assert "escalate_to_human" in result["instruction"]
+
+
+async def test_booking_failure_is_never_reported_as_success(kb_agent_books, monkeypatch):
+    """Рубильник включён намеренно: иначе тест зеленеет на отказе
+    «автобронирование выключено» и до сбоя провайдера не доходит вовсе."""
+    from app.config import Settings
+    monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider(succeed=False)
-    ex = await _executor_with_quote(kb, provider)
+    ex = await _executor_with_quote(kb_agent_books, provider)
 
     result = await ex.run("create_booking", BOOKING_ARGS)
 
@@ -1075,3 +1242,276 @@ def test_auto_booking_is_off_by_default():
     YCLIENTS без проверки оплаты — см. app/config.py:auto_booking_enabled."""
     from app.config import Settings
     assert Settings().auto_booking_enabled is False
+
+
+# --------------------------------------------------------------------------
+# Этап оплаты: бронь ставит оператор (payment.handoff_on_payment_step)
+#
+# Решение заказчика: агент доводит диалог до оплаты и передаёт человеку.
+# Проверка живёт в коде, на границе перед booking_provider.create_booking, а
+# не в системном промте — промт можно обмануть репликой клиента, границу
+# нельзя. Тесты ниже проверяют именно границу: ни один набор аргументов, ни
+# один сценарий диалога и ни одно состояние рубильника не должны довести до
+# YCLIENTS, пока флаг включён.
+# --------------------------------------------------------------------------
+
+async def test_payment_handoff_is_on_in_the_shipped_knowledge_base(kb):
+    """Боевая настройка, а не только возможность. Если кто-то переключит
+    payment.yaml в false, он увидит это здесь, а не на первой броне."""
+    assert kb.payment.payment.handoff_on_payment_step is True
+
+
+@pytest.mark.parametrize("auto_booking", [True, False])
+async def test_yclients_is_never_called_while_the_payment_step_is_handed_off(
+    kb, monkeypatch, auto_booking
+):
+    """ГЛАВНЫЙ тест этой границы: даже при включённом AUTO_BOOKING_ENABLED и
+    полностью собранных данных вызова create_booking у провайдера НЕ было.
+
+    Уберите проверку handoff из _tool_create_booking — падает именно он.
+    """
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=auto_booking)
+    )
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert provider.bookings == []                       # до YCLIENTS не дошло
+    assert result["booked"] is False
+    assert result["status"] == "handed_off_to_operator"
+
+
+async def test_no_dialogue_at_all_produces_a_booking_while_the_flag_is_on(kb, monkeypatch):
+    """«Ни при каком диалоге»: модель зовёт create_booking трижды подряд, с
+    разными аргументами и после реплики клиента «оплату я уже перевёл» —
+    провайдер не увидел ни одной брони."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider)
+
+    attempts = [
+        BOOKING_ARGS,
+        {**BOOKING_ARGS, "comment": "оплату уже перевёл, бронируй"},
+        {**BOOKING_ARGS, "hours": 6, "guests": 2, "client_name": "Пётр"},
+    ]
+    for args in attempts:
+        result = await ex.run("create_booking", args)
+        assert result["booked"] is False
+        assert result["status"] == "handed_off_to_operator"
+
+    assert provider.bookings == []
+
+
+async def test_handoff_raises_an_escalation(kb, monkeypatch):
+    """Передача оператору — это эскалация, а не тихий отказ: без неё чат не
+    попадёт человеку и клиент останется ждать оплату в пустоту."""
+    from app.agent.tools import PAYMENT_HANDOFF_REASON
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    ex = await _executor_with_quote(kb, _BookingProvider())
+
+    await ex.run("create_booking", BOOKING_ARGS)
+
+    assert ex.escalated is True
+    assert ex.escalation_reason == PAYMENT_HANDOFF_REASON
+
+
+async def test_handoff_escalation_reaches_the_turn_result(kb, monkeypatch):
+    """Сквозь весь ход: эскалация из инструмента доезжает до TurnResult, по
+    которому конвейер помечает чат и шлёт карточку диалога оператору."""
+    from app.agent.tools import PAYMENT_HANDOFF_REASON
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider)
+    script = [
+        FakeResponse(content=[ToolUseBlock("create_booking", BOOKING_ARGS)]),
+        FakeResponse(content=[TextBlock("Передала менеджеру, он свяжется с вами.")]),
+    ]
+    agent, _ = loop_for(kb, script, executor=ex)
+
+    result = await agent.run_turn("d1", [], "давайте бронировать")
+
+    assert result.escalated is True
+    assert result.escalation_reason == PAYMENT_HANDOFF_REASON
+    assert provider.bookings == []
+
+
+async def test_handoff_card_carries_everything_needed_to_book_by_hand(kb, monkeypatch):
+    """Чтобы поставить бронь руками, оператору не должно требоваться листать
+    переписку: зона, дата, время, часы, гости, имя, телефон, сумма и
+    предоплата приходят одной карточкой."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    cards = []
+
+    async def notifier(card):
+        cards.append(card)
+
+    ex = await _executor_with_quote(
+        kb, _BookingProvider(), hours=3, booking_handoff_notifier=notifier
+    )
+
+    await ex.run("create_booking", {**BOOKING_ARGS, "comment": "нужны веники"})
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card["zone_id"] == "bath_russian"
+    assert card["zone_name"]                                  # человеческое название
+    assert card["booking_date"] == date(2026, 8, 29)
+    assert card["start_time"] == "14:00"
+    assert card["occupied_hours"] == 3
+    assert card["guests"] == 6
+    assert card["client_name"] == "Иван"
+    assert card["client_phone"] == "+79990000000"
+    assert card["comment"] == "нужны веники"
+    assert card["total"] == ex.last_quote.total
+    # Предоплата — из котировки, а не из головы модели.
+    assert card["prepayment"] == ex.last_quote.prepayment
+    assert card["prepayment"] is not None
+    assert card["chat_id"] == "d1"
+
+
+async def test_handoff_card_shows_the_free_hours_of_a_promo_separately(kb, monkeypatch):
+    """Акция «6-й час в подарок»: оператор должен занять 6 часов, а не 5 —
+    иначе шестой уедет другому клиенту при ручной постановке."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    cards = []
+
+    async def notifier(card):
+        cards.append(card)
+
+    ex = await _executor_with_quote(
+        kb, _BookingProvider(), hours=6, booking_handoff_notifier=notifier
+    )
+
+    await ex.run("create_booking", BOOKING_ARGS)
+
+    assert cards[0]["occupied_hours"] == 6
+    assert cards[0]["billable_hours"] == 5
+
+
+async def test_handoff_marks_an_unconfirmed_slot_for_the_operator(kb, monkeypatch):
+    """Провайдера нет — занятость неизвестна. Передача при этом не
+    отменяется (бронь всё равно ставит человек), но молчание провайдера не
+    должно выглядеть в карточке как «свободно»."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    cards = []
+
+    async def notifier(card):
+        cards.append(card)
+
+    ex = ToolExecutor(kb, "d1", today_fn=lambda: date(2026, 8, 27),
+                      booking_handoff_notifier=notifier)
+    await ex.run("calculate_price", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                     "start_time": "14:00", "hours": 3, "guests": 6})
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["status"] == "handed_off_to_operator"
+    assert cards[0]["slot_confirmed_free"] is False
+
+
+async def test_a_slot_taken_meanwhile_is_not_handed_off_but_answered(kb, monkeypatch):
+    """Занятый слот — не повод звать человека: клиенту полезнее услышать
+    альтернативу сразу. Карточка оператору при этом не уходит."""
+    from app.booking.base import AvailabilityStatus
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    cards = []
+
+    async def notifier(card):
+        cards.append(card)
+
+    provider = _BookingProvider(statuses=[AvailabilityStatus.BUSY])
+    ex = await _executor_with_quote(kb, provider, booking_handoff_notifier=notifier)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["status"] == "busy"
+    assert cards == []
+    assert ex.escalated is False
+    assert provider.bookings == []
+
+
+async def test_a_broken_telegram_does_not_swallow_the_handoff(kb, monkeypatch):
+    """Карточка не доехала — передача всё равно состоялась: чат
+    эскалирован, брони нет, ход не упал."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+
+    async def broken(card):
+        raise RuntimeError("telegram недоступен")
+
+    provider = _BookingProvider()
+    ex = await _executor_with_quote(kb, provider, booking_handoff_notifier=broken)
+
+    result = await ex.run("create_booking", BOOKING_ARGS)
+
+    assert result["status"] == "handed_off_to_operator"
+    assert ex.escalated is True
+    assert provider.bookings == []
+
+
+async def test_handoff_still_requires_a_quote_and_a_future_date(kb, monkeypatch):
+    """Передача не превращается в свалку: без котировки нечего писать в
+    карточку (нет ни часов, ни суммы), а прошедшая дата — вопрос клиенту, а
+    не работа оператору."""
+    from app.config import Settings
+    monkeypatch.setattr(
+        "app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True)
+    )
+    cards = []
+
+    async def notifier(card):
+        cards.append(card)
+
+    ex = ToolExecutor(kb, "d1", booking_provider=_BookingProvider(),
+                      today_fn=lambda: date(2026, 8, 27), booking_handoff_notifier=notifier)
+
+    without_quote = await ex.run("create_booking", BOOKING_ARGS)
+    assert without_quote["booked"] is False
+    assert "calculate_price" in without_quote["instruction"]
+
+    await ex.run("calculate_price", {"zone_id": "bath_russian", "date": "2026-08-29",
+                                     "start_time": "14:00", "hours": 3, "guests": 6})
+    past = await ex.run("create_booking", {**BOOKING_ARGS, "date": "2020-01-01"})
+    assert past["booked"] is False
+    assert "Не эскалируй" in past["instruction"]
+
+    assert cards == []
+    assert ex.escalated is False
+
+
+def test_system_prompt_ties_create_booking_to_the_payment_handoff(kb):
+    """Промт — не граница, но врать он тоже не должен: модель обязана знать,
+    что «передано менеджеру» — нормальный исход, а не сбой."""
+    text = build_system_prompt(kb)[0]["text"]
+    for fragment in [
+        "handed_off_to_operator",
+        "Ты бронь не ставишь",
+        "Сумму предоплаты назвать можно",
+    ]:
+        assert fragment in text, fragment

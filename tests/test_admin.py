@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -233,6 +234,126 @@ def test_cost_guard_uses_decimal_not_float():
     guard.add(Decimal("0.1"))
     guard.add(Decimal("0.1"))
     assert guard.add(Decimal("0.1")) is True, "0.1*3 должно быть ровно 0.3"
+
+
+def test_cost_guard_is_seeded_from_what_was_already_spent_today():
+    """Без затравки дневной лимит считался бы «с последнего рестарта», а на
+    Railway контейнер перезапускается ещё и при каждом деплое."""
+    guard = DailyCostGuard(Decimal("100"))
+
+    already_tripped = guard.seed(Decimal("90"))
+
+    assert already_tripped is False
+    assert guard.add(Decimal("15")) is True      # 105 > 100, а не 15
+
+
+def test_cost_guard_seeded_over_the_limit_reports_it_without_re_alerting():
+    """Рестарт после исчерпанного лимита не должен ни поднимать агента в
+    работу, ни слать алерт заново — он уже уходил, когда лимит превысили."""
+    paused = []
+    guard = DailyCostGuard(Decimal("100"), on_pause=lambda: paused.append(True))
+
+    assert guard.seed(Decimal("140")) is True
+    assert guard.tripped is True
+    assert paused == []
+
+
+def test_cost_guard_counter_rolls_over_at_moscow_midnight():
+    """Сутки — московские, как у лимита исходящих и лимита уступок."""
+    now = [datetime(2026, 8, 29, 20, 0, tzinfo=timezone.utc)]   # 23:00 МСК
+    guard = DailyCostGuard(Decimal("100"), now_fn=lambda: now[0])
+
+    assert guard.add(Decimal("90")) is False
+    now[0] = datetime(2026, 8, 29, 21, 30, tzinfo=timezone.utc)  # 00:30 МСК, новые сутки
+    assert guard.add(Decimal("90")) is False, "счётчик обязан начаться заново"
+    assert guard.spent == Decimal("90")
+
+
+def test_cost_guard_can_trip_again_the_next_day():
+    now = [datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)]
+    tripped = []
+    guard = DailyCostGuard(Decimal("100"), on_pause=lambda: tripped.append(1),
+                           now_fn=lambda: now[0])
+
+    assert guard.add(Decimal("150")) is True
+    now[0] = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    assert guard.add(Decimal("150")) is True
+    assert len(tripped) == 2
+
+
+def test_a_zero_limit_is_a_switched_off_guard_not_an_instant_trip():
+    """Ноль — «потолка нет» (осознанно, с WARNING в стартовом логе), а не
+    «лимит исчерпан первым же рублём»."""
+    paused = []
+    guard = DailyCostGuard(Decimal("0"), on_pause=lambda: paused.append(True))
+
+    assert guard.enabled is False
+    assert guard.add(Decimal("100000")) is False
+    assert paused == []
+
+
+def test_the_shipped_cost_limit_is_not_zero():
+    """Незаданная переменная не должна означать «лимита нет» — тот же
+    принцип, что у OUTBOUND_DAILY_LIMIT."""
+    from app.config import Settings
+
+    assert Settings().daily_cost_limit_rub > 0
+
+
+# --------------------------------------------------------------------------
+# Предохранитель подключён к реальному пути вызова модели
+# --------------------------------------------------------------------------
+
+async def test_every_turn_feeds_its_cost_to_the_guard(kb):
+    """Ход агента стоит денег — и эти деньги обязаны попасть в счётчик.
+    Иначе лимит остаётся строчкой в RUNBOOK, а не предохранителем."""
+    from app.agent.loop import AgentLoop
+
+    from tests.test_agent import FakeAnthropic, FakeResponse, TextBlock
+
+    guard = DailyCostGuard(Decimal("1000"))
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("Здравствуйте!")])])
+    loop = AgentLoop(client, kb, cost_guard=guard)
+
+    result = await loop.run_turn("d1", [], "привет")
+
+    assert guard.spent > 0
+    assert guard.spent == Decimal(result.llm_meta["cost_rub"])
+
+
+async def test_a_turn_killed_by_the_guard_rail_still_costs_money(kb):
+    """Последний рубеж не отдаёт текст клиенту, но модель уже отработала.
+    Предохранитель ограничивает трату, а не выдачу."""
+    from app.agent.loop import AgentLoop
+
+    from tests.test_agent import FakeAnthropic, FakeResponse, TextBlock
+
+    guard = DailyCostGuard(Decimal("1000"))
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("С вас 3500 ₽ за баню.")])])
+    loop = AgentLoop(client, kb, cost_guard=guard)
+
+    result = await loop.run_turn("d1", [], "сколько стоит баня?")
+
+    assert result.escalated is True          # рубеж сработал
+    assert guard.spent > 0                   # но ход всё равно оплачен
+
+
+async def test_a_broken_guard_does_not_break_the_dialogue(kb):
+    """Предохранитель сломан — разговор с живым клиентом продолжается."""
+    from app.agent.loop import AgentLoop
+
+    from tests.test_agent import FakeAnthropic, FakeResponse, TextBlock
+
+    class _Broken:
+        def add(self, cost):
+            raise RuntimeError("счётчик сломан")
+
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("Здравствуйте!")])])
+    loop = AgentLoop(client, kb, cost_guard=_Broken())
+
+    result = await loop.run_turn("d1", [], "привет")
+
+    assert result.text == "Здравствуйте!"
 
 
 # --------------------------------------------------------------------------

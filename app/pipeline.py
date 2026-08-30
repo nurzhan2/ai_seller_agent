@@ -313,19 +313,21 @@ class MessagePipeline:
 
         our_user_id = getattr(self.settings, "avito_user_id", "") or ""
         if is_outgoing_echo(payload, our_user_id):
-            # Авито шлёт вебхук и на наши собственные сообщения. Без этой
-            # проверки агент отвечает сам себе по кругу.
+            # Сообщение с НАШЕЙ стороны аккаунта. Их два вида, и по
+            # `author_id` они неразличимы: наш собственный ответ (эхо —
+            # отбросить, иначе агент отвечает сам себе по кругу) и текст,
+            # который живой менеджер написал клиенту руками из интерфейса
+            # Авито. Второе — не мусор, а самое важное событие для режима
+            # перехвата: пока человек в чате, агенту там говорить нечего
+            # (инцидент 2026-08-27/28).
             #
-            # Лог обязателен, хотя отбрасывание здесь штатное и частое.
+            # Лог обязателен, хотя отбрасывание эха штатное и частое.
             # Это ПЕРВОЕ место, где сообщение исчезает до всякой записи в
             # БД: при неверном AVITO_USER_ID (или если Авито однажды
             # положит наш id в author_id входящего) сюда уходили бы ВСЕ
             # сообщения подряд, чат не появился бы в базе вовсе, и снаружи
             # это неотличимо от «вебхуки не приходили».
-            logger.info(
-                "pipeline: отброшено эхо нашего же сообщения (author_id == AVITO_USER_ID)",
-                extra={"chat_id": extract_chat_id(payload)},
-            )
+            await self._note_outgoing_from_our_side(payload)
             return
 
         chat_id = extract_chat_id(payload)
@@ -533,6 +535,67 @@ class MessagePipeline:
             description["message_type"], description["top_level_keys"], dumped[:2000],
             extra={"chat_id": chat_id},
         )
+
+    async def _note_outgoing_from_our_side(self, payload: dict) -> None:
+        """Разбор сообщения с нашей стороны аккаунта: мы или живой менеджер.
+
+        Порядок проверок — от дешёвого к дорогому и от частого к редкому:
+        эхо собственного ответа приходит на КАЖДЫЙ ответ агента, а менеджер
+        пишет руками редко. Поэтому сначала сравнение с нашими отправками, и
+        только если не совпало — запись перехвата.
+        """
+        chat_id = extract_chat_id(payload)
+        text = (extract_text(payload) or "").strip()
+
+        if not chat_id:
+            logger.info(
+                "pipeline: отброшено эхо нашего же сообщения (author_id == AVITO_USER_ID)",
+                extra={"chat_id": None},
+            )
+            return
+
+        try:
+            ours = await self.store.was_sent_by_us(chat_id, text)
+        except Exception:
+            # Сбой проверки — считаем сообщение своим и молчим про перехват.
+            # Ошибка в другую сторону («это менеджер») заставила бы агента
+            # замолчать на окно кулдауна из-за упавшего SELECT.
+            logger.exception(
+                "pipeline: не удалось отличить эхо от сообщения менеджера",
+                extra={"chat_id": chat_id},
+            )
+            ours = True
+
+        if ours:
+            logger.info(
+                "pipeline: отброшено эхо нашего же сообщения (author_id == AVITO_USER_ID)",
+                extra={"chat_id": chat_id},
+            )
+            return
+
+        # Дошли сюда — писал человек. Прежде чем заводить состояние, тот же
+        # фильтр объявлений, что и у обычного входящего: менеджер отвечает и
+        # в чатах, где заказчик сам покупатель («Репетитор по физике»), и
+        # перехватывать там нечего — агента в этих чатах нет. Проверка стоит
+        # ПОСЛЕ сравнения с нашими отправками намеренно: своё эхо приходит на
+        # каждый ответ агента и не должно платить за резолв item_id.
+        item_id = await self._resolve_item_id(payload, chat_id)
+        if not await self._listing_is_allowed(item_id, chat_id):
+            return
+
+        logger.info(
+            "pipeline: в чате написал живой менеджер — перехват",
+            extra={"chat_id": chat_id},
+        )
+        try:
+            await self.ops_service.note_operator_message(chat_id)
+        except Exception:
+            # Не молча: не записанный перехват означает, что агент ответит
+            # поверх человека — ровно то, ради чего режим и заводился.
+            logger.exception(
+                "pipeline: перехват чата менеджером НЕ записан",
+                extra={"chat_id": chat_id},
+            )
 
     async def _handle_image_without_text(self, chat: Any) -> None:
         """Клиент прислал фото — молчание хуже шаблонного ответа. Не ход

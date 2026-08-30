@@ -39,6 +39,13 @@ MOSCOW_TZ = timezone(timedelta(hours=3), name="MSK")
 # грузить из базы заведомо больше, чем модель увидит, незачем.
 HISTORY_LIMIT = 30
 
+# Сколько последних наших исходящих сравнивать с эхом, решая «это мы или
+# живой менеджер» (app/pipeline.py, ветка эха). Авито присылает эхо в
+# пределах секунд после отправки, так что глубина здесь — запас на случай
+# отставания поллера, а не история диалога: на длинном хвосте растёт только
+# шанс совпасть с повторно отправленным тем же текстом.
+ECHO_LOOKBACK = 20
+
 # Статусы, которые НЕ попадают в историю для модели: этих текстов клиент не
 # видел. Показать их модели — значит убедить её, что она уже ответила, и
 # получить ответ на несуществующую реплику. `dry_run`/`pending` при этом
@@ -98,6 +105,10 @@ class DialogStore(Protocol):
     async def get_chat_item_id(self, chat_id: str) -> Optional[str]: ...
 
     async def get_chat_manual_hold(self, chat_id: str) -> bool: ...
+
+    async def set_chat_manual_hold(self, chat_id: str, value: bool) -> bool: ...
+
+    async def was_sent_by_us(self, chat_id: str, text: str) -> bool: ...
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
@@ -249,6 +260,26 @@ class InMemoryDialogStore:
     async def get_chat_manual_hold(self, chat_id: str) -> bool:
         existing = self.chats.get(chat_id)
         return existing.manual_hold if existing else False
+
+    async def set_chat_manual_hold(self, chat_id: str, value: bool) -> bool:
+        # `ChatRecord` — frozen: правится заменой строки целиком, как и
+        # везде в этом сторе (см. get_or_create_chat выше). Мутация поля
+        # молча роняла бы команду /hold, а она ставится по инциденту.
+        import dataclasses
+
+        chat = await self.get_or_create_chat(chat_id)
+        self.chats[chat_id] = dataclasses.replace(chat, manual_hold=value)
+        return value
+
+    async def was_sent_by_us(self, chat_id: str, text: str) -> bool:
+        normalized = (text or "").strip()
+        if not normalized:
+            return False
+        recent = [
+            m for m in self.messages.get(chat_id, [])
+            if m["direction"] == Direction.outgoing and m["author"] == Author.agent
+        ][-ECHO_LOOKBACK:]
+        return any((m["text"] or "").strip() == normalized for m in recent)
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         return self.item_zones.get(item_id)
@@ -496,6 +527,75 @@ class SqlAlchemyDialogStore:
                     select(Chat.item_id).where(Chat.chat_id == chat_id)
                 )
             ).scalar_one_or_none()
+
+    async def set_chat_manual_hold(self, chat_id: str, value: bool) -> bool:
+        """Ручной hold — тот самый флаг для 65 чатов инцидента 2026-08-28.
+
+        Ставится и снимается ТОЛЬКО отсюда (команды /hold и /unhold): его не
+        трогают ни кулдаун, ни возврат чата агенту, ни режим перехвата.
+        Смысл флага в том и есть, что снимает его человек.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Chat
+
+        async with self._session_factory() as session:
+            chat = (
+                await session.execute(select(Chat).where(Chat.chat_id == chat_id))
+            ).scalar_one_or_none()
+            if chat is None:
+                # Держать можно и чат, которого мы ещё не видели: оператор
+                # ставит hold по инциденту, а не по нашей готовности.
+                chat = Chat(chat_id=chat_id)
+                session.add(chat)
+            chat.manual_hold = value
+            await session.commit()
+        return value
+
+    async def was_sent_by_us(self, chat_id: str, text: str) -> bool:
+        """Это эхо НАШЕГО ЖЕ сообщения, а не текст живого менеджера?
+
+        Авито присылает событие на каждое исходящее — и на наши, и на
+        написанные менеджером руками из интерфейса Авито. У всех у них
+        `author_id` равен нашему аккаунту (тот самый признак, по которому
+        отсекается эхо), поэтому отличить одно от другого можно только по
+        тому, писали мы этот текст сами или нет: свои отправки лежат в
+        `messages`, чужих там нет.
+
+        Ошибиться можно в две стороны, и они неравноценны:
+          * приняли менеджера за себя — кулдаун не включится, агент продолжит
+            отвечать поверх человека (это и есть исходный инцидент);
+          * приняли себя за менеджера — агент замолчит на окно кулдауна после
+            КАЖДОГО своего ответа, то есть замолчит совсем.
+        Второе несравнимо хуже, поэтому сравнение точное: свой текст мы знаем
+        дословно и совпадём с ним наверняка, а менеджер совпадёт, только если
+        дословно повторит недавний ответ агента.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Message
+
+        normalized = (text or "").strip()
+        if not normalized:
+            # Картинка или системное событие: текста нет, сравнивать нечего,
+            # и «нашим» это считать нельзя — агент картинок не шлёт.
+            return False
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Message.text)
+                    .where(
+                        Message.chat_id == chat_id,
+                        Message.direction == Direction.outgoing,
+                        Message.author == Author.agent,
+                    )
+                    .order_by(Message.id.desc())
+                    .limit(ECHO_LOOKBACK)
+                )
+            ).scalars().all()
+
+        return any((row or "").strip() == normalized for row in rows)
 
     async def get_chat_manual_hold(self, chat_id: str) -> bool:
         """Ручной hold — для `OutboundGate` перед отправкой клиенту.

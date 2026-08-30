@@ -17,6 +17,7 @@ from app.channels import avito_payloads as pl
 from app.channels.avito import (
     AvitoAuth,
     AvitoClient,
+    AvitoTokenError,
     SpecNotVerifiedError,
     _is_retryable,
     truncate_for_avito,
@@ -148,6 +149,97 @@ async def test_token_is_not_refetched_while_valid(settings):
     await auth.get_token()
     await auth.get_token()
     assert route.call_count == 1
+
+
+# --------------------------------------------------------------------------
+# Отказ в выдаче токена приходит с HTTP 200
+#
+# Живой случай 2026-08-30: ключи в окружении оказались плейсхолдерами, Авито
+# ответил `unauthorized_client` — и всё это под кодом 200. raise_for_status
+# такое пропускает, и наружу вылезал `KeyError: 'access_token'`: трассировка
+# без единого слова о причине, хотя Авито назвал её прямо в теле.
+# --------------------------------------------------------------------------
+
+@respx.mock
+async def test_a_rejected_token_request_raises_a_named_error_not_a_key_error(settings):
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "error": "unauthorized_client",
+                "error_description": (
+                    "The client is not authorized to request a token using this method."
+                ),
+            },
+        )
+    )
+    auth = AvitoAuth(settings, redis=FakeRedis())
+
+    with pytest.raises(AvitoTokenError) as excinfo:
+        await auth.get_token()
+
+    message = str(excinfo.value)
+    assert "unauthorized_client" in message
+    assert "not authorized" in message
+
+
+@respx.mock
+async def test_the_rejection_reason_reaches_the_log(settings, caplog):
+    """Причина обязана быть в логе целиком: по ней различаются «ключи не те»,
+    «приложению не разрешён этот grant» и «интеграция не активирована»."""
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(
+            200,
+            json={"error": "invalid_client", "error_description": "Client not found"},
+        )
+    )
+    auth = AvitoAuth(settings, redis=FakeRedis())
+
+    with caplog.at_level("ERROR", logger="parmangal.avito"):
+        with pytest.raises(AvitoTokenError):
+            await auth.get_token()
+
+    assert "invalid_client" in caplog.text
+    assert "Client not found" in caplog.text
+
+
+@respx.mock
+async def test_a_body_without_any_error_fields_still_fails_clearly(settings):
+    """Ответ 200 без access_token и без error — тоже отказ, а не повод
+    падать с KeyError на неожиданной форме."""
+    respx.post(token_url()).mock(return_value=httpx.Response(200, json={"foo": "bar"}))
+    auth = AvitoAuth(settings, redis=FakeRedis())
+
+    with pytest.raises(AvitoTokenError) as excinfo:
+        await auth.get_token()
+
+    assert "access_token" in str(excinfo.value)
+
+
+@respx.mock
+async def test_a_rejected_token_is_not_cached(settings):
+    """Иначе отказ осел бы в Redis и повторялся до истечения TTL."""
+    redis = FakeRedis()
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"error": "unauthorized_client"})
+    )
+    auth = AvitoAuth(settings, redis=redis)
+
+    with pytest.raises(AvitoTokenError):
+        await auth.get_token()
+
+    assert redis.store.get("avito:access_token") is None
+
+
+@respx.mock
+async def test_a_good_token_response_still_works(settings):
+    """Проверка отказа не должна мешать нормальному пути."""
+    respx.post(token_url()).mock(
+        return_value=httpx.Response(200, json={"access_token": "tok-ok", "expires_in": 3600})
+    )
+    auth = AvitoAuth(settings, redis=FakeRedis())
+
+    assert await auth.get_token() == "tok-ok"
 
 
 @respx.mock

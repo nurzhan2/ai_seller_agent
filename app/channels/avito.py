@@ -40,6 +40,16 @@ class SpecNotVerifiedError(RuntimeError):
     """Спек помечен как непроверенный — исходящие запросы запрещены."""
 
 
+class AvitoTokenError(RuntimeError):
+    """Авито отказал в выдаче токена и объяснил, почему.
+
+    Отдельный тип, а не голый KeyError: причина отказа приходит в теле
+    ответа (`error`, `error_description`) под кодом HTTP 200, и она нужна
+    целиком — по ней различаются «ключи не те», «приложению не разрешён
+    этот grant» и «интеграция не активирована в кабинете».
+    """
+
+
 def _assert_spec_verified() -> None:
     if not ep.SPEC_VERIFIED:
         raise SpecNotVerifiedError(
@@ -164,6 +174,32 @@ class AvitoAuth:
         finally:
             if self._client is None:
                 await client.aclose()
+
+        # Авито отдаёт ОШИБКУ АВТОРИЗАЦИИ С КОДОМ 200, а не 401: тело вида
+        # {"error": "...", "error_description": "..."} приходит под HTTP 200,
+        # и raise_for_status выше её не видит. Пока этой ветки не было,
+        # провал вылезал как `KeyError: 'access_token'` — трассировка без
+        # единого слова о причине, хотя Авито причину назвал прямо в теле.
+        # Разбор 2026-08-30 на этом и застрял: в логе был KeyError, а
+        # настоящий ответ («The client is not authorized to request a token
+        # using this method») пришлось доставать отдельным скриптом
+        # (scripts/diagnose_avito_token.py).
+        if not isinstance(payload, dict) or "access_token" not in payload:
+            error = ""
+            description = ""
+            if isinstance(payload, dict):
+                error = str(payload.get("error") or "")
+                description = str(payload.get("error_description") or "")
+            logger.error(
+                "avito token request rejected: error=%s description=%s (HTTP %s)",
+                error or "(нет поля error)",
+                description or "(нет поля error_description)",
+                response.status_code,
+            )
+            raise AvitoTokenError(
+                f"Авито не выдал токен: {error or 'ответ без access_token'}"
+                + (f" — {description}" if description else "")
+            )
 
         token = payload["access_token"]
         expires_in = int(payload.get("expires_in", 86400))

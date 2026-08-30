@@ -163,6 +163,35 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
             f"Ответов агента: {flags.agent_reply_count}"
         )
 
+    @dp.message(Command("hold"))
+    async def on_hold(message: Message) -> None:
+        """Заткнуть один чат насмерть — до /unhold.
+
+        Не то же самое, что «Взять на себя»: перехват в режиме cooldown
+        истекает сам, hold — нет. Ставится по инциденту, снимается руками.
+        """
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "Использование: /hold <chat_id>\n"
+                "Агент перестаёт писать в этот чат совсем — ни ответом, ни "
+                "касанием, ни одобренным сообщением. Снять: /unhold <chat_id>."
+            )
+            return
+        await message.answer(await service.hold(parts[1].strip(), message.from_user.id))
+
+    @dp.message(Command("unhold"))
+    async def on_unhold(message: Message) -> None:
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer("Использование: /unhold <chat_id>")
+            return
+        await message.answer(await service.unhold(parts[1].strip(), message.from_user.id))
+
     @dp.message(Command("reset"))
     async def on_reset(message: Message) -> None:
         """Сбросить счётчик ответов агента в одном чате.
@@ -299,6 +328,8 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("provider", "LLM-провайдер"),
     ("chat", "Статус чата по id"),
     ("reset", "Сбросить счётчик ответов в чате"),
+    ("hold", "Заткнуть чат до /unhold"),
+    ("unhold", "Снять ручной hold с чата"),
 )
 
 

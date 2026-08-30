@@ -14,8 +14,15 @@ from decimal import Decimal
 from typing import Any, Awaitable, Callable, Optional
 
 from app.channels import kill_switch
+from app.channels.outbound_gate import TakeoverState, takeover_blocks
 from app.config import Settings, get_settings
-from app.ops.state import ChatFlags, InMemoryOpsStore, OpsStore, PendingReply, should_auto_return
+from app.ops.state import (
+    ChatFlags,
+    InMemoryOpsStore,
+    OpsStore,
+    PendingReply,
+    auto_return_reason,
+)
 
 logger = logging.getLogger("parmangal.ops")
 
@@ -33,10 +40,16 @@ class OpsService:
         settings: Optional[Settings] = None,
         send_to_avito: Optional[Callable[[str, str], Awaitable[Any]]] = None,
         redis: Optional[Any] = None,
+        # (chat_id, value) -> None. Ручной hold живёт в таблице `chats`, а не
+        # в операторском сторе: его читает граница исходящих, и она не должна
+        # зависеть от операторского контура. None — команды /hold и /unhold
+        # честно откажут, а не сделают вид, что сработали.
+        manual_hold_setter: Optional[Callable[[str, bool], Awaitable[Any]]] = None,
     ):
         self.store = store or InMemoryOpsStore()
         self.settings = settings or get_settings()
         self.send_to_avito = send_to_avito
+        self.manual_hold_setter = manual_hold_setter
         # Хранилище аварийного рубильника (/stop, /resume) — то же Redis,
         # что читает OutboundGate на каждой отправке. Без Redis (тесты,
         # локальный стенд) команды честно откажут — см. kill_switch.stop.
@@ -75,14 +88,66 @@ class OpsService:
         return {"changed": True, "message": "Агент снова отвечает"}
 
     async def auto_return_if_stale(self, chat_id: str) -> bool:
+        """Возврат чата агенту без участия человека.
+
+        Два повода, и оба ленивые — проверяются при обращении к чату, а не
+        отдельным воркером: сутки без активности (страховка от «взял и
+        забыл») и, в режиме `cooldown`, истёкшее окно тишины. Второе можно
+        было бы не чистить вовсе — гейт и так перестаёт блокировать, — но
+        тогда `is_human_takeover` навсегда остаётся поднятым, и /chat
+        показывает «у оператора» на чате, где агент давно отвечает сам.
+        """
         flags = await self.store.get_flags(chat_id)
-        if not should_auto_return(flags):
+        reason = auto_return_reason(flags, self.settings)
+        if reason is None:
             return False
         flags.is_human_takeover = False
         flags.takeover_at = None
         await self.store.set_flags(chat_id, flags)
-        await self.store.log_action(chat_id, 0, "auto_return", {"reason": "24h без активности"})
+        await self.store.log_action(chat_id, 0, "auto_return", {"reason": reason})
         return True
+
+    async def note_operator_message(self, chat_id: str) -> None:
+        """В чате написал живой менеджер (не наш агент — см.
+        app/pipeline.py, ветка эха).
+
+        Поднимает ровно тот же флаг, что и кнопка «Взять на себя»: для
+        системы «человек в чате» — одно состояние, а не два похожих. Как
+        долго оно молчит — решает режим на границе исходящих, а не эта
+        запись. Поэтому здесь нет ни одной ветки по TAKEOVER_MODE: запись
+        факта и решение по нему живут в разных местах намеренно.
+
+        `takeover_at` двигается КАЖДЫМ сообщением менеджера — на этом и
+        держится «окно от последнего сообщения».
+        """
+        flags = await self.store.get_flags(chat_id)
+        flags.is_human_takeover = True
+        flags.takeover_at = datetime.now(timezone.utc)
+        await self.store.set_flags(chat_id, flags)
+        await self.store.log_action(chat_id, 0, "operator_message", {})
+
+    async def hold(self, chat_id: str, user_id: int) -> str:
+        """Ручной hold на один чат — жёстче любого перехвата.
+
+        Отдельный флаг (`Chat.manual_hold`), а не `is_human_takeover`, и
+        разница принципиальная: перехват в режиме `cooldown` истекает сам
+        через окно, а hold не истекает никогда и не снимается ни возвратом
+        чата агенту, ни сменой режима — только командой /unhold. Заведён по
+        инциденту 2026-08-28, когда 65 чатов нужно было заткнуть насмерть, а
+        не «на 15 минут».
+        """
+        if self.manual_hold_setter is None:
+            return "Ручной hold недоступен: нет доступа к базе."
+        await self.manual_hold_setter(chat_id, True)
+        await self.store.log_action(chat_id, user_id, "hold", {})
+        return f"⛔ Чат {chat_id} на ручном hold. Агент туда не пишет, пока не будет /unhold."
+
+    async def unhold(self, chat_id: str, user_id: int) -> str:
+        if self.manual_hold_setter is None:
+            return "Ручной hold недоступен: нет доступа к базе."
+        await self.manual_hold_setter(chat_id, False)
+        await self.store.log_action(chat_id, user_id, "unhold", {})
+        return f"✅ Ручной hold с чата {chat_id} снят."
 
     # -- модерация ---------------------------------------------------------
 
@@ -293,7 +358,13 @@ class OpsService:
         await self.auto_return_if_stale(chat_id)
         flags = await self.store.get_flags(chat_id)
 
-        if flags.is_human_takeover:
+        if takeover_blocks(
+            TakeoverState(flags.is_human_takeover, flags.takeover_at), self.settings
+        ):
+            # ТА ЖЕ функция, что на границе исходящих (app/channels/
+            # outbound_gate.py). Здесь она работает на опережение — чтобы не
+            # платить за ход модели, который гейт всё равно не пропустит, —
+            # но правило одно и живёт там, а не продублировано здесь.
             return False, "чат у оператора"
         if not flags.ai_enabled:
             return False, "ИИ выключен для этого чата"

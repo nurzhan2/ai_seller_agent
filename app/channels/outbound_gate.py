@@ -33,6 +33,8 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from app.channels.daily_limit import DailyLimitResult
@@ -43,6 +45,8 @@ logger = logging.getLogger("parmangal.outbound")
 ItemIdLookup = Callable[[str], Awaitable[Optional[str]]]
 # chat_id -> стоит ли на чате ручной hold (app/db/models.py:Chat.manual_hold).
 ManualHoldLookup = Callable[[str], Awaitable[bool]]
+# chat_id -> состояние перехвата чата человеком (см. TakeoverState ниже).
+TakeoverLookup = Callable[[str], Awaitable["TakeoverState"]]
 # () -> стоит ли глобальный аварийный рубильник (app/channels/kill_switch.py).
 KillSwitchLookup = Callable[[], Awaitable[bool]]
 # () -> результат проверки суточного лимита (app/channels/daily_limit.py).
@@ -51,6 +55,67 @@ DailyLimitCheck = Callable[[], Awaitable[DailyLimitResult]]
 # (just_exceeded), либо не удалось его проверить (redis_unavailable) —
 # разбирать, какой из двух случаев, дело колбэка, а не гейта.
 DailyLimitAlert = Callable[[DailyLimitResult], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class TakeoverState:
+    """Ровно те два поля `ChatFlags`, которые нужны правилу ниже.
+
+    Свой тип, а не `ChatFlags` из app/ops/state.py, чтобы граница исходящих
+    не зависела от операторского контура: гейт обязан работать и там, где
+    операторского стора нет вовсе (харнесс, тесты), а направление зависимостей
+    «канал → операторский модуль» рано или поздно превратится в кольцо.
+    """
+
+    is_human_takeover: bool = False
+    takeover_at: Optional[datetime] = None
+
+
+def takeover_blocks(
+    state: TakeoverState, settings: Any, now: Optional[datetime] = None
+) -> bool:
+    """ЕДИНСТВЕННОЕ определение правила «в чате человек, агент молчит».
+
+    Зовётся из двух мест и обязано оставаться одной функцией: гейт применяет
+    его на границе (инвариант, который нельзя обойти новым путём отправки),
+    а `should_agent_reply` — заранее, чтобы не платить за ход модели, который
+    всё равно не уйдёт. Две похожие проверки в двух файлах разъехались бы на
+    первой же правке режима.
+
+    Режимы — app/config.py:takeover_mode. `cooldown` считает окно от
+    ПОСЛЕДНЕГО сообщения менеджера: каждое новое его сообщение сдвигает
+    `takeover_at` и продлевает тишину.
+
+    `takeover_at is None` при поднятом флаге — это «человек в чате, а когда
+    он писал, мы не знаем». Молчим (fail closed): ошибиться в сторону
+    молчания здесь дешевле, чем заговорить поверх живого менеджера — ровно
+    это и было инцидентом.
+    """
+    if not state.is_human_takeover:
+        return False
+
+    mode = getattr(settings, "takeover_mode", "cooldown")
+    if mode == "off":
+        return False
+    if mode == "permanent":
+        return True
+
+    if state.takeover_at is None:
+        return True
+
+    minutes = int(getattr(settings, "takeover_cooldown_minutes", 15) or 0)
+    if minutes <= 0:
+        # Нулевое окно — это «кулдаун выключен», а не «молчать вечно».
+        return False
+
+    taken_at = state.takeover_at
+    if taken_at.tzinfo is None:
+        # SQLite в тестах отдаёт naive datetime; в Postgres колонка aware.
+        # Считать naive за локальное время — способ получить окно длиной в
+        # часовой пояс.
+        taken_at = taken_at.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return now - taken_at < timedelta(minutes=minutes)
 
 
 async def is_listing_allowed(
@@ -171,6 +236,7 @@ class OutboundGate:
         settings: Any,
         item_id_lookup: Optional[ItemIdLookup] = None,
         manual_hold_lookup: Optional[ManualHoldLookup] = None,
+        takeover_lookup: Optional[TakeoverLookup] = None,
         kill_switch_lookup: Optional[KillSwitchLookup] = None,
         daily_limit_check: Optional[DailyLimitCheck] = None,
         daily_limit_alert: Optional[DailyLimitAlert] = None,
@@ -180,6 +246,7 @@ class OutboundGate:
         self._settings = settings
         self._item_id_lookup = item_id_lookup
         self._manual_hold_lookup = manual_hold_lookup
+        self._takeover_lookup = takeover_lookup
         self._kill_switch_lookup = kill_switch_lookup
         self._daily_limit_check = daily_limit_check
         self._daily_limit_alert = daily_limit_alert
@@ -231,6 +298,27 @@ class OutboundGate:
                 # ровно той ошибкой, ради которой hold и заводили.
                 logger.exception(
                     "outbound: не удалось проверить manual_hold — отправка заблокирована",
+                    extra={"chat_id": chat_id},
+                )
+                return False
+
+        # Перехват чата человеком — сразу после ручного hold и по тем же
+        # правилам обработки сбоя. Порядок с hold именно такой: hold строже
+        # (снимается только руками), и если стоят оба, в логе должен быть
+        # виден он, а не кулдаун, который истечёт сам.
+        if self._takeover_lookup is not None:
+            try:
+                state = await self._takeover_lookup(chat_id)
+            except Exception:
+                logger.exception(
+                    "outbound: не удалось проверить перехват чата — отправка заблокирована",
+                    extra={"chat_id": chat_id},
+                )
+                return False
+            if takeover_blocks(state, self._settings):
+                logger.info(
+                    "outbound: заблокировано — в чате живой менеджер (режим %s)",
+                    getattr(self._settings, "takeover_mode", "cooldown"),
                     extra={"chat_id": chat_id},
                 )
                 return False

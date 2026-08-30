@@ -140,9 +140,20 @@ class AgentLoop:
         dialog_model: str = MAIN_MODEL,
         classifier_model: str = CLASSIFIER_MODEL,
         booking_provider: Any = None,       # BookingProvider — YClientsProvider или None
+        photo_provider: Any = None,         # .get(zone_id) -> list[image_id], см. app/media/photos.py
         concessions_today_provider: Any = None,   # async () -> int, R10 дневной лимит
         booking_sink: Any = None,           # .save(**record) — запись брони в нашу БД
         booking_notifier: Any = None,       # async (record) -> None — уведомление оператору
+        # async (card) -> None — карточка «поставьте бронь руками» на этапе
+        # оплаты (payment.handoff_on_payment_step). Не то же самое, что
+        # booking_notifier: там бронь уже стоит, здесь её ещё нет.
+        booking_handoff_notifier: Any = None,
+        # DailyCostGuard (app/metrics.py) — предохранитель по расходу на
+        # модели. Живёт ЗДЕСЬ, а не в конвейере, потому что это единственная
+        # точка, через которую проходит каждый платный вызов модели: и
+        # обычный ход, и «чистый» повторный ход при запросе на скидку, и
+        # прогон харнесса. None (тесты, харнесс) — лимита нет.
+        cost_guard: Any = None,
     ):
         # `client` принимает три формы ради обратной совместимости с уже
         # написанными тестами и харнессом: готовый LLMProvider, «сырой»
@@ -154,6 +165,7 @@ class AgentLoop:
         self.kb = kb
         self.dialog_model = dialog_model
         self.classifier_model = classifier_model
+        self.cost_guard = cost_guard
         # `self.kb`, а НЕ захваченный параметр `kb`: база знаний
         # перезагружается на лету, когда оператор правит цену из Telegram
         # (app/ops/menu_service.py), и обновление `agent_loop.kb` обязано
@@ -162,10 +174,12 @@ class AgentLoop:
         self.executor_factory = executor_factory or (
             lambda dialog_id, state, concessions_blocked=False: ToolExecutor(
                 self.kb, dialog_id, state, booking_provider=booking_provider,
+                photo_provider=photo_provider,
                 concessions_blocked=concessions_blocked,
                 concessions_today_provider=concessions_today_provider,
                 booking_sink=booking_sink,
                 booking_notifier=booking_notifier,
+                booking_handoff_notifier=booking_handoff_notifier,
             )
         )
 
@@ -297,6 +311,17 @@ class AgentLoop:
             ),
             "tool_iterations": len(quote_statuses) or len(tool_calls),
         }
+
+        # Расход считается ДО ветки последнего рубежа: этот ход уже стоил
+        # денег, даже если его текст клиенту не уйдёт. Предохранитель
+        # оплаченное не возвращает — он ограничивает трату, а не выдачу.
+        if self.cost_guard is not None:
+            try:
+                self.cost_guard.add(Decimal(llm_meta["cost_rub"]))
+            except Exception:
+                # Предохранитель не должен ронять ход клиента. Не сработал —
+                # это видно в логе и в /admin/costs, а разговор продолжается.
+                logger.exception("cost guard failed", extra={"dialog_id": dialog_id})
 
         # Последний рубеж: инструмент ни разу не вызывался за весь ход, а в
         # тексте всё равно всплыла цена. Не имеет значения, какой провайдер

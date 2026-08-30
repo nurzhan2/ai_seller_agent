@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -303,15 +304,17 @@ def test_lifespan_kb_reload_updates_agent_loop_and_pipeline():
 
 
 # --------------------------------------------------------------------------
-# AUTO_BOOKING_ENABLED в стартовом логе
+# Бронирование в стартовом логе
 # --------------------------------------------------------------------------
 #
-# Флаг читается лениво, в момент вызова инструмента
+# Оба флага читаются лениво, в момент вызова инструмента
 # (app/agent/tools.py:_tool_create_booking), поэтому до первой попытки брони
-# он никак себя не проявляет. Оба состояния обязаны быть в логе старта:
-# «выключено» — чтобы отсутствие переменной не читалось как «забыли на
-# деплое» (ровно тот класс ошибки, что уже стоил 65 сообщений), «включено» —
-# чтобы включение без проверки оплаты нельзя было проглядеть.
+# они никак себя не проявляют. В логе старта обязаны быть все три состояния:
+# «оплату ведёт оператор» (боевое — агент не бронирует вообще, и значение
+# AUTO_BOOKING_ENABLED не значит ничего), «выключено» — чтобы отсутствие
+# переменной не читалось как «забыли на деплое» (ровно тот класс ошибки, что
+# уже стоил 65 сообщений), «включено» — чтобы автобронирование без проверки
+# оплаты нельзя было проглядеть.
 
 
 def _startup_log(monkeypatch, env, level=logging.WARNING):
@@ -353,9 +356,37 @@ def _startup_log(monkeypatch, env, level=logging.WARNING):
     return chr(10).join(r.getMessage() for r in records)
 
 
+def _without_payment_handoff(monkeypatch):
+    """Гасит payment.handoff_on_payment_step в базе знаний, которую грузит
+    lifespan. Нужно ровно для двух тестов ниже: в боевой настройке флаг
+    включён, ветки про AUTO_BOOKING_ENABLED недостижимы, а покрытие им всё
+    равно нужно — они снова заработают в день, когда заказчик решит
+    вернуть автобронирование."""
+    from app.kb.loader import load_catalog as real_load_catalog
+
+    def patched(*args, **kwargs):
+        kb = real_load_catalog(*args, **kwargs)
+        kb.payment.payment.handoff_on_payment_step = False
+        return kb
+
+    monkeypatch.setattr("app.main.load_catalog", patched)
+
+
+def test_startup_says_the_agent_does_not_book_at_all(monkeypatch):
+    """Боевое состояние: этап оплаты передан оператору. Значение
+    AUTO_BOOKING_ENABLED при этом ни на что не влияет, и лог обязан сказать
+    именно это — иначе включённый рубильник читается как «агент бронирует»."""
+    text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "true"})
+
+    assert "handoff_on_payment_step=true" in text
+    assert "НЕ ставит брони" in text
+    assert "ни на что не влияет" in text
+
+
 def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
     """Выключенное автобронирование обязано быть НАПИСАНО в логе, а не
     выводиться из отсутствия переменной."""
+    _without_payment_handoff(monkeypatch)
     text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "false"})
 
     assert "AUTO_BOOKING_ENABLED=false" in text
@@ -365,10 +396,136 @@ def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
 def test_startup_warns_that_auto_booking_is_enabled(monkeypatch):
     """Включённое автобронирование — не «всё в порядке», а состояние, в
     котором бронь ставится без проверки оплаты. Тоже WARNING, не info."""
+    _without_payment_handoff(monkeypatch)
     text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "true"})
 
     assert "AUTO_BOOKING_ENABLED=true" in text
     assert "БЕЗ проверки оплаты" in text
+
+
+# --------------------------------------------------------------------------
+# Предохранитель по расходу: проводка и стартовый лог
+# --------------------------------------------------------------------------
+
+def test_lifespan_wires_the_cost_guard_into_the_agent_loop():
+    """Ровно тот дефект, ради которого это делалось: класс существовал и был
+    покрыт тестами, но не создавался нигде, кроме них, — лимит расхода был
+    заявлен в RUNBOOK и не работал."""
+    from app.metrics import DailyCostGuard
+
+    state = _real_app_state()
+
+    guard = getattr(state, "cost_guard", None)
+    assert isinstance(guard, DailyCostGuard)
+    assert state.pipeline.agent_loop.cost_guard is guard, (
+        "предохранитель обязан доехать до единственной точки, через которую "
+        "проходит каждый платный вызов модели"
+    )
+
+
+def test_the_cost_limit_actually_pauses_the_agent():
+    """Смысл предохранителя не в записи в лог, а в остановке. Пауза — та же
+    самая, что ставит оператор командой /pause: один рубильник, один способ
+    снять. (Мутация «пауза не ставится» пережила первый заход тестов —
+    проверялась проводка гейта, но не то, что он делает.)"""
+    from app.config import Settings
+    from app.main import build_cost_guard
+
+    settings = Settings(daily_cost_limit_rub=Decimal("100"))
+    assert settings.agent_paused is False
+    guard = build_cost_guard(settings, ops_bot=None)
+
+    assert guard.add(Decimal("150")) is True
+    assert settings.agent_paused is True
+
+
+def test_a_cost_limit_below_the_threshold_leaves_the_agent_working():
+    from app.config import Settings
+    from app.main import build_cost_guard
+
+    settings = Settings(daily_cost_limit_rub=Decimal("100"))
+    guard = build_cost_guard(settings, ops_bot=None)
+
+    guard.add(Decimal("99"))
+
+    assert settings.agent_paused is False
+
+
+async def test_the_cost_limit_alerts_the_operator_in_telegram():
+    """Алерт уходит задачей, а не await: add() зовётся из синхронного
+    участка хода агента, где клиент ждёт ответа."""
+    import asyncio
+
+    from app.config import Settings
+    from app.main import build_cost_guard
+
+    sent = []
+
+    class _Bot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    settings = Settings(daily_cost_limit_rub=Decimal("100"), telegram_ops_chat_id="-100500")
+    guard = build_cost_guard(settings, ops_bot=_Bot())
+
+    guard.add(Decimal("150"))
+    await asyncio.sleep(0)          # даём созданной задаче отработать
+
+    assert len(sent) == 1
+    chat_id, text = sent[0]
+    assert chat_id == "-100500"
+    assert "ЛИМИТ РАСХОДА" in text
+    assert "150" in text            # сколько именно потрачено
+    assert "/resume" in text        # чем снимать — само не отпустит
+
+
+def test_a_missing_telegram_still_pauses_the_agent():
+    """Молча остановиться хуже, чем остановиться с записью только в логе.
+    Но продолжать тратить деньги хуже обоих вариантов."""
+    from app.config import Settings
+    from app.main import build_cost_guard
+
+    settings = Settings(daily_cost_limit_rub=Decimal("100"))   # без ops-чата
+    guard = build_cost_guard(settings, ops_bot=None)
+
+    guard.add(Decimal("150"))
+
+    assert settings.agent_paused is True
+
+
+def test_the_cost_guard_starts_from_what_the_database_already_spent(monkeypatch):
+    """Затравка обязана ПРИМЕНИТЬСЯ, а не просто существовать: без неё
+    дневной лимит считается «с последнего рестарта», и на Railway, где
+    контейнер перезапускается при каждом деплое, потолок не наступает
+    никогда."""
+    from decimal import Decimal
+
+    from app.admin.queries import SqlAlchemyAdminQueries
+
+    async def already_spent(self):
+        return Decimal("777")
+
+    monkeypatch.setattr(SqlAlchemyAdminQueries, "cost_spent_today", already_spent)
+
+    state = _real_app_state()
+
+    assert state.cost_guard.spent == Decimal("777")
+
+
+def test_startup_reports_an_active_cost_limit(monkeypatch):
+    text = _startup_log(monkeypatch, {"DAILY_COST_LIMIT_RUB": "1500"}, level=logging.INFO)
+
+    assert "DAILY_COST_LIMIT_RUB=1500" in text
+    assert "/resume" in text
+
+
+def test_startup_warns_when_the_cost_limit_is_switched_off(monkeypatch):
+    """Ноль — осознанно снятый потолок, и это WARNING: незаданный лимит
+    ничем себя не проявит, пока не придёт счёт."""
+    text = _startup_log(monkeypatch, {"DAILY_COST_LIMIT_RUB": "0"})
+
+    assert "DAILY_COST_LIMIT_RUB=0" in text
+    assert "ОТКЛЮЧЁН" in text
 
 
 # --------------------------------------------------------------------------

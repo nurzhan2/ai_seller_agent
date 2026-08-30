@@ -21,13 +21,16 @@ from app.config import Settings, get_settings
 from app.db.session import get_engine, get_sessionmaker
 from app.kb.loader import KnowledgeBase, load_catalog
 from app.logging_setup import configure_logging
-from app.metrics import dry_run_gauge, render_metrics
+from app.media.photos import KbPhotoProvider
+from app.metrics import DailyCostGuard, dry_run_gauge, render_metrics
 from app.ops.bot import OpsService
 from app.ops.handlers import build_dispatcher, set_bot_commands
 from app.ops.notifications import (
     DialogCard,
     dialog_keyboard,
+    render_booking_handoff,
     render_booking_notice,
+    render_daily_cost_limit_notice,
     render_dialog_card,
     render_outbound_daily_limit_notice,
     render_outbound_daily_limit_unavailable_notice,
@@ -117,6 +120,92 @@ def build_booking_notifier(settings: Any, ops_bot: Any):
         )
 
     return notify
+
+
+def build_booking_handoff_notifier(settings: Any, ops_bot: Any):
+    """Карточка «поставьте бронь руками» — этап оплаты ведёт человек.
+
+    Тоже без кнопок, но по обратной причине, чем `build_booking_notifier`:
+    там одобрять нечего, потому что бронь уже стоит; здесь — потому что
+    нужна работа, а не одобрение. Кнопки «Взять на себя» и ссылка на чат
+    приходят отдельной карточкой диалога: ход помечен эскалацией
+    (app/agent/tools.py:PAYMENT_HANDOFF_REASON), и конвейер шлёт её сам.
+
+    Без бота или без TELEGRAM_OPS_CHAT_ID возвращается None — передача от
+    этого не отменяется: бронь всё равно не ставится, чат всё равно
+    эскалирован и виден в /admin/dialogs.
+    """
+    if ops_bot is None or not getattr(settings, "telegram_ops_chat_id", ""):
+        return None
+
+    async def notify(card: dict) -> None:
+        await ops_bot.send_message(
+            chat_id=settings.telegram_ops_chat_id,
+            text=render_booking_handoff(card),
+        )
+
+    return notify
+
+
+def _takeover_lookup(ops_service: Any):
+    """`ChatFlags` операторского стора -> `TakeoverState` границы исходящих.
+
+    Переходник, а не прямая передача `get_flags`: гейт намеренно знает только
+    два поля и ничего — про операторский контур (см. TakeoverState).
+    """
+
+    from app.channels.outbound_gate import TakeoverState
+
+    async def lookup(chat_id: str) -> TakeoverState:
+        flags = await ops_service.store.get_flags(chat_id)
+        return TakeoverState(flags.is_human_takeover, flags.takeover_at)
+
+    return lookup
+
+
+def build_cost_guard(settings: Any, ops_bot: Any) -> DailyCostGuard:
+    """Предохранитель по расходу на модели — с реальной паузой агента.
+
+    Пауза ставится тем же способом, что и оператором из Telegram
+    (`settings.agent_paused`, см. app/ops/bot.py:pause_all): один рубильник,
+    один способ снять — /resume. Заводить второй флаг «остановлен из-за
+    денег» значило бы получить состояние, о котором /resume не знает.
+
+    Алерт уходит `create_task`, а не `await`: `DailyCostGuard.add` вызывается
+    из синхронного участка хода агента, и ждать там Telegram нельзя — клиент
+    в это время ждёт ответа. Без бота или без TELEGRAM_OPS_CHAT_ID пауза всё
+    равно ставится: молча остановиться хуже, чем остановиться с записью
+    только в логе, но продолжать тратить деньги хуже обоих вариантов.
+    """
+
+    def on_pause() -> None:
+        settings.agent_paused = True
+        logger.error(
+            "DAILY_COST_LIMIT_RUB=%s исчерпан — агент поставлен на паузу, "
+            "снять только через /resume",
+            settings.daily_cost_limit_rub,
+        )
+        if ops_bot is None or not getattr(settings, "telegram_ops_chat_id", ""):
+            return
+        text = render_daily_cost_limit_notice(guard.spent, guard.limit_rub)
+
+        async def send() -> None:
+            try:
+                await ops_bot.send_message(
+                    chat_id=settings.telegram_ops_chat_id, text=text
+                )
+            except Exception:
+                logger.exception("cost limit alert send failed")
+
+        try:
+            asyncio.get_running_loop().create_task(send())
+        except RuntimeError:
+            # Цикла нет (тест зовёт add() синхронно) — пауза уже стоит,
+            # это главное; алерт в таком контексте отправлять некуда.
+            logger.warning("cost limit alert skipped: нет работающего event loop")
+
+    guard = DailyCostGuard(settings.daily_cost_limit_rub, on_pause=on_pause)
+    return guard
 
 
 def build_daily_limit_alert(settings: Any, ops_bot: Any):
@@ -478,6 +567,14 @@ async def lifespan(app: FastAPI):
     from app.dialog_store import SqlAlchemyBookingSink, SqlAlchemyDialogStore
 
     dialog_store = SqlAlchemyDialogStore(get_sessionmaker())
+
+    # /hold и /unhold правят `chats.manual_hold` — ту же колонку, что читает
+    # граница исходящих. Ставится ПОСЛЕ создания стора, а не в конструкторе
+    # OpsService: операторский контур поднимается раньше конвейера, и ссылка
+    # на ещё не созданный dialog_store роняла бы весь старт приложения.
+    # Не через операторский стор — hold обязан работать и тогда, когда
+    # операторский контур не поднялся вовсе.
+    ops_service.manual_hold_setter = dialog_store.set_chat_manual_hold
     # Единственная дверь наружу. Дальше по коду в качестве «клиента Авито»
     # передаётся ИМЕННО гейт, а не avito_client — чтобы новый путь отправки
     # физически не мог обойти белый список объявлений (см. докстринг
@@ -488,6 +585,11 @@ async def lifespan(app: FastAPI):
         settings,
         dialog_store.get_chat_item_id,
         dialog_store.get_chat_manual_hold,
+        # Перехват чата человеком. Состояние берётся из операторского стора
+        # (тот же флаг, что двигает кнопка «Взять на себя»), а решение по
+        # нему принимает сам гейт — по TAKEOVER_MODE, одной функцией на весь
+        # проект (app/channels/outbound_gate.py:takeover_blocks).
+        takeover_lookup=_takeover_lookup(ops_service),
         # Аварийный рубильник (/stop, /resume) и суточный лимит — та же
         # причина, что у белого списка объявлений строкой выше: должны
         # работать одинаково для всех четырёх путей отправки, а не только
@@ -541,6 +643,32 @@ async def lifespan(app: FastAPI):
     from app.pipeline import MessagePipeline
 
     dialog_model, classifier_model = resolve_models(settings)
+
+    # Предохранитель по расходу. Затравка из БД — обязательна: без неё
+    # дневной лимит считался бы «с последнего рестарта», а на Railway
+    # контейнер перезапускается и при каждом деплое. Читаем тем же
+    # admin_queries, что и /admin/costs, — один источник, одни числа.
+    cost_guard = build_cost_guard(settings, ops_bot)
+    try:
+        already_tripped = cost_guard.seed(await admin_queries.cost_spent_today())
+    except Exception:
+        # БД недоступна на старте (та же ситуация, что и у остальных
+        # supervised_*): поднимаемся с нулевым счётчиком, а не падаем.
+        # Предохранитель при этом слабее — скажем об этом вслух.
+        logger.exception(
+            "cost guard: расход за сегодня не прочитан из БД — счётчик "
+            "стартует с нуля, дневной лимит на этих сутках занижен не будет"
+        )
+        already_tripped = False
+    if already_tripped:
+        settings.agent_paused = True
+        logger.error(
+            "DAILY_COST_LIMIT_RUB=%s был исчерпан ещё до старта (потрачено "
+            "%s ₽) — агент поднят на паузе, снять только через /resume",
+            settings.daily_cost_limit_rub, cost_guard.spent,
+        )
+    app.state.cost_guard = cost_guard
+
     # dialog_store уже создан выше (нужен гейту исходящих). Он же идёт и
     # сюда: его count_concessions_today нужен AgentLoop — R10 (дневной
     # лимит уступок) без него никогда не видит реальное число, только 0.
@@ -550,9 +678,18 @@ async def lifespan(app: FastAPI):
         dialog_model=dialog_model,
         classifier_model=classifier_model,
         booking_provider=booking_provider,
+        # Фотографии — из базы знаний, КОЛБЭКОМ: `app.state.kb` заменяется
+        # целиком, когда оператор правит каталог из Telegram, и провайдер
+        # обязан это видеть. На 2026-08-30 у всех зон `photos: []` — файлы
+        # лежат в media/photos/, но scripts/import_photos.py не запускался,
+        # так что инструмент по-прежнему честно отвечает «фотографий нет».
+        # Проводка нужна, чтобы в день импорта не пришлось её вспоминать.
+        photo_provider=KbPhotoProvider(lambda: app.state.kb),
         concessions_today_provider=dialog_store.count_concessions_today,
         booking_sink=SqlAlchemyBookingSink(get_sessionmaker()),
         booking_notifier=build_booking_notifier(settings, ops_bot),
+        booking_handoff_notifier=build_booking_handoff_notifier(settings, ops_bot),
+        cost_guard=cost_guard,
     )
     pipeline = MessagePipeline(
         store=dialog_store,
@@ -595,7 +732,21 @@ async def lifespan(app: FastAPI):
     # деплое» — тот же класс ошибки, что уже стоил 65 сообщений. Включённое
     # состояние тем более обязано быть видно при старте: до первой брони
     # оно ничем себя не проявляет.
-    if settings.auto_booking_enabled:
+    #
+    # Порядок проверок в логе повторяет порядок в коде: этап оплаты старше
+    # рубильника. Пока handoff_on_payment_step=true, AUTO_BOOKING_ENABLED не
+    # значит ничего — и сказать об этом при старте важнее, чем повторить
+    # значение переменной, иначе включённый рубильник читается как
+    # «агент бронирует», а он не бронирует.
+    if app.state.kb.payment.payment.handoff_on_payment_step:
+        logger.warning(
+            "payment.handoff_on_payment_step=true — агент НЕ ставит брони "
+            "вообще: на этапе оплаты диалог передаётся оператору с готовой "
+            "карточкой, бронь в календаре ставит человек. AUTO_BOOKING_ENABLED"
+            "=%s при этом ни на что не влияет",
+            settings.auto_booking_enabled,
+        )
+    elif settings.auto_booking_enabled:
         logger.warning(
             "AUTO_BOOKING_ENABLED=true — агент ставит брони в YCLIENTS САМ, "
             "БЕЗ проверки оплаты: её в коде нет, подтверждение платежа "
@@ -615,6 +766,25 @@ async def lifespan(app: FastAPI):
     # info: молча снятый потолок исходящих ничем себя не проявит, пока не
     # уйдёт лишняя тысяча сообщений. Настроенный лимит достаточно показать
     # числом.
+    # Дневной лимит расхода — по тому же принципу, что и лимит исходящих:
+    # состояние читается из лога, а не выводится из наличия переменной.
+    # Ноль здесь означает «потолка на деньги нет вообще» — это WARNING, а не
+    # info: незаданный лимит ничем себя не проявит, пока не придёт счёт.
+    if settings.daily_cost_limit_rub <= 0:
+        logger.warning(
+            "DAILY_COST_LIMIT_RUB=%s — дневной лимит расхода на модели "
+            "ОТКЛЮЧЁН: агент не остановится ни на какой сумме",
+            settings.daily_cost_limit_rub,
+        )
+    else:
+        logger.info(
+            "DAILY_COST_LIMIT_RUB=%s ₽ — дневной лимит расхода активен "
+            "(потрачено сегодня: %s ₽). При превышении агент уходит на паузу; "
+            "счётчик обнуляется в полночь по Москве, пауза снимается только "
+            "командой /resume",
+            settings.daily_cost_limit_rub, cost_guard.spent,
+        )
+
     if settings.outbound_daily_limit <= 0:
         logger.warning(
             "OUTBOUND_DAILY_LIMIT=%d — суточный лимит исходящих ОТКЛЮЧЁН: "

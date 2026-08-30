@@ -9,6 +9,7 @@ u2u-…, в 12:09 конвейер тот же чат заблокировал �
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -20,6 +21,8 @@ from app.channels.outbound_gate import (
     ListingNotAllowed,
     OutboundGate,
     SendingHalted,
+    TakeoverState,
+    takeover_blocks,
 )
 from app.config import Settings
 
@@ -600,3 +603,141 @@ def test_every_sending_method_of_the_client_is_covered_by_the_gate():
     assert sending <= covered, (
         f"в AvitoClient есть методы отправки без проверки в OutboundGate: {sending - covered}"
     )
+
+
+# --------------------------------------------------------------------------
+# TAKEOVER_MODE: что делает агент, когда в чате появился живой менеджер
+#
+# Инцидент 2026-08-27/28: менеджер писал клиенту сам, агент отвечал поверх.
+# Правило живёт ОДНОЙ функцией на границе исходящих (takeover_blocks), и
+# тесты ниже бьют именно по ней и по её применению в обоих местах вызова.
+# --------------------------------------------------------------------------
+
+def _flags(minutes_ago: float = 0.0) -> TakeoverState:
+    return TakeoverState(
+        is_human_takeover=True,
+        takeover_at=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+    )
+
+
+def _settings(mode: str, minutes: int = 15) -> Settings:
+    # `avito_blocked_items="none"` — осознанно снятый фильтр объявлений (см.
+    # соседние тесты): здесь проверяется перехват, и отказ по чёрному списку
+    # маскировал бы результат.
+    return Settings(
+        takeover_mode=mode,
+        takeover_cooldown_minutes=minutes,
+        avito_blocked_items="none",
+    )
+
+
+def test_the_shipped_takeover_mode_is_cooldown():
+    """Дефолт — не «как было»: `permanent` держит чат за оператором навсегда
+    и требует помнить про кнопку, `off` возвращает инцидент."""
+    assert Settings().takeover_mode == "cooldown"
+    assert Settings().takeover_cooldown_minutes == 15
+
+
+def test_takeover_never_blocks_a_chat_nobody_took():
+    for mode in ("off", "cooldown", "permanent"):
+        assert takeover_blocks(TakeoverState(), _settings(mode)) is False, mode
+
+
+def test_mode_off_lets_the_agent_talk_over_a_live_manager():
+    """Режим для отладки, и в докстринге настройки так и написано: включать
+    в бою — вернуть тот же инцидент."""
+    assert takeover_blocks(_flags(minutes_ago=0), _settings("off")) is False
+    assert takeover_blocks(_flags(minutes_ago=999), _settings("off")) is False
+
+
+def test_mode_permanent_blocks_until_someone_returns_the_chat():
+    assert takeover_blocks(_flags(minutes_ago=0), _settings("permanent")) is True
+    assert takeover_blocks(_flags(minutes_ago=60 * 24 * 7), _settings("permanent")) is True
+
+
+def test_mode_cooldown_blocks_inside_the_window_and_lets_go_after():
+    settings = _settings("cooldown", minutes=15)
+
+    assert takeover_blocks(_flags(minutes_ago=0), settings) is True
+    assert takeover_blocks(_flags(minutes_ago=14), settings) is True
+    assert takeover_blocks(_flags(minutes_ago=16), settings) is False
+
+
+def test_the_cooldown_window_is_measured_from_the_last_manager_message():
+    """«Окно от последнего сообщения»: менеджер, который пишет каждые пять
+    минут, держит агента молчащим всё это время, а не первые 15 минут."""
+    settings = _settings("cooldown", minutes=15)
+    old = _flags(minutes_ago=40)
+    assert takeover_blocks(old, settings) is False
+
+    # Пришло новое сообщение менеджера — takeover_at сдвинулся.
+    assert takeover_blocks(_flags(minutes_ago=0), settings) is True
+
+
+def test_a_takeover_without_a_timestamp_stays_silent():
+    """«Человек в чате, а когда писал — не знаем». Молчим: заговорить поверх
+    живого менеджера дороже, чем промолчать лишний раз."""
+    state = TakeoverState(is_human_takeover=True, takeover_at=None)
+
+    assert takeover_blocks(state, _settings("cooldown")) is True
+
+
+def test_a_naive_timestamp_is_read_as_utc_not_as_local_time():
+    """SQLite в тестах отдаёт naive datetime. Считать его локальным — значит
+    получить окно длиной в часовой пояс."""
+    state = TakeoverState(
+        is_human_takeover=True,
+        takeover_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1),
+    )
+
+    assert takeover_blocks(state, _settings("cooldown", minutes=15)) is True
+
+
+def test_a_zero_cooldown_means_no_window_not_silence_forever():
+    assert takeover_blocks(_flags(minutes_ago=0), _settings("cooldown", minutes=0)) is False
+
+
+# ---- применение правила: граница исходящих --------------------------------
+
+async def test_the_outbound_gate_blocks_a_chat_with_a_live_manager():
+    """Гейт — единственная точка, через которую уходят все четыре пути
+    отправки. Проверка перехвата обязана быть здесь, иначе следующий новый
+    путь снова напишет поверх человека."""
+    async def takeover(chat_id):
+        return _flags(minutes_ago=1)
+
+    gate = OutboundGate(
+        _FakeClient(), _settings("cooldown"), takeover_lookup=takeover,
+    )
+
+    assert await gate.is_allowed("c1") is False
+
+
+async def test_the_outbound_gate_lets_the_chat_go_after_the_window():
+    async def takeover(chat_id):
+        return _flags(minutes_ago=30)
+
+    gate = OutboundGate(
+        _FakeClient(), _settings("cooldown"), takeover_lookup=takeover,
+    )
+
+    assert await gate.is_allowed("c1") is True
+
+
+async def test_a_broken_takeover_lookup_blocks_rather_than_guesses():
+    """Как и у manual_hold: сбой проверки — это запрет. Пропустить отправку
+    из-за упавшего SELECT значило бы написать поверх менеджера именно тогда,
+    когда база лежит и разбираться некому."""
+    async def broken(chat_id):
+        raise RuntimeError("БД недоступна")
+
+    gate = OutboundGate(_FakeClient(), _settings("cooldown"), takeover_lookup=broken)
+
+    assert await gate.is_allowed("c1") is False
+
+
+async def test_the_gate_without_a_takeover_lookup_works_as_before():
+    """Харнесс и тесты собирают гейт без операторского контура."""
+    gate = OutboundGate(_FakeClient(), _settings("cooldown"))
+
+    assert await gate.is_allowed("c1") is True

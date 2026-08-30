@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 # Через сколько бездействия оператора чат возвращается агенту.
 TAKEOVER_TIMEOUT = timedelta(hours=24)
@@ -287,4 +287,33 @@ def should_auto_return(flags: ChatFlags, now: Optional[datetime] = None) -> bool
     if not flags.is_human_takeover or flags.takeover_at is None:
         return False
     now = now or datetime.now(timezone.utc)
-    return now - flags.takeover_at >= TAKEOVER_TIMEOUT
+    taken_at = flags.takeover_at
+    if taken_at.tzinfo is None:
+        taken_at = taken_at.replace(tzinfo=timezone.utc)
+    return now - taken_at >= TAKEOVER_TIMEOUT
+
+
+def auto_return_reason(
+    flags: ChatFlags, settings: Any = None, now: Optional[datetime] = None
+) -> Optional[str]:
+    """Почему чат пора вернуть агенту — или None, если не пора.
+
+    Строкой, а не булевым: причина уходит в журнал операторских действий, и
+    «вернули через сутки простоя» и «истёк кулдаун» — разные события, по
+    которым потом разбирают, почему агент заговорил.
+
+    Кулдаун считается ТОЙ ЖЕ функцией, что решает молчать или нет на границе
+    исходящих: если правило и его отмена разъедутся, чат будет либо возвращён
+    раньше, чем гейт перестал блокировать, либо не возвращён никогда.
+    """
+    if not flags.is_human_takeover:
+        return None
+    if should_auto_return(flags, now):
+        return "24h без активности"
+    if settings is not None and getattr(settings, "takeover_mode", "cooldown") == "cooldown":
+        from app.channels.outbound_gate import TakeoverState, takeover_blocks
+
+        state = TakeoverState(flags.is_human_takeover, flags.takeover_at)
+        if not takeover_blocks(state, settings, now):
+            return "истёк кулдаун после сообщения менеджера"
+    return None

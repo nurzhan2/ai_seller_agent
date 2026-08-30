@@ -1134,3 +1134,166 @@ async def test_catalog_editor_over_the_sql_store_end_to_end(session_factory):
 
     reverted = await fresh_editor.revert_last(user_id=111)
     assert "6000" in reverted.price_example      # обратно к 1500 ₽/ч × 4 ч
+
+
+# --------------------------------------------------------------------------
+# Затравка предохранителя по расходу
+# --------------------------------------------------------------------------
+
+async def test_cost_spent_today_sums_the_same_field_the_costs_page_shows(session_factory):
+    """Предохранитель и /admin/costs читают одно поле одной таблицы — иначе
+    «в отчёте одно, в предохранителе другое»."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "раз", SendStatus.sent,
+                              llm_meta={"provider": "anthropic", "model": "m", "cost_rub": "12.50"})
+    await store.save_outgoing("c-1", "два", SendStatus.sent,
+                              llm_meta={"provider": "anthropic", "model": "m", "cost_rub": "7.50"})
+
+    spent = await SqlAlchemyAdminQueries(session_factory).cost_spent_today()
+
+    assert spent == Decimal("20.00")
+
+
+async def test_cost_spent_today_ignores_yesterday(session_factory):
+    """Иначе после суток работы предохранитель стартовал бы уже сработавшим."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "сегодня", SendStatus.sent,
+                              llm_meta={"cost_rub": "5"})
+
+    async with session_factory() as session:
+        session.add(Message(
+            chat_id="c-1", direction=Direction.outgoing, author=Author.agent,
+            text="позавчера", status=SendStatus.sent, llm_meta={"cost_rub": "9999"},
+            created_at=datetime.now(timezone.utc) - timedelta(days=2),
+        ))
+        await session.commit()
+
+    spent = await SqlAlchemyAdminQueries(session_factory).cost_spent_today()
+
+    assert spent == Decimal("5")
+
+
+async def test_cost_spent_today_survives_a_broken_cost_field(session_factory):
+    """Битое значение в JSONB — ноль, а не падение старта приложения."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "битое", SendStatus.sent,
+                              llm_meta={"cost_rub": "не число"})
+    await store.save_outgoing("c-1", "живое", SendStatus.sent,
+                              llm_meta={"cost_rub": "3"})
+
+    assert await SqlAlchemyAdminQueries(session_factory).cost_spent_today() == Decimal("3")
+
+
+# --------------------------------------------------------------------------
+# Отличение своего эха от сообщения живого менеджера (боевая реализация)
+#
+# Мутационный разбор показал, что тесты конвейера проверяли только
+# InMemory-стор: у SQL-реализации можно было вывернуть ответ наизнанку, и не
+# падало ничего. А в бою работает именно она.
+# --------------------------------------------------------------------------
+
+async def test_our_own_outgoing_text_is_recognised_as_ours(session_factory):
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "Здравствуйте! На какое число?", SendStatus.sent)
+
+    assert await store.was_sent_by_us("c-1", "Здравствуйте! На какое число?") is True
+
+
+async def test_a_text_we_never_sent_is_not_ours(session_factory):
+    """Это и есть менеджер, написавший клиенту руками из интерфейса Авито."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "Здравствуйте! На какое число?", SendStatus.sent)
+
+    assert await store.was_sent_by_us("c-1", "Валерия, я сама отвечу") is False
+
+
+async def test_an_empty_text_is_never_ours(session_factory):
+    """Картинка или системное событие: сравнивать нечего, а агент картинок
+    не шлёт — значит писал человек."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "какой-то ответ", SendStatus.sent)
+
+    assert await store.was_sent_by_us("c-1", "") is False
+    assert await store.was_sent_by_us("c-1", "   ") is False
+
+
+async def test_our_text_from_another_chat_does_not_count(session_factory):
+    """Шаблонные ответы агента повторяются дословно из чата в чат. Если не
+    ограничить поиск текущим чатом, сообщение менеджера в одном чате
+    «узнается» по ответу агента в другом — и перехват не сработает."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.get_or_create_chat("c-2")
+    await store.save_outgoing("c-1", "Здравствуйте! На какое число?", SendStatus.sent)
+
+    assert await store.was_sent_by_us("c-2", "Здравствуйте! На какое число?") is False
+
+
+async def test_a_dry_run_reply_still_counts_as_ours(session_factory):
+    """В DRY_RUN ответ агента пишется со статусом dry_run и уходит клиенту
+    только после кнопки. Эхо придёт с тем же текстом — и это по-прежнему МЫ,
+    а не менеджер: иначе в режиме модерации агент замолкал бы после каждого
+    одобренного ответа."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_outgoing("c-1", "Посчитал: 9000 ₽", SendStatus.dry_run)
+
+    assert await store.was_sent_by_us("c-1", "Посчитал: 9000 ₽") is True
+
+
+async def test_an_incoming_message_is_not_our_outgoing(session_factory):
+    """Клиент прислал текст, менеджер его дословно повторил — это всё равно
+    сообщение менеджера: своими считаются только ИСХОДЯЩИЕ записи."""
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.save_incoming("c-1", "а можно в субботу?", avito_message_id="m-1")
+
+    assert await store.was_sent_by_us("c-1", "а можно в субботу?") is False
+
+
+# --------------------------------------------------------------------------
+# Ручной hold в базе
+# --------------------------------------------------------------------------
+
+async def test_manual_hold_is_stored_and_read_back(session_factory):
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-1")
+
+    assert await store.get_chat_manual_hold("c-1") is False
+
+    await store.set_chat_manual_hold("c-1", True)
+    assert await store.get_chat_manual_hold("c-1") is True
+
+    await store.set_chat_manual_hold("c-1", False)
+    assert await store.get_chat_manual_hold("c-1") is False
+
+
+async def test_manual_hold_can_be_set_on_a_chat_we_have_never_seen(session_factory):
+    """Оператор ставит hold по инциденту, а не по нашей готовности: чат мог
+    ещё не дойти до конвейера."""
+    store = SqlAlchemyDialogStore(session_factory)
+
+    await store.set_chat_manual_hold("c-новый", True)
+
+    assert await store.get_chat_manual_hold("c-новый") is True
+
+
+async def test_manual_hold_survives_everything_that_clears_a_takeover(session_factory):
+    """Ключевое свойство: hold не снимается ничем автоматическим. Здесь —
+    на уровне базы: возврат чата агенту трогает флаги перехвата и НЕ трогает
+    manual_hold."""
+    store = SqlAlchemyDialogStore(session_factory)
+    ops = SqlAlchemyOpsStore(session_factory)
+    await store.get_or_create_chat("c-1")
+    await store.set_chat_manual_hold("c-1", True)
+    await ops.set_flags("c-1", ChatFlags(is_human_takeover=True, takeover_at=NOW))
+
+    await ops.set_flags("c-1", ChatFlags(is_human_takeover=False, takeover_at=None))
+
+    assert await store.get_chat_manual_hold("c-1") is True

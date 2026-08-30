@@ -68,6 +68,14 @@ def times_url(company="1", staff="20", day=DAY) -> str:
     )
 
 
+def record_url(company="1") -> str:
+    return ep.BASE_URL + ep.BOOK_RECORD[1].format(company_id=company)
+
+
+def payment_link_url(company="1") -> str:
+    return ep.BASE_URL + ep.PAYMENT_LINK[1].format(company_id=company)
+
+
 # --------------------------------------------------------------------------
 # Спек подтверждён заказчиком (ключи получены, факты сверены — не наша
 # догадка). Флаг переключился с False на True — три теста ниже раньше
@@ -109,13 +117,27 @@ async def test_unmapped_zone_is_unknown(mapping, verified):
     assert "не заведена" in result.reason
 
 
+@respx.mock
 async def test_disabled_mapping_row_is_treated_as_missing(verified):
+    """Сеть отвечает УСПЕШНО и говорит «свободно» — иначе тест зеленел бы
+    сам собой: без зарегистрированного мока запрос падает, и UNKNOWN
+    получается по совсем другой причине, а проверка `enabled` в
+    InMemoryZoneMapping.get могла быть удалена незамеченной."""
+    route = respx.get(times_url()).mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "data": [{"time": "12:00"}], "meta": {}}
+        )
+    )
     m = InMemoryZoneMapping()
     m.set("bath_russian", service_id="10", staff_id="20", company_id="1")
     m.rows["bath_russian"]["enabled"] = False
-    provider = YClientsProvider(mapping=m)
+    provider = YClientsProvider(mapping=m, company_id="1")
+
     result = await provider.check_availability("bath_russian", DAY)
+
     assert result.status is AvailabilityStatus.UNKNOWN
+    assert "не заведена" in result.reason
+    assert route.call_count == 0, "выключенная строка не должна доходить до сети"
 
 
 # --------------------------------------------------------------------------
@@ -139,11 +161,27 @@ async def test_network_error_becomes_unknown(mapping, verified):
 
 @respx.mock
 async def test_success_false_envelope_becomes_unknown(mapping, verified):
+    """`data` НЕПУСТАЯ намеренно. С `data: null` тест зеленел бы и без
+    проверки `success` вовсе — UNKNOWN приходил бы по ветке «данных нет».
+    Опасен именно этот случай: конверт говорит «ошибка», а внутри лежит
+    похожий на рабочий список, который так и просится быть принятым за
+    расписание."""
     respx.get(times_url()).mock(
-        return_value=httpx.Response(200, json={"success": False, "data": None, "meta": {}})
+        return_value=httpx.Response(
+            200,
+            json={
+                "success": False,
+                "data": [{"time": "14:00"}, {"time": "15:00"}],
+                "meta": {"message": "staff not found"},
+            },
+        )
     )
     provider = YClientsProvider(mapping=mapping, company_id="1")
-    assert (await provider.get_free_slots("bath_russian", DAY)).status is AvailabilityStatus.UNKNOWN
+
+    result = await provider.get_free_slots("bath_russian", DAY)
+
+    assert result.status is AvailabilityStatus.UNKNOWN
+    assert result.free_slots == ()
 
 
 @pytest.mark.parametrize("status", ep.ACCESS_DENIED_STATUSES)
@@ -220,17 +258,39 @@ async def test_slots_are_cached_for_60_seconds(mapping, verified):
     await provider.get_free_slots("bath_russian", DAY)
 
     assert route.call_count == 1, "второй запрос должен идти из кеша"
-    assert list(redis.ttls.values()) == [SLOTS_CACHE_TTL]
+    # Литерал, а не SLOTS_CACHE_TTL: сравнение константы с самой собой
+    # зеленело бы при любом её значении, включая «кеш живёт вечно», — а
+    # именно 60 секунд названы в имени теста и в докстринге провайдера.
+    assert list(redis.ttls.values()) == [60]
+    assert SLOTS_CACHE_TTL == 60
 
 
 @respx.mock
 async def test_booking_invalidates_cache(mapping, verified):
-    """Иначе минуту показываем занятый слот свободным."""
+    """Иначе минуту показываем занятый слот свободным.
+
+    Сброс проверяется ЧЕРЕЗ create_booking, а не прямым вызовом
+    `invalidate_cache`: сам метод работал и раньше, а вот вызов его из
+    брони можно было удалить — и тест, дёргавший метод напрямую, этого не
+    замечал. Ломается здесь именно проводка, ради которой метод и написан.
+    """
+    respx.post(record_url()).mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "data": [{"record_id": 42}], "meta": {}}
+        )
+    )
     redis = FakeRedis()
     provider = YClientsProvider(mapping=mapping, company_id="1", redis=redis)
     await redis.set("yclients:slots:bath_russian:2026-07-18", json.dumps(["14:00"]))
 
-    await provider.invalidate_cache("bath_russian", DAY)
+    result = await provider.create_booking(
+        BookingRequest(
+            zone_id="bath_russian", date=DAY, start_time=time(14, 0), occupied_hours=3,
+            guests=6, client_name="Иван", client_phone="+79990000000",
+        )
+    )
+
+    assert result.success is True
     assert await redis.get("yclients:slots:bath_russian:2026-07-18") is None
 
 
@@ -354,10 +414,22 @@ async def test_get_staff_is_empty_on_403(mapping, verified):
 # Оплата
 # --------------------------------------------------------------------------
 
+@respx.mock
 async def test_payment_link_unsupported_returns_none(mapping, verified):
-    """Эндпоинт не подтверждён — этап оплаты остаётся за оператором."""
+    """Эндпоинт не подтверждён — этап оплаты остаётся за оператором.
+
+    Сеть отвечает ГОТОВОЙ ссылкой: без этого мока тест зеленел бы и со
+    снятым гейтом `PAYMENT_LINK_SUPPORTED` — неудавшийся запрос тоже даёт
+    None. Здесь же None означает ровно одно: до сети не дошли."""
+    route = respx.post(payment_link_url()).mock(
+        return_value=httpx.Response(
+            200, json={"success": True, "data": {"url": "https://pay.example/42"}, "meta": {}}
+        )
+    )
     provider = YClientsProvider(mapping=mapping, company_id="1")
+
     assert await provider.create_payment_link("42", Decimal("7500")) is None
+    assert route.call_count == 0, "неподтверждённый эндпоинт не должен вызываться"
 
 
 async def test_noop_provider_never_promises_availability():
@@ -478,10 +550,20 @@ async def test_successful_response_with_no_seances_is_busy_not_unknown(mapping, 
 @respx.mock
 async def test_success_false_body_is_unknown_even_on_http_200(mapping, verified):
     """200 в HTTP ещё не значит успех: конверт v2.0 несёт success отдельно.
-    Это единственный оставшийся путь к unknown — реальный сбой запроса."""
+    Это единственный оставшийся путь к unknown — реальный сбой запроса.
+
+    `data` заполнена сеансами — теми самыми, которые превратились бы в
+    «свободно», если бы флаг конверта не проверялся. С `data: null` тест
+    проверял бы не то, что написано в его имени: пустые данные дают unknown
+    сами по себе."""
     respx.get(times_url()).mock(
         return_value=httpx.Response(
-            200, json={"success": False, "data": None, "meta": {"message": "staff not found"}}
+            200,
+            json={
+                "success": False,
+                "data": [{"time": "12:00", "seance_length": 3600}],
+                "meta": {"message": "staff not found"},
+            },
         )
     )
     provider = YClientsProvider(mapping=mapping, company_id="1")
