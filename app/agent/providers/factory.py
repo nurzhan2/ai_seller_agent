@@ -9,19 +9,20 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, Optional
 
-from app.agent.providers.anthropic_provider import AnthropicProvider
 from app.agent.providers.base import LLMProvider
 from app.agent.providers import deepseek_provider as _ds
 from app.agent.providers.deepseek_provider import DeepSeekProvider
 from app.agent.providers.failover import FailoverProvider
 
-MAIN_MODEL = "claude-sonnet-5"
-CLASSIFIER_MODEL = "claude-haiku-4-5-20251001"
-
 _DEFAULT_MODELS: dict[str, tuple[str, str]] = {
     # provider_name -> (dialog_model, classifier_model)
-    "anthropic": (MAIN_MODEL, CLASSIFIER_MODEL),
     "deepseek": (_ds.DIALOG_MODEL, _ds.CLASSIFIER_MODEL),
+    # Anthropic ВЫБРАТЬ В РАНТАЙМЕ НЕЛЬЗЯ (см. _build_single и app/config.py),
+    # но пара моделей нужна харнессу качества: scripts/replay.py собирает
+    # клиента Anthropic сам и спрашивает у нас только имена моделей —
+    # эталонный прогон (--baseline) и сравнение провайдеров считаются
+    # именно по ним. Убрать эту строку значит уронить compare_providers.
+    "anthropic": ("claude-sonnet-5", "claude-haiku-4-5-20251001"),
 }
 
 
@@ -46,11 +47,11 @@ def resolve_models(settings: Any) -> tuple[str, str]:
 
 
 def _build_single(provider_name: str, settings: Any) -> LLMProvider:
-    if provider_name == "anthropic":
-        return AnthropicProvider(
-            api_key=settings.anthropic_api_key.get_secret_value(),
-            base_url=settings.llm_base_url or "",
-        )
+    """Провайдер по имени. Anthropic здесь БОЛЬШЕ НЕТ — см. app/config.py:
+    ключ в проде был заглушкой, то есть резерв не работал, а выглядел
+    настроенным. Неизвестное имя роняет сборку явной ошибкой, а не
+    возвращает молча что-нибудь: провайдер выбирается один раз при старте,
+    и «не тот провайдер» лучше поймать там же."""
     if provider_name == "deepseek":
         return DeepSeekProvider(
             api_key=settings.deepseek_api_key.get_secret_value(),

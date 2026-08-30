@@ -194,18 +194,42 @@ class Settings(BaseSettings):
     agent_min_inbound_ts: int = 0
 
     # --- Anthropic -------------------------------------------------------
+    # Только для харнесса качества: судья по тону (app/quality/judge.py) и
+    # scripts/replay.py --provider anthropic. К диалогам с клиентами
+    # отношения не имеет — их ведёт DeepSeek, см. llm_provider ниже.
     anthropic_api_key: SecretStr = SecretStr("")
 
     # --- LLM-провайдер (промт №12) ---------------------------------------
-    # Заказчик может подключить свой ключ DeepSeek вместо нашего Anthropic —
-    # их токены, их расходы. Переключается без пересборки образа, только
-    # перезапуском процесса (см. docs/GO_LIVE.md).
-    llm_provider: Literal["anthropic", "deepseek"] = "anthropic"
+    # Диалоги ведёт DeepSeek — ключ заказчика, их токены, их расходы.
+    #
+    # ANTHROPIC КАК ПРОВАЙДЕР ДИАЛОГА УБРАН (2026-08-30). Он числился
+    # основным по умолчанию и резервным на случай отказа DeepSeek, но
+    # ANTHROPIC_API_KEY в проде всё это время был заглушкой
+    # `sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx` из .env.example — то есть резерв не
+    # сработал бы ни разу, и узнали бы мы об этом в момент падения DeepSeek.
+    # Провайдер, который не может работать, хуже отсутствующего: он создаёт
+    # уверенность, что запасной путь есть.
+    #
+    # Класс AnthropicProvider при этом ЖИВ и удалён не будет: это адаптер
+    # формы сообщений Anthropic API, которой говорит и сам DeepSeek
+    # (api.deepseek.com/anthropic), и через него же в AgentLoop заходят
+    # тестовые клиенты. Оценка тона (app/quality/judge.py, claude-opus-5) и
+    # scripts/compare_providers.py тоже остаются — они собирают клиента
+    # сами и к рантайму агента отношения не имеют.
+    llm_provider: Literal["deepseek"] = "deepseek"
     # Резервный провайдер: включается автоматически после
     # llm_fallback_after_errors подряд идущих ошибок основного
     # (см. app/agent/providers/failover.py). Пусто — резерва нет, ошибка
     # основного провайдера уходит наверх как есть.
-    llm_fallback_provider: Optional[Literal["anthropic", "deepseek"]] = None
+    #
+    # Сейчас провайдер ровно один, поэтому резерв настроить НЕЧЕМ: переход
+    # deepseek -> deepseek не спасает ни от чего (тот же адрес, тот же
+    # ключ). Механизм отказоустойчивости (FailoverProvider) оставлен рабочим
+    # и покрытым тестами — он понадобится, когда появится второй настоящий
+    # провайдер. Резерв ПО МОДЕЛИ (например, deepseek-v4-flash вместо
+    # deepseek-v4-pro) этой настройкой не делается: модель выбирается в
+    # factory.resolve_models на уровне хода, а не провайдера.
+    llm_fallback_provider: Optional[Literal["deepseek"]] = None
     llm_fallback_after_errors: int = 3
     # Пусто — имя модели берётся по умолчанию для llm_provider
     # (app.agent.providers.factory.default_models_for).

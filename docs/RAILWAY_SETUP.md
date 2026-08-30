@@ -60,9 +60,9 @@ Redis — им переменные не нужны, Railway настраива�
 
 | переменная | значение |
 |---|---|
-| `ANTHROPIC_API_KEY` | обязателен — это провайдер по умолчанию (`LLM_PROVIDER=anthropic`) и всегда нужен судье в харнессе, даже если основной провайдер — DeepSeek |
-| `LLM_PROVIDER` | `anthropic` по умолчанию, `deepseek` — если заказчик подключил свой ключ (см. `docs/PROVIDER_COMPARISON.md`) |
-| `DEEPSEEK_API_KEY` | только если `LLM_PROVIDER=deepseek` или настроен `LLM_FALLBACK_PROVIDER=deepseek` |
+| `ANTHROPIC_API_KEY` | **не нужен в Railway** (удалён 2026-08-30). Anthropic как провайдер диалога убран — в проде этот ключ был заглушкой, то есть «резерв» не сработал бы ни разу. Настоящий ключ нужен только локально, для судьи в харнессе и `scripts/compare_providers.py` |
+| `LLM_PROVIDER` | `deepseek` — единственное допустимое значение (см. `docs/PROVIDER_COMPARISON.md`). `anthropic` не проходит валидацию: приложение с ним не стартует |
+| `DEEPSEEK_API_KEY` | **обязателен** — это провайдер диалога |
 | `TELEGRAM_BOT_TOKEN` | от @BotFather |
 | `TELEGRAM_OPS_CHAT_ID` | id чата/канала операторов |
 | `TELEGRAM_ALLOWED_USERS` | id операторов через запятую — пустое значение выключает бота для всех, не открывает его всем |

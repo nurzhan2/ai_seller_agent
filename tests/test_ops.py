@@ -380,26 +380,30 @@ async def test_set_moderation_mode_all_three_values_are_accepted(service, settin
 
 async def test_show_provider_reports_current_and_no_fallback(service):
     message = await service.show_provider()
-    assert "anthropic" in message
+    assert "deepseek" in message
     assert "не настроен" in message
-
-
-async def test_set_provider_switches_and_logs(service, settings):
-    message = await service.set_provider(ALLOWED_USER, "deepseek")
-    assert "anthropic → deepseek" in message
-    assert settings.llm_provider == "deepseek"
-    actions = [a for a in service.store.actions if a["action"] == "set_provider"]
-    assert actions and actions[0]["payload"] == {"from": "anthropic", "to": "deepseek"}
 
 
 async def test_set_provider_rejects_unknown_name(service, settings):
     message = await service.set_provider(ALLOWED_USER, "openai")
     assert "Использование" in message
-    assert settings.llm_provider == "anthropic"
+    assert settings.llm_provider == "deepseek"
+
+
+async def test_set_provider_refuses_anthropic_and_says_why(service, settings):
+    """Команда, которой можно сломать бота одним словом, не должна
+    существовать: раньше `/provider anthropic` переключал на провайдера с
+    ключом-заглушкой, после чего падал КАЖДЫЙ ход, а снаружи это выглядело
+    как «бот сломался»."""
+    message = await service.set_provider(ALLOWED_USER, "anthropic")
+
+    assert "убран" in message
+    assert settings.llm_provider == "deepseek"
+    assert not [a for a in service.store.actions if a["action"] == "set_provider"]
 
 
 async def test_set_provider_is_a_noop_when_already_active(service, settings):
-    message = await service.set_provider(ALLOWED_USER, "anthropic")
+    message = await service.set_provider(ALLOWED_USER, "deepseek")
     assert "Уже на" in message
     assert not [a for a in service.store.actions if a["action"] == "set_provider"]
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent.providers.anthropic_provider import AnthropicProvider
 from app.agent.providers.deepseek_provider import CLASSIFIER_MODEL, DIALOG_MODEL, DeepSeekProvider
@@ -213,28 +214,57 @@ def test_resolve_models_uses_defaults_when_unset():
 
 
 def test_resolve_models_respects_partial_override():
-    settings = Settings(llm_provider="anthropic", llm_classifier_model="claude-haiku-custom")
+    settings = Settings(llm_classifier_model="ds-classifier-custom")
     dialog_model, classifier_model = resolve_models(settings)
-    assert dialog_model == "claude-sonnet-5"       # не переопределён
-    assert classifier_model == "claude-haiku-custom"  # переопределён
+    assert dialog_model == "deepseek-v4-pro"          # не переопределён
+    assert classifier_model == "ds-classifier-custom"  # переопределён
 
 
-def test_build_provider_plain_anthropic():
-    settings = Settings(llm_provider="anthropic", anthropic_api_key="sk-ant-test")
+def test_build_provider_plain_deepseek():
+    settings = Settings(deepseek_api_key="sk-test")
     provider = build_provider(settings)
-    assert isinstance(provider, AnthropicProvider)
+    assert isinstance(provider, DeepSeekProvider)
 
 
-def test_build_provider_with_fallback_wraps_in_failover():
+def test_anthropic_cannot_be_selected_as_a_runtime_provider():
+    """Ключ в проде был заглушкой sk-ant-xxxxx, то есть «резерв» не сработал
+    бы ни разу. Провайдер, который не может работать, хуже отсутствующего:
+    он создаёт уверенность, что запасной путь есть."""
+    with pytest.raises(ValidationError):
+        Settings(llm_provider="anthropic")
+    with pytest.raises(ValidationError):
+        Settings(llm_fallback_provider="anthropic")
+
+
+def test_build_provider_refuses_an_unknown_provider_loudly():
+    """Провайдер выбирается один раз при старте — «не тот провайдер» должен
+    падать там же, а не возвращаться молча чем-нибудь."""
+    settings = Settings(deepseek_api_key="sk-test")
+    settings.llm_provider = "anthropic"     # мимо валидации, как это сделал бы старый .env
+
+    with pytest.raises(ValueError, match="неизвестный провайдер"):
+        build_provider(settings)
+
+
+def test_the_failover_machinery_still_works_for_a_future_second_provider():
+    """FailoverProvider не удалён вместе с Anthropic: он понадобится, когда
+    появится второй настоящий провайдер. Сейчас настроить его нечем —
+    переход deepseek -> deepseek не спасает ни от чего."""
     settings = Settings(
-        llm_provider="anthropic",
-        anthropic_api_key="sk-ant-test",
-        llm_fallback_provider="deepseek",
         deepseek_api_key="sk-test",
+        llm_fallback_provider="deepseek",
         llm_fallback_after_errors=5,
     )
     provider = build_provider(settings)
+
     assert isinstance(provider, FailoverProvider)
-    assert isinstance(provider.primary, AnthropicProvider)
+    assert isinstance(provider.primary, DeepSeekProvider)
     assert isinstance(provider.fallback, DeepSeekProvider)
     assert provider.max_consecutive_errors == 5
+
+
+def test_the_harness_still_knows_the_anthropic_models():
+    """scripts/replay.py собирает клиента Anthropic сам и спрашивает у нас
+    только имена моделей — на них считается эталонный прогон и сравнение
+    провайдеров (docs/PROVIDER_COMPARISON.md)."""
+    assert default_models_for("anthropic") == ("claude-sonnet-5", "claude-haiku-4-5-20251001")

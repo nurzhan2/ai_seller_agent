@@ -305,8 +305,21 @@ class OpsService:
         return line
 
     async def set_provider(self, user_id: int, provider: str) -> str:
-        if provider not in ("anthropic", "deepseek"):
-            return "Использование: /provider [anthropic | deepseek]"
+        """Переключение провайдера. Anthropic БОЛЬШЕ НЕ ВАРИАНТ.
+
+        Раньше сюда можно было передать `anthropic` — и агент переключался
+        на провайдера с ключом-заглушкой, после чего падал КАЖДЫЙ ход, а
+        снаружи это выглядело как «бот сломался». Команда, которая умеет
+        сломать бота одним словом, не должна существовать: список
+        допустимых значений теперь ровно один и совпадает с тем, что
+        принимает конфигурация.
+        """
+        if provider not in ("deepseek",):
+            return (
+                "Использование: /provider deepseek\n"
+                "Anthropic как провайдер диалога убран: ключ в проде был "
+                "заглушкой, переключение на него ломало каждый ход."
+            )
         if provider == self.settings.llm_provider:
             return f"Уже на {provider}."
         previous = self.settings.llm_provider
