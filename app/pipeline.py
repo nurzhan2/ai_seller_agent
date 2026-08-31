@@ -880,6 +880,32 @@ class MessagePipeline:
                 )
         await self._count_agent_reply(chat_id)
 
+    async def _client_wrote_after_threshold(self, chat_id: str) -> bool:
+        """Писал ли клиент в этот чат позже AGENT_MIN_INBOUND_TS.
+
+        Для путей, которые отправляют НЕ в ответ на входящее сообщение, а по
+        сохранённому состоянию (запасной ответ по таймауту уступки,
+        отложенные касания): у них нет payload'а, чтобы спросить `created`,
+        поэтому возраст берётся из истории диалога.
+
+        Порог не поднят — правило не применяется: при `<= 0` конвейер и так
+        не отвечает ни на что, отдельного мнения здесь не нужно.
+        """
+        threshold = getattr(self.settings, "agent_min_inbound_ts", 0) or 0
+        if threshold <= 0:
+            return True
+        try:
+            wrote_at = await self.store.last_incoming_at(chat_id)
+        except Exception:
+            # Сбой чтения — не отправляем (fail closed, как и везде вокруг
+            # порога): промолчать дешевле, чем написать в старый чат.
+            logger.exception(
+                "pipeline: не удалось узнать возраст переписки",
+                extra={"chat_id": chat_id},
+            )
+            return False
+        return wrote_at is not None and wrote_at.timestamp() >= threshold
+
     # -- таймаут запроса на скидку ------------------------------------------
 
     async def check_concession_timeouts(self) -> list[str]:
@@ -906,6 +932,22 @@ class MessagePipeline:
                     extra={"chat_id": pending.chat_id},
                 )
                 continue
+
+            # ТОТ ЖЕ порог AGENT_MIN_INBOUND_TS. Запрос на скидку ставится
+            # в очередь во время живого хода — то есть свежим, — но лежать
+            # он может часами, и порог за это время могли поднять (а
+            # оператор мог не нажать ничего). Отправить запасной ответ в
+            # чат, который порог уже не пропускает, значит обойти его
+            # третьим путём. Правило одно на все выходы.
+            if not await self._client_wrote_after_threshold(pending.chat_id):
+                logger.info(
+                    "pipeline: запасной ответ отменён — клиент писал раньше "
+                    "AGENT_MIN_INBOUND_TS",
+                    extra={"chat_id": pending.chat_id},
+                )
+                await self.ops_service.store.set_pending(pending.chat_id, None)
+                continue
+
             try:
                 await self.avito_client.send_message(pending.chat_id, pending.fallback_text)
             except Exception:

@@ -243,6 +243,8 @@ async def supervised_touch_scheduler(
     interval_seconds: int,
     now_fn: Any = lambda: datetime.now(timezone.utc),
     can_send: Any = None,
+    last_inbound: Any = None,
+    min_inbound_ts: int = 0,
 ) -> None:
     """Периодический проход воркера отложенных касаний.
 
@@ -268,6 +270,7 @@ async def supervised_touch_scheduler(
                 current.catalog.constants.working_window, send, now_fn(),
                 delay_minutes=delay_minutes, max_count=max_count,
                 can_send=can_send,
+                last_inbound=last_inbound, min_inbound_ts=min_inbound_ts,
             )
         except asyncio.CancelledError:
             raise
@@ -630,6 +633,11 @@ async def lifespan(app: FastAPI):
             # не отправить, а погасить таймер — иначе чат остаётся due
             # навсегда. См. run_scheduler_pass.
             can_send=outbound.is_allowed,
+            # AGENT_MIN_INBOUND_TS — тот же порог, что у конвейера. Воркер
+            # был вторым путём наружу, который его не спрашивал: таймер
+            # переживает и смену порога, и месяцы простоя.
+            last_inbound=dialog_store.last_incoming_at,
+            min_inbound_ts=settings.agent_min_inbound_ts,
         )
     )
     logger.info("touch scheduler: started")

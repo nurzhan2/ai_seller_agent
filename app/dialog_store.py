@@ -110,6 +110,8 @@ class DialogStore(Protocol):
 
     async def was_sent_by_us(self, chat_id: str, text: str) -> bool: ...
 
+    async def last_incoming_at(self, chat_id: str) -> Optional[datetime]: ...
+
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None: ...
@@ -189,6 +191,11 @@ class InMemoryDialogStore:
                 "status": SendStatus.sent,
                 "avito_message_id": avito_message_id,
                 "llm_meta": None,
+                # Нужен `last_incoming_at`: по нему пути, отправляющие не в
+                # ответ на входящее (касания, запасной ответ по таймауту
+                # уступки), проверяют AGENT_MIN_INBOUND_TS. В БД это
+                # серверный DEFAULT now(), здесь ставим руками.
+                "created_at": datetime.now(timezone.utc),
             }
         )
         return True
@@ -280,6 +287,13 @@ class InMemoryDialogStore:
             if m["direction"] == Direction.outgoing and m["author"] == Author.agent
         ][-ECHO_LOOKBACK:]
         return any((m["text"] or "").strip() == normalized for m in recent)
+
+    async def last_incoming_at(self, chat_id: str) -> Optional[datetime]:
+        stamps = [
+            m["created_at"] for m in self.messages.get(chat_id, [])
+            if m["direction"] == Direction.incoming and m.get("created_at") is not None
+        ]
+        return max(stamps) if stamps else None
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]:
         return self.item_zones.get(item_id)
@@ -596,6 +610,32 @@ class SqlAlchemyDialogStore:
             ).scalars().all()
 
         return any((row or "").strip() == normalized for row in rows)
+
+    async def last_incoming_at(self, chat_id: str) -> Optional[datetime]:
+        """Когда клиент писал в этот чат в последний раз.
+
+        Нужен путям, которые отправляют НЕ в ответ на входящее, а по
+        сохранённому состоянию: отложенные касания и запасной ответ по
+        таймауту уступки. У них нет payload'а с `created`, поэтому возраст
+        переписки берётся из истории. None — клиент не писал ни разу (или
+        чата нет), и для порога это значит «не свежее».
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Message
+
+        async with self._session_factory() as session:
+            return (
+                await session.execute(
+                    select(Message.created_at)
+                    .where(
+                        Message.chat_id == chat_id,
+                        Message.direction == Direction.incoming,
+                    )
+                    .order_by(Message.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
 
     async def get_chat_manual_hold(self, chat_id: str) -> bool:
         """Ручной hold — для `OutboundGate` перед отправкой клиенту.

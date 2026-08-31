@@ -115,6 +115,9 @@ class SqlAlchemyTouchStore:
 Sender = Callable[[str, str], Awaitable[None]]
 # chat_id -> можно ли вообще писать в этот чат (белый список объявлений).
 CanSend = Callable[[str], Awaitable[bool]]
+# chat_id -> когда клиент писал в этот чат в последний раз (None — не писал
+# или мы не знаем). Нужен для AGENT_MIN_INBOUND_TS, см. run_scheduler_pass.
+LastInbound = Callable[[str], Awaitable[Optional[datetime]]]
 
 
 def _disarmed(state: TouchState) -> TouchState:
@@ -141,6 +144,8 @@ async def run_scheduler_pass(
     delay_minutes: int,
     max_count: int,
     can_send: Optional[CanSend] = None,
+    last_inbound: Optional[LastInbound] = None,
+    min_inbound_ts: int = 0,
 ) -> list[str]:
     """Один проход. Возвращает chat_id всех диалогов, которым реально
     отправили касание за этот проход.
@@ -159,12 +164,66 @@ async def run_scheduler_pass(
     работает и как разовая уборка: чаты, попавшие в таблицу касаний до
     появления фильтра (именно так туда попал u2u-чат из инцидента),
     вычищаются сами при первой же попытке их коснуться.
+
+    `min_inbound_ts` + `last_inbound` — ТОТ ЖЕ порог AGENT_MIN_INBOUND_TS,
+    что отсекает входящие в конвейере. Воркер был вторым путём наружу,
+    который его не спрашивал: таймер взводится ответом агента (а тот через
+    порог проходит), но взведённый однажды таймер живёт в БД и переживает
+    и смену порога, и месяцы простоя. В проде так и нашёлся чат с касанием,
+    просроченным на четверо суток. Касание такому чату — сообщение живому
+    человеку, который писал нам неделю назад и ответа уже не ждёт.
+
+    Просроченный по возрасту таймер ГАСИТСЯ, а не пропускается: клиент,
+    писавший до порога, новее не станет, а оставленный due диалог воркер
+    перебирал бы каждую минуту до конца времён (та же причина, что и у
+    гашения по белому списку выше). Напишет снова — конвейер заведёт таймер
+    заново.
     """
     if not is_within_working_hours(now, working_window):
         return []
 
     touched: list[str] = []
     for dialog in await store.list_due(now, max_count):
+        # Лимит касаний — ДО отправки, а не после. `advance_touch` считает
+        # следующий номер и гасит таймер только по факту, поэтому состояние
+        # с `touch_count >= max_count` и живым сроком (такое остаётся от
+        # прежних значений TOUCH_MAX_COUNT) отправило бы «лишнее» касание и
+        # только потом успокоилось. Оба штатных стора такое состояние
+        # отфильтровывают в `list_due`, но правило «не больше max_count»
+        # обязано выполняться там, где отправляют, а не там, где выбирают.
+        if dialog.state.touch_count >= max_count:
+            await store.save(dialog.chat_id, _disarmed(dialog.state))
+            logger.info(
+                "touch scheduler: касание отменено — лимит касаний исчерпан, таймер погашен",
+                extra={"chat_id": dialog.chat_id, "touch_count": dialog.state.touch_count},
+            )
+            continue
+
+        if min_inbound_ts > 0 and last_inbound is not None:
+            try:
+                wrote_at = await last_inbound(dialog.chat_id)
+            except Exception:
+                # Сбой чтения — не отправляем и НЕ гасим: таймер переживёт
+                # аварию БД, а вот погашенный по ошибке уже не вернуть.
+                logger.exception(
+                    "touch scheduler: не удалось узнать возраст переписки — касание отложено",
+                    extra={"chat_id": dialog.chat_id},
+                )
+                continue
+            fresh = wrote_at is not None and wrote_at.timestamp() >= min_inbound_ts
+            if not fresh:
+                await store.save(dialog.chat_id, _disarmed(dialog.state))
+                logger.info(
+                    "touch scheduler: касание отменено — клиент писал раньше "
+                    "AGENT_MIN_INBOUND_TS, таймер погашен",
+                    extra={
+                        "chat_id": dialog.chat_id,
+                        "last_inbound": wrote_at.isoformat() if wrote_at else None,
+                        "agent_min_inbound_ts": min_inbound_ts,
+                    },
+                )
+                continue
+
         if can_send is not None and not await can_send(dialog.chat_id):
             await store.save(dialog.chat_id, _disarmed(dialog.state))
             logger.info(

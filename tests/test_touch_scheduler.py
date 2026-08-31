@@ -265,3 +265,144 @@ async def test_without_can_send_everything_works_as_before():
 
     assert touched == ["chat-1"]
     assert sent == [("chat-1", TEMPLATES[TEMPLATE_SOFT])]
+
+
+# --------------------------------------------------------------------------
+# AGENT_MIN_INBOUND_TS в воркере касаний
+#
+# Второй путь наружу, который порога не спрашивал. Таймер взводится ответом
+# агента (тот через порог проходит), но взведённый однажды живёт в БД и
+# переживает и смену порога, и месяцы простоя: в проде нашёлся чат с
+# касанием, просроченным на четверо суток.
+# --------------------------------------------------------------------------
+
+FRESH = datetime(2026, 8, 31, 9, 0, tzinfo=timezone.utc)
+THRESHOLD_TS = int(datetime(2026, 8, 31, 3, 0, tzinfo=timezone.utc).timestamp())
+
+
+def _due_state(count: int = 0) -> TouchState:
+    return TouchState(
+        touch_count=count,
+        last_touch_at=None,
+        next_touch_due_at=FRESH - timedelta(minutes=30),
+    )
+
+
+async def _run(store, sent, *, last_inbound=None, min_ts=0, max_count=3):
+    async def send(chat_id, text):
+        sent.append((chat_id, text))
+
+    return await run_scheduler_pass(
+        store, TEMPLATES, WINDOW, send, FRESH,
+        delay_minutes=30, max_count=max_count,
+        last_inbound=last_inbound, min_inbound_ts=min_ts,
+    )
+
+
+async def test_a_touch_is_not_sent_when_the_client_wrote_before_the_threshold():
+    store = InMemoryTouchStore(dialogs={"c1": _due_state()})
+    sent = []
+
+    async def last_inbound(chat_id):
+        return datetime(2026, 8, 27, 18, 45, tzinfo=timezone.utc)   # четверо суток назад
+
+    touched = await _run(store, sent, last_inbound=last_inbound, min_ts=THRESHOLD_TS)
+
+    assert touched == []
+    assert sent == []
+    assert store.dialogs["c1"].next_touch_due_at is None, "таймер обязан погаснуть"
+    assert store.dialogs["c1"].touch_count == 0, "счётчик — история, его не переписываем"
+
+
+async def test_a_touch_is_sent_when_the_client_wrote_after_the_threshold():
+    store = InMemoryTouchStore(dialogs={"c1": _due_state()})
+    sent = []
+
+    async def last_inbound(chat_id):
+        return FRESH - timedelta(hours=1)
+
+    touched = await _run(store, sent, last_inbound=last_inbound, min_ts=THRESHOLD_TS)
+
+    assert touched == ["c1"]
+    assert len(sent) == 1
+
+
+async def test_a_chat_the_client_never_wrote_in_gets_no_touch():
+    """Fail closed, как и везде вокруг порога: возраст неизвестен — значит
+    не свежее."""
+    store = InMemoryTouchStore(dialogs={"c1": _due_state()})
+    sent = []
+
+    async def last_inbound(chat_id):
+        return None
+
+    await _run(store, sent, last_inbound=last_inbound, min_ts=THRESHOLD_TS)
+
+    assert sent == []
+    assert store.dialogs["c1"].next_touch_due_at is None
+
+
+async def test_a_broken_lookup_delays_the_touch_without_disarming_it():
+    """Авария БД не должна гасить таймер: погашенный по ошибке уже не
+    вернуть, а отложенный переживёт сбой."""
+    store = InMemoryTouchStore(dialogs={"c1": _due_state()})
+    sent = []
+
+    async def last_inbound(chat_id):
+        raise RuntimeError("БД недоступна")
+
+    await _run(store, sent, last_inbound=last_inbound, min_ts=THRESHOLD_TS)
+
+    assert sent == []
+    assert store.dialogs["c1"].next_touch_due_at is not None, "таймер обязан остаться"
+
+
+async def test_without_a_threshold_the_worker_behaves_as_before():
+    """Порог не поднят — правило не применяется (конвейер в этом режиме и
+    так не отвечает ни на что)."""
+    store = InMemoryTouchStore(dialogs={"c1": _due_state()})
+    sent = []
+
+    touched = await _run(store, sent, last_inbound=None, min_ts=0)
+
+    assert touched == ["c1"]
+
+
+# --------------------------------------------------------------------------
+# Лимит касаний проверяется ДО отправки
+# --------------------------------------------------------------------------
+
+async def test_the_third_touch_is_sent_and_the_fourth_is_not():
+    """Граница TOUCH_MAX_COUNT=3. `advance_touch` считает следующий номер и
+    гасит таймер только по факту отправки, поэтому состояние с исчерпанным
+    счётчиком и живым сроком (остаётся от прежних значений настройки)
+    отправляло бы четвёртое касание и только потом успокаивалось."""
+    store = InMemoryTouchStore(dialogs={"третье": _due_state(count=2),
+                                        "четвёртое": _due_state(count=3)})
+    sent = []
+
+    touched = await _run(store, sent, max_count=3)
+
+    assert touched == ["третье"], "третье касание уходит, четвёртое — нет"
+    assert [c for c, _ in sent] == ["третье"]
+    # Штатный стор исчерпанный чат до отправки вообще не доносит (`is_due`
+    # фильтрует по счётчику), поэтому его состояние остаётся как было —
+    # висит в таблице, но невидим воркеру. Ровно такой ряд и нашёлся в
+    # проде: touch_count=3 при TOUCH_MAX_COUNT=3 и живым сроком.
+    assert store.dialogs["четвёртое"].touch_count == 3
+
+
+async def test_the_limit_is_checked_where_we_send_not_only_where_we_select():
+    """Стор, который забыл отфильтровать исчерпанные (или чьё max_count
+    изменилось между взводом и отправкой), не должен приводить к лишнему
+    сообщению живому человеку."""
+    class _LooseStore(InMemoryTouchStore):
+        async def list_due(self, now, max_count):
+            return [TouchDialog(chat_id=cid, state=st) for cid, st in self.dialogs.items()]
+
+    store = _LooseStore(dialogs={"c1": _due_state(count=9)})
+    sent = []
+
+    await _run(store, sent, max_count=3)
+
+    assert sent == []

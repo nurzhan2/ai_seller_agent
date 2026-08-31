@@ -1476,6 +1476,11 @@ async def test_timeout_sends_the_precomputed_fallback_and_clears_pending():
     тишина, диалог продолжается."""
     settings = _live_settings()
     store = InMemoryDialogStore()
+    # Входящее обязательно: запрос на скидку рождается из хода клиента, и
+    # запасной ответ проверяет возраст переписки по AGENT_MIN_INBOUND_TS.
+    # Чат без единого входящего — фикстура, которой в жизни не бывает.
+    await store.get_or_create_chat("chat-1")
+    await store.save_incoming("chat-1", "а можно скидку?", avito_message_id="m-скидка")
     avito = _FakeAvito()
     ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
     await ops_service.store.set_pending(
@@ -1508,8 +1513,11 @@ async def test_timeout_logs_the_reason():
             is_concession=True, fallback_text="без скидки", due_at=NOW - timedelta(minutes=1),
         ),
     )
+    store = InMemoryDialogStore()
+    await store.get_or_create_chat("chat-1")
+    await store.save_incoming("chat-1", "а можно скидку?", avito_message_id="m-скидка-2")
     pipeline = MessagePipeline(
-        store=InMemoryDialogStore(), agent_loop=_FakeAgentLoop(), ops_service=ops_service,
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service,
         settings=settings, avito_client=_FakeAvito(), debounce_window_seconds=0, now_fn=lambda: NOW,
     )
 
@@ -2047,3 +2055,61 @@ async def test_an_old_echo_of_our_own_answer_is_still_just_dropped():
 
     assert (await ops.store.get_flags("chat-1")).is_human_takeover is False
     assert len(store.messages["chat-1"]) == before
+
+
+# --------------------------------------------------------------------------
+# Порог AGENT_MIN_INBOUND_TS у запасного ответа по таймауту уступки
+#
+# Третий путь наружу, отправляющий не в ответ на входящее, а по сохранённому
+# состоянию. Запрос на скидку встаёт в очередь во время живого хода, но
+# лежать может часами — а порог за это время могли поднять.
+# --------------------------------------------------------------------------
+
+async def _pipeline_with_due_concession(settings, store):
+    ops_service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await ops_service.store.set_pending(
+        "chat-1",
+        PendingReply(
+            chat_id="chat-1", text="6 000 ₽ вместо 7 000 ₽.",
+            created_at=NOW - timedelta(minutes=20), is_concession=True,
+            fallback_text="Уточню детали и вернусь с ответом.",
+            due_at=NOW - timedelta(minutes=5),
+        ),
+    )
+    avito = _FakeAvito()
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(), ops_service=ops_service, settings=settings,
+        avito_client=avito, debounce_window_seconds=0, now_fn=lambda: NOW,
+    )
+    return pipeline, avito, ops_service
+
+
+async def test_the_fallback_is_not_sent_to_a_chat_older_than_the_threshold():
+    settings = _settings()
+    settings.dry_run = False
+    settings.agent_min_inbound_ts = NOW_TS
+    store = InMemoryDialogStore()
+    await store.get_or_create_chat("chat-1")
+    # Клиент писал задолго до порога: истории нет вовсе — значит не свежее.
+    pipeline, avito, ops_service = await _pipeline_with_due_concession(settings, store)
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert handled == []
+    assert avito.sent == []
+    assert await ops_service.store.get_pending("chat-1") is None, "запрос снят с очереди"
+
+
+async def test_the_fallback_still_goes_to_a_fresh_chat():
+    settings = _settings()
+    settings.dry_run = False
+    settings.agent_min_inbound_ts = NOW_TS - 6 * 3600
+    store = InMemoryDialogStore()
+    await store.get_or_create_chat("chat-1")
+    await store.save_incoming("chat-1", "а можно скидку?", avito_message_id="m-1")
+    pipeline, avito, ops_service = await _pipeline_with_due_concession(settings, store)
+
+    handled = await pipeline.check_concession_timeouts()
+
+    assert handled == ["chat-1"]
+    assert avito.sent == [("chat-1", "Уточню детали и вернусь с ответом.")]
