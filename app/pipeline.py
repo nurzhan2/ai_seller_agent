@@ -327,7 +327,7 @@ class MessagePipeline:
             # положит наш id в author_id входящего) сюда уходили бы ВСЕ
             # сообщения подряд, чат не появился бы в базе вовсе, и снаружи
             # это неотличимо от «вебхуки не приходили».
-            await self._note_outgoing_from_our_side(payload)
+            await self._note_outgoing_from_our_side(payload, too_old=too_old)
             return
 
         chat_id = extract_chat_id(payload)
@@ -536,16 +536,35 @@ class MessagePipeline:
             extra={"chat_id": chat_id},
         )
 
-    async def _note_outgoing_from_our_side(self, payload: dict) -> None:
+    async def _note_outgoing_from_our_side(self, payload: dict, *, too_old: bool = False) -> None:
         """Разбор сообщения с нашей стороны аккаунта: мы или живой менеджер.
 
         Порядок проверок — от дешёвого к дорогому и от частого к редкому:
         эхо собственного ответа приходит на КАЖДЫЙ ответ агента, а менеджер
         пишет руками редко. Поэтому сначала сравнение с нашими отправками, и
         только если не совпало — запись перехвата.
+
+        `too_old` — ТОТ ЖЕ порог AGENT_MIN_INBOUND_TS, что отсекает входящие
+        выше по `_accept`. Без него холостой прогон 2026-08-31 за минуту
+        пометил 346 чатов как «в чате живой менеджер»: поллер на первом
+        проходе вычитывает историю целиком, а каждое НАШЕ ЖЕ сообщение
+        многомесячной давности выглядит отсюда как «менеджер пишет прямо
+        сейчас» — в `messages` его нет, автор наш. Перехват — утверждение о
+        НАСТОЯЩЕМ моменте, и строить его на февральской переписке нельзя.
         """
         chat_id = extract_chat_id(payload)
         text = (extract_text(payload) or "").strip()
+
+        if too_old:
+            # Порог един для всего конвейера: ветка, которая его обходит,
+            # рано или поздно начинает жить своей жизнью — этот перехват уже
+            # второй такой случай.
+            logger.info(
+                "pipeline: сообщение с нашей стороны старше AGENT_MIN_INBOUND_TS — "
+                "перехват не ставится",
+                extra={"chat_id": chat_id},
+            )
+            return
 
         if not chat_id:
             logger.info(

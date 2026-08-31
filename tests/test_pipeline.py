@@ -1958,3 +1958,92 @@ async def test_the_agent_answers_again_after_the_cooldown_window():
 
     allowed, _ = await ops.should_agent_reply("chat-1")
     assert allowed is True
+
+
+# --------------------------------------------------------------------------
+# Порог AGENT_MIN_INBOUND_TS — единое правило, ветка перехвата не исключение
+#
+# Холостой прогон 2026-08-31: поллер на первом проходе вычитал историю
+# чатов, и каждое НАШЕ ЖЕ сообщение многомесячной давности выглядело как
+# «менеджер пишет прямо сейчас» — за минуту 346 чатов получили
+# is_human_takeover с меткой «сейчас». Перехват — утверждение о настоящем
+# моменте, и строить его на февральской переписке нельзя.
+# --------------------------------------------------------------------------
+
+async def test_an_old_message_from_our_side_does_not_start_a_takeover():
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="менеджер писал это в феврале",
+                 created=NOW_TS - 200 * 24 * 3600)
+    )
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False, "историческая переписка — не перехват"
+    assert flags.takeover_at is None
+
+
+async def test_a_fresh_message_from_our_side_still_starts_a_takeover():
+    """Обратная сторона: живой менеджер, пишущий сейчас, обязан остановить
+    агента — ради этого перехват и заводился."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="Валерия, я отвечу сама", created=NOW_TS)
+    )
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is True
+    assert flags.takeover_at is not None
+
+
+async def test_a_takeover_is_not_started_when_the_threshold_is_not_raised():
+    """Порог <= 0 означает «агент не отвечает ни на что» — значит и перехват
+    ставить не с чего: в этом режиме конвейер вообще не делает утверждений
+    о свежести."""
+    settings = _settings()
+    settings.agent_min_inbound_ts = 0
+    pipeline, store, agent, ops = _build(settings=settings)
+    await store.get_or_create_chat("chat-1")
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="что угодно", created=NOW_TS)
+    )
+    await _settle()
+
+    assert (await ops.store.get_flags("chat-1")).is_human_takeover is False
+
+
+async def test_a_message_with_an_unknown_timestamp_does_not_start_a_takeover():
+    """Fail closed, как и везде вокруг порога: о свежести нечего сказать —
+    значит не свежее."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+    payload = _payload(author_id=OUR_USER_ID, text="без времени")
+    payload["payload"]["value"].pop("created", None)
+
+    await pipeline.handle_message(payload)
+    await _settle()
+
+    assert (await ops.store.get_flags("chat-1")).is_human_takeover is False
+
+
+async def test_an_old_echo_of_our_own_answer_is_still_just_dropped():
+    """Своё эхо старше порога — по-прежнему тихо отброшено, без перехвата и
+    без записи в историю."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+    await store.save_outgoing("chat-1", "наш ответ", SendStatus.sent)
+    before = len(store.messages["chat-1"])
+
+    await pipeline.handle_message(
+        _payload(author_id=OUR_USER_ID, text="наш ответ", created=NOW_TS - 10 ** 7)
+    )
+    await _settle()
+
+    assert (await ops.store.get_flags("chat-1")).is_human_takeover is False
+    assert len(store.messages["chat-1"]) == before
