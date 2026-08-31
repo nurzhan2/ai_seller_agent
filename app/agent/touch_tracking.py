@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, time as TimeType, timedelta
 from typing import Optional
 
+from app.clock import MOSCOW_TZ
 from app.kb.loader import WorkingWindow
 
 SOFT_TOUCH_NUMBER = 2
@@ -83,10 +84,21 @@ def _parse_hhmm(value: str) -> TimeType:
 
 def is_within_working_hours(dt: datetime, window: WorkingWindow) -> bool:
     """9:00–23:00 (или что задано в constants.working_window) — за пределами
-    окна отложенные сообщения не уходят, регламент прямо это требует."""
+    окна отложенные сообщения не уходят, регламент прямо это требует.
+
+    ВРЕМЯ ПРИВОДИТСЯ К МОСКВЕ. Окно в базе знаний — часы работы комплекса,
+    то есть московские; воркер же передаёт сюда `datetime.now(timezone.utc)`.
+    Сравнение UTC-времени с московскими часами превращало окно 9:00–23:00 в
+    фактические 12:00–02:00 МСК: касания могли уйти клиенту в час ночи и не
+    уходили с 9 до 12 утра.
+
+    Naive datetime считается уже московским — так его передают тесты; у
+    aware время переводится в МСК явно.
+    """
     start = _parse_hhmm(window.from_)
     end = _parse_hhmm(window.to)
-    t = dt.time()
+    moment = dt.astimezone(MOSCOW_TZ) if dt.tzinfo is not None else dt
+    t = moment.time()
     if start <= end:
         return start <= t < end
     return t >= start or t < end   # окно через полночь — на всякий случай, сейчас не наш случай

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from app.clock import moscow_today
 from datetime import date as DateType, timedelta
 from typing import Optional
 
@@ -74,7 +75,9 @@ def resolve_relative_date(text: str, today: Optional[DateType] = None) -> Option
     что нашлось, и возвращается — не пытаемся выбирать между несколькими
     датами в одной фразе, это решение не для эвристики.
     """
-    today = today or DateType.today()
+    # Московская дата, а не date.today(): контейнер в UTC, «сегодня»
+    # клиента — московское (см. app/clock.py).
+    today = today or moscow_today()
     stripped = text.strip()
 
     try:

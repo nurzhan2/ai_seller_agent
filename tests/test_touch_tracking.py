@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.clock import MOSCOW_TZ
 from app.agent.touch_tracking import (
     DIRECT_TOUCH_NUMBER,
     SOFT_TOUCH_NUMBER,
@@ -130,8 +131,36 @@ def test_at_max_count_dialog_is_never_due_again():
     ],
 )
 def test_working_hours_window(hour, minute, expected):
-    dt = datetime(2026, 8, 20, hour, minute, tzinfo=timezone.utc)
+    """Часы — МОСКОВСКИЕ: окно в базе знаний это часы работы комплекса."""
+    dt = datetime(2026, 8, 20, hour, minute, tzinfo=MOSCOW_TZ)
     assert is_within_working_hours(dt, WINDOW) is expected
+
+
+@pytest.mark.parametrize(
+    "utc_hour,expected,why",
+    [
+        (22, False, "01:00 МСК — ночь, касание уходить не должно"),
+        (6, True, "09:00 МСК — ровно открытие"),
+        (5, False, "08:00 МСК — ещё закрыто"),
+        (19, True, "22:00 МСК — ещё работаем"),
+        (20, False, "23:00 МСК — закрытие"),
+    ],
+)
+def test_a_utc_moment_is_converted_to_moscow_before_comparing(utc_hour, expected, why):
+    """Воркер передаёт сюда `datetime.now(timezone.utc)`, а окно 9:00–23:00
+    — московское. Сравнение UTC-времени с московскими часами превращало окно
+    в фактические 12:00–02:00 МСК: касания уходили в час ночи и не уходили
+    с 9 до 12 утра."""
+    dt = datetime(2026, 8, 20, utc_hour, 0, tzinfo=timezone.utc)
+
+    assert is_within_working_hours(dt, WINDOW) is expected, why
+
+
+def test_a_naive_moment_is_taken_as_moscow():
+    """Naive время приходит только из тестов и считается уже московским —
+    иначе те же 9:00 значили бы разное в двух соседних вызовах."""
+    assert is_within_working_hours(datetime(2026, 8, 20, 10, 0), WINDOW) is True
+    assert is_within_working_hours(datetime(2026, 8, 20, 2, 0), WINDOW) is False
 
 
 # --------------------------------------------------------------------------

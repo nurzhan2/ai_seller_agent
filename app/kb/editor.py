@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import date as DateType, time as TimeType, timedelta
 from typing import Any, Optional
 
+from app.clock import moscow_today
 from app.kb.editable import EditableField, build_override_value, field_by_key
 from app.kb.loader import KnowledgeBase, read_raw_kb, validate_raw
 from app.kb.override_store import OverrideRecord, OverrideStore, to_overrides
@@ -180,7 +181,9 @@ class CatalogEditor:
 # --------------------------------------------------------------------------
 
 def _next_weekend(today: Optional[DateType] = None) -> DateType:
-    day = today or DateType.today()
+    # Московская дата: пример цены оператор видит в своём календаре, а не в
+    # UTC-сутках контейнера (app/clock.py).
+    day = today or moscow_today()
     # 5 = суббота. Ищем ближайшую будущую субботу, чтобы пример не
     # приходился на сегодня — цена «на сегодня» может быть заблокирована
     # праздником и увести пример в blocked без всякой связи с правкой.

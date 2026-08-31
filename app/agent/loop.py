@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -42,6 +43,12 @@ logger = logging.getLogger("parmangal.loop")
 
 MAIN_MODEL = "claude-sonnet-5"
 CLASSIFIER_MODEL = "claude-haiku-4-5-20251001"
+
+# Сколько символов вызова инструмента писать в лог и хранить в llm_meta.
+# Ответ get_zones или каталог цен занимают килобайты — целиком они делают
+# лог нечитаемым, а строку `messages` тяжёлой; обрезанного хвоста хватает,
+# чтобы понять, что именно вернул инструмент.
+TOOL_TRACE_LIMIT = 600
 
 MAX_TOOL_ITERATIONS = 5
 MAX_TOKENS = 1024
@@ -109,6 +116,23 @@ class TurnResult:
     # ценовые. Конвейер (app/pipeline.py) фильтрует их сам через
     # ConcessionEvent.needs_operator_approval, решая, нужно ли одобрение.
     concession_events: list[Any] = field(default_factory=list)
+
+
+def _loggable(value: Any) -> Any:
+    """Значение, пригодное и для лога, и для JSONB: сериализуемое и короткое.
+
+    Аргументы инструментов приходят от модели и содержат только скаляры, но
+    результаты — наши, и в них попадают Decimal, date и вложенные структуры
+    на килобайты. `default=str` вместо падения на несериализуемом: журнал
+    вызовов не должен ронять ход клиента ради собственной аккуратности.
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        return {"_нечитаемо": type(value).__name__}
+    if len(text) <= TOOL_TRACE_LIMIT:
+        return json.loads(text)
+    return {"_обрезано": text[:TOOL_TRACE_LIMIT]}
 
 
 def estimate_cost_rub(model: str, input_tokens: int, output_tokens: int) -> Decimal:
@@ -254,6 +278,7 @@ class AgentLoop:
 
         totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0}
         tool_calls: list[str] = []
+        tool_trace: list[dict] = []
         quote_statuses: list[str] = []
         final_text = ""
         hit_limit = False
@@ -286,7 +311,30 @@ class AgentLoop:
             results = []
             for block in tool_uses:
                 tool_calls.append(block.name)
-                payload = await executor.run(block.name, dict(block.input))
+                arguments = dict(block.input)
+                payload = await executor.run(block.name, arguments)
+
+                # ЖУРНАЛ ВЫЗОВОВ. Разбор инцидента 2026-08-31 («сегодняшняя
+                # дата уже прошла» на сегодняшнюю дату) пришлось вести по
+                # косвенным уликам: в БД лежали только токены и стоимость, а
+                # какие даты модель реально передала в create_booking —
+                # нигде. Имя, аргументы и результат нужны целиком: без
+                # аргументов не видно, ЧТО спросили, без результата — что
+                # ответил код, а расходятся обычно именно они.
+                record = {
+                    "tool": block.name,
+                    "arguments": _loggable(arguments),
+                    "result": _loggable(payload),
+                }
+                tool_trace.append(record)
+                logger.info(
+                    "tool %s(%s) -> %s",
+                    block.name,
+                    json.dumps(record["arguments"], ensure_ascii=False)[:TOOL_TRACE_LIMIT],
+                    json.dumps(record["result"], ensure_ascii=False)[:TOOL_TRACE_LIMIT],
+                    extra={"dialog_id": dialog_id, "tool": block.name},
+                )
+
                 if payload.get("error"):
                     tool_call_errors += 1
                 if block.name == "calculate_price" and "status" in payload:
@@ -310,6 +358,11 @@ class AgentLoop:
                 )
             ),
             "tool_iterations": len(quote_statuses) or len(tool_calls),
+            # Журнал вызовов инструментов — рядом с расходом, в том же
+            # llm_meta: он и так едет в БД с каждым исходящим, а отдельная
+            # таблица ради разбора инцидентов ещё и рассинхронизируется с
+            # сообщением, к которому относится.
+            "tool_trace": tool_trace,
         }
 
         # Расход считается ДО ветки последнего рубежа: этот ход уже стоил

@@ -49,7 +49,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger("parmangal.outbound.daily_limit")
 
-MOSCOW_TZ = timezone(timedelta(hours=3), name="MSK")
+from app.clock import MOSCOW_TZ  # единый источник, см. app/clock.py
 KEY_PREFIX = "outbound:daily_count:"
 # С запасом на двое суток: TTL обновляется на каждый инкремент, ключ не
 # накапливается годами, даже если инкременты идут секунда в секунду с

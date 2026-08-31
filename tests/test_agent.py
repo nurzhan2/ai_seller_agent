@@ -92,8 +92,25 @@ def loop_for(kb, script, label="question", executor=None):
 
 def test_system_prompt_marks_catalog_for_caching(kb):
     blocks = build_system_prompt(kb)
-    assert len(blocks) == 2
+    assert len(blocks) == 3          # правила, каталог, «Сейчас:»
     assert blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_the_current_date_is_a_separate_uncached_block(kb):
+    """Дата меняется каждую минуту. Подмешать её в кешируемый блок каталога
+    значит промахиваться мимо кеша на каждом ходу, а вклеить в правила —
+    ломать кеш статической части."""
+    blocks = build_system_prompt(kb)
+
+    from app.clock import moscow_today
+
+    today = moscow_today().strftime("%d.%m.%Y")
+    assert "cache_control" not in blocks[-1]
+    assert "cache_control" not in blocks[0]
+    assert today in blocks[-1]["text"], "дата обязана быть в отдельном блоке"
+    # Сама дата не должна попасть ни в правила, ни в каталог — там кеш.
+    assert today not in blocks[0]["text"]
+    assert today not in blocks[1]["text"]
 
 
 def test_system_prompt_contains_hard_prohibitions(kb):

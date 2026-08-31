@@ -32,7 +32,9 @@ logger = logging.getLogger("parmangal.dialog_store")
 # 2014 года, а zoneinfo на python:3.12-slim требует отдельно поставленного
 # пакета tzdata (не факт, что стоит в контейнере) ради того, что и так
 # не меняется.
-MOSCOW_TZ = timezone(timedelta(hours=3), name="MSK")
+# Единый источник (app/clock.py) — раньше та же константа была объявлена
+# здесь и в app/channels/daily_limit.py двумя копиями.
+from app.clock import MOSCOW_TZ  # noqa: E402  (реэкспорт ради обратной совместимости)
 
 # Сколько сообщений диалога поднимаем из БД в контекст модели. Совпадает с
 # HISTORY_WINDOW в app/agent/loop.py — там же лишнее ещё раз обрежется, но

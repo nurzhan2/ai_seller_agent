@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any, Callable, Optional
 
 from app.agent.dates import resolve_relative_date
+from app.clock import moscow_today
 from app.config import get_settings
 from app.kb.loader import KnowledgeBase
 from app.pricing.concessions import (
@@ -422,7 +423,11 @@ class ToolExecutor:
         booking_provider: Any = None,
         concessions_blocked: bool = False,
         concessions_today_provider: Any = None,
-        today_fn: Callable[[], DateType] = DateType.today,
+        # МОСКОВСКАЯ дата, а не date.today(). Контейнер живёт в UTC, бизнес
+        # — по Москве: с 00:00 до 03:00 МСК date.today() отдаёт вчерашний
+        # день, и «сегодня» клиента превращается во вчера. Все даты, которые
+        # агент называет и проверяет, — московские сутки.
+        today_fn: Callable[[], DateType] = moscow_today,
         booking_sink: Any = None,
         booking_notifier: Any = None,
         booking_handoff_notifier: Any = None,
@@ -451,10 +456,10 @@ class ToolExecutor:
         # прошлом" в check_availability — сделано инъекцией специально ради
         # тестируемости («29 августа» должно резолвиться по фиксированному
         # today, а не по реальным часам машины, где бы тесты ни запускались).
-        # _days_until()/_tool_request_concession ниже по файлу по-прежнему
-        # берут DateType.today() напрямую — не трогаю их в этой задаче:
-        # это отдельная зона риска (движок уступок), не связанная с датами
-        # бронирования.
+        # _days_until()/_tool_request_concession ниже по файлу тоже переведены
+        # на московскую дату (инцидент 2026-08-31): «сколько дней до брони»
+        # и «дата в прошлом» обязаны считаться от одного и того же дня,
+        # иначе с 00:00 до 03:00 МСК они расходятся на сутки.
         self._today_fn = today_fn
         # Куда записать поставленную бронь у себя и кого уведомить — тот же
         # приём внедрения, что у lead_sink/photo_provider. None в обоих
@@ -642,7 +647,7 @@ class ToolExecutor:
             base_price_quoted=self.state.base_price_quoted,
             floor_reached=self.state.floor_reached,
             touch_count=self.state.touch_count,
-            booking_date=self.last_booking_date or DateType.today(),
+            booking_date=self.last_booking_date or moscow_today(),
         )
         decision = decide(request, self.kb)
         self.concession_events.append(
@@ -697,7 +702,7 @@ class ToolExecutor:
             # Неизвестная дата не должна открывать уступку — возвращаем
             # заведомо большое число, чтобы условие «близкая дата» не прошло.
             return 999
-        return max((self.last_booking_date - DateType.today()).days, 0)
+        return max((self.last_booking_date - moscow_today()).days, 0)
 
     async def _availability_for(
         self, zone_id: str, date_value: DateType,
