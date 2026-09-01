@@ -445,8 +445,19 @@ async def test_webhook_and_poller_do_not_double_answer(monkeypatch):
     }}}
 
     assert await pipeline.handle_message(event, source="webhook") is True
-    # Второй канал с тем же message_id — заявка уже занята.
-    assert await pipeline.handle_message(event, source="poller") is False
+    # Второй канал с тем же message_id — до агента не доходит (за этим следит
+    # Loop.run_turn выше, он падает при попытке хода), но отчитывается как
+    # ОБРАБОТАННЫЙ.
+    #
+    # Здесь стояло `is False`, и это была не проверка свойства, а слепок
+    # механики: «заявка уже занята». Механику поллер читает как «конвейер
+    # упал» и навсегда останавливает курсор чата — на запуске 2026-09-01 так
+    # оглохли 18 чатов (см. test_pipeline.py::
+    # test_duplicate_reports_handled_so_the_poller_advances_the_cursor).
+    # Докстринг handle_message всё это время говорил обратное: дубль —
+    # штатный исход, False бывает ровно тогда, когда что-то упало. Настоящий
+    # False проверяет test_failed_handling_releases_the_claim ниже.
+    assert await pipeline.handle_message(event, source="poller") is True
     assert "avito:seen_message:m-1" in redis.store
 
 
