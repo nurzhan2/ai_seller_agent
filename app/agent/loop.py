@@ -22,6 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
@@ -37,6 +38,7 @@ from app.agent.providers.anthropic_provider import AnthropicProvider
 from app.agent.providers.base import LLMProvider
 from app.agent.providers.deepseek_provider import PRICE_PER_MTOK_RUB as _DEEPSEEK_RATES
 from app.agent.tools import TOOLS, ToolExecutor, tool_result_block
+from app.clock import moscow_now
 from app.kb.loader import KnowledgeBase
 
 logger = logging.getLogger("parmangal.loop")
@@ -85,6 +87,112 @@ PRICE_LIKE_WITHOUT_TOOL_CALL = re.compile(
     r"\b\d[\d\s]{1,9}\d\s*(?:₽|руб|р\.)|\b\d{3,6}\s*(?:₽|руб)", re.IGNORECASE
 )
 GUARD_RAIL_VIOLATION = "цена в тексте без вызова инструмента (последний рубеж)"
+
+# ВТОРОЙ ПОСЛЕДНИЙ РУБЕЖ: занятость и даты. Заведён по инциденту запуска
+# 2026-09-01.
+#
+# Клиент: «Есть окошко сегодня?» (22:52). Ответ (22:53, tool_trace ПУСТОЙ):
+# «...сейчас 22:53, и окошко на 14:00 давно закрыто. Ближайшие свободные —
+# завтра, 1 сентября, весь день». Сегодня БЫЛО 1 сентября; никакого «14:00»
+# клиент не называл; свободных слотов никто не проверял. Ценовой рубеж это
+# пропустил — и правильно, цены в тексте нет.
+#
+# ДВА РАЗНЫХ ПРАВИЛА, А НЕ ОДНО. Первая редакция блокировала любой текст с
+# датой без вызова инструмента — и на прогоне сразу срезала правильный ответ
+# «завтра будет 2 сентября», для которого никакой инструмент не нужен: дата
+# лежит в промте. Утверждение о ЗАНЯТОСТИ и называние ДАТЫ — разные вещи, и
+# проверяются по-разному:
+#
+#   занятость  — нужен инструмент, потому что этих данных в промте нет;
+#   дата       — инструмент не нужен, она в промте есть; проверяем не факт
+#                вызова, а СОВПАДЕНИЕ с тем, что модели показали.
+AVAILABILITY_TOOLS = frozenset({"check_availability", "find_next_available"})
+
+# Словарь занятости. Намеренно без «дата», «число», «время» самих по себе:
+# «на какую дату планируете?» — вопрос, а не утверждение о календаре.
+AVAILABILITY_WORDS = re.compile(
+    r"\b(?:свободн\w*|занят\w*|окошк\w*|окно\b|есть\s+врем\w*|ближайш\w*)",
+    re.IGNORECASE,
+)
+
+_MONTHS_RU = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+}
+# «сегодня»/«завтра»/«послезавтра» -> сдвиг в днях от сегодняшнего.
+_RELATIVE_DAYS = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+_RELATIVE_RE = re.compile(r"\b(сегодня|завтра|послезавтра)\b", re.IGNORECASE)
+_DATE_RE = re.compile(
+    r"\b(\d{1,2})\s*[.\-/]\s*(\d{1,2})(?:\s*[.\-/]\s*\d{2,4})?\b"
+    r"|\b(\d{1,2})\s+(январ|феврал|март|апрел|ма|июн|июл|август|сентябр|"
+    r"октябр|ноябр|декабр)\w*",
+    re.IGNORECASE,
+)
+# Насколько близко к слову «завтра» должно стоять число, чтобы считать их
+# одной фразой. «Ближайшие свободные — завтра, 1 сентября» укладывается с
+# запасом; отдельные упоминания в разных абзацах не слипаются.
+_PAIRING_WINDOW = 40
+
+
+def _dates_in(text: str) -> list[tuple[int, int, int]]:
+    """(позиция, день, месяц) для каждой найденной календарной даты."""
+    found = []
+    for m in _DATE_RE.finditer(text):
+        if m.group(1):
+            day, month = int(m.group(1)), int(m.group(2))
+        else:
+            day = int(m.group(3))
+            key = m.group(4).lower()
+            month = next((v for k, v in _MONTHS_RU.items() if key.startswith(k)), 0)
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            found.append((m.start(), day, month))
+    return found
+
+
+def date_contradicts_now(text: str, now: datetime) -> Optional[str]:
+    """«завтра, 1 сентября» в день, когда 1 сентября — сегодня.
+
+    Сверяем не факт вызова инструмента, а само число: обе даты модели уже
+    показаны в блоке «Сейчас:» (app/agent/prompts.py:build_now_block), и
+    расхождение означает, что она их не прочитала. Возвращает описание для
+    лога либо None.
+
+    Осознанные ограничения. Год не проверяем: в переписке его почти не пишут,
+    а «1 сентября» без года — это ближайшее 1 сентября, и разбирать это здесь
+    значило бы повторять resolve_date. Пары ищем в окне символов, а не по
+    синтаксису: разбирать русский текст правилами дороже, чем ошибиться в
+    сторону пропуска — рубеж не единственная защита, а последняя.
+    """
+    dates = _dates_in(text)
+    if not dates:
+        return None
+    for m in _RELATIVE_RE.finditer(text):
+        word = m.group(1).lower()
+        expected = (now + timedelta(days=_RELATIVE_DAYS[word])).date()
+        for pos, day, month in dates:
+            if abs(pos - m.start()) > _PAIRING_WINDOW:
+                continue
+            if (day, month) != (expected.day, expected.month):
+                return (
+                    f"«{word}» рядом с {day:02d}.{month:02d}, "
+                    f"а {word} — {expected.strftime('%d.%m')}"
+                )
+    return None
+
+
+AVAILABILITY_GUARD_VIOLATION = (
+    "занятость без вызова check_availability/find_next_available (последний рубеж)"
+)
+DATE_GUARD_VIOLATION = "дата в тексте противоречит блоку «Сейчас:» (последний рубеж)"
+#
+# Сам текст ОБЯЗАН не попадать под собственные правила — иначе рубеж не
+# самосогласован: подставленный им ответ сам выглядит как утверждение о
+# календаре. Первая редакция («уточню свободное время») под него попадала.
+# Держится тестом test_the_guard_reply_does_not_trip_the_guard_itself.
+AVAILABILITY_GUARD_REPLY = (
+    "Подскажите, пожалуйста, на какое число и на сколько гостей вы "
+    "рассчитываете — посмотрю по календарю и вернусь с вариантами."
+)
 
 
 @dataclass
@@ -178,6 +286,11 @@ class AgentLoop:
         # обычный ход, и «чистый» повторный ход при запросе на скидку, и
         # прогон харнесса. None (тесты, харнесс) — лимита нет.
         cost_guard: Any = None,
+        # Часы хода. Момент берётся ОДИН РАЗ на ход и уходит в два места:
+        # в блок «Сейчас:» системного промта и в сверку дат последнего
+        # рубежа. Иначе рубеж сравнивал бы ответ с датой, которой модель не
+        # видела, — и на стыке суток ловил бы несуществующее расхождение.
+        now_fn: Any = None,
     ):
         # `client` принимает три формы ради обратной совместимости с уже
         # написанными тестами и харнессом: готовый LLMProvider, «сырой»
@@ -190,6 +303,7 @@ class AgentLoop:
         self.dialog_model = dialog_model
         self.classifier_model = classifier_model
         self.cost_guard = cost_guard
+        self.now_fn = now_fn or moscow_now
         # `self.kb`, а НЕ захваченный параметр `kb`: база знаний
         # перезагружается на лету, когда оператор правит цену из Telegram
         # (app/ops/menu_service.py), и обновление `agent_loop.kb` обязано
@@ -252,7 +366,9 @@ class AgentLoop:
             if concessions_blocked
             else self.executor_factory(dialog_id, state)
         )
-        system = build_system_prompt(self.kb)
+        # Один момент на весь ход — см. now_fn в конструкторе.
+        now = self.now_fn()
+        system = build_system_prompt(self.kb, now)
 
         # Подсказка о зоне идёт в СОДЕРЖИМОЕ этого хода, а не в системный
         # промт: она меняется от сообщения к сообщению, а кешируемый блок
@@ -396,6 +512,54 @@ class AgentLoop:
                 granted_offer_templates=list(executor.granted_offer_templates),
                 hit_iteration_limit=hit_limit,
                 llm_meta=llm_meta,
+                tool_call_errors=tool_call_errors,
+                concession_state=getattr(executor, "state", None),
+                concession_events=getattr(executor, "concession_events", []),
+            )
+
+        # Второй последний рубеж: текст утверждает что-то про дату или
+        # занятость, а инструмент, который даёт на это право, за ход не
+        # вызывался. См. AVAILABILITY_TOOLS — там же разбор инцидента.
+        #
+        # НЕ эскалация, в отличие от ценового рубежа: спросить у клиента
+        # число — обычная работа агента, звать ради этого человека значит
+        # получить эскалацию на каждый вопрос «а когда свободно?». Ответ
+        # уходит клиенту как обычный, разговор продолжается, а в логе
+        # остаётся ERROR — по нему и видно, как часто модель пытается
+        # сочинять календарь.
+        guard_reason: Optional[str] = None
+        if final_text:
+            if AVAILABILITY_WORDS.search(final_text) and not AVAILABILITY_TOOLS.intersection(
+                tool_calls
+            ):
+                guard_reason = AVAILABILITY_GUARD_VIOLATION
+            else:
+                mismatch = date_contradicts_now(final_text, now)
+                if mismatch:
+                    guard_reason = f"{DATE_GUARD_VIOLATION}: {mismatch}"
+
+        if guard_reason:
+            logger.error(
+                "guard rail: %s",
+                guard_reason,
+                extra={
+                    "dialog_id": dialog_id,
+                    "provider": self.provider.name,
+                    "tool_calls": ",".join(tool_calls) or "(ни одного)",
+                    "withheld_text": final_text[:TOOL_TRACE_LIMIT],
+                },
+            )
+            return TurnResult(
+                text=AVAILABILITY_GUARD_REPLY,
+                escalated=executor.escalated,
+                escalation_reason=executor.escalation_reason,
+                classification=classification,
+                tool_calls=tool_calls,
+                quote_statuses=quote_statuses,
+                granted_offer_templates=list(executor.granted_offer_templates),
+                hit_iteration_limit=hit_limit,
+                llm_meta={**llm_meta, "guard_rail": guard_reason,
+                          "withheld_text": final_text},
                 tool_call_errors=tool_call_errors,
                 concession_state=getattr(executor, "state", None),
                 concession_events=getattr(executor, "concession_events", []),

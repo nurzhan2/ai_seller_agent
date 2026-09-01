@@ -9,14 +9,24 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
 from app.agent.debounce import Debouncer
-from app.agent.loop import AgentLoop, TurnResult, estimate_cost_rub, summarize_history
+from app.agent.loop import (
+    AVAILABILITY_GUARD_REPLY,
+    AVAILABILITY_GUARD_VIOLATION,
+    AVAILABILITY_WORDS,
+    DATE_GUARD_VIOLATION,
+    AgentLoop,
+    TurnResult,
+    date_contradicts_now,
+    estimate_cost_rub,
+    summarize_history,
+)
 from app.agent.prompts import build_system_prompt
 from app.agent.tools import TOOLS, ToolExecutor, quote_to_dict
 from app.kb.loader import load_catalog
@@ -1532,3 +1542,188 @@ def test_system_prompt_ties_create_booking_to_the_payment_handoff(kb):
         "Сумму предоплаты назвать можно",
     ]:
         assert fragment in text, fragment
+
+
+# --------------------------------------------------------------------------
+# ПОСЛЕДНИЕ РУБЕЖИ
+#
+# Оба заведены по живым инцидентам и до сих пор не имели ни одного теста —
+# ценовой в том числе.
+#
+# Рубеж занятости и дат — ДВА разных правила, и это главное про него:
+#   занятость («свободно», «занято», «окошко») — нужен инструмент, этих
+#     данных в промте нет;
+#   дата — инструмент НЕ нужен, она в промте есть; сверяем не факт вызова,
+#     а совпадение с тем, что модели показали.
+# Первая редакция требовала инструмент и для дат — и на живом прогоне сразу
+# срезала правильный ответ «завтра будет 2 сентября».
+# --------------------------------------------------------------------------
+
+_MSK = timezone(timedelta(hours=3))
+# День инцидента: 1 сентября 2026, вторник, 22:53 МСК.
+INCIDENT_NOW = datetime(2026, 9, 1, 22, 53, tzinfo=_MSK)
+
+
+def loop_at(kb, script, now=INCIDENT_NOW, label="question"):
+    """Цикл с зафиксированными часами — иначе тесты про даты живут один день."""
+    client = FakeAnthropic(script, label)
+    return AgentLoop(client, kb, now_fn=lambda: now)
+
+
+async def test_price_without_a_tool_call_never_reaches_the_client(kb):
+    """Ценовой рубеж: цифра рядом с рублями и ни одного вызова за ход."""
+    agent, _ = loop_for(
+        kb, [FakeResponse(content=[TextBlock("Баня выйдет 10 500 ₽ за четыре часа.")])]
+    )
+    result = await agent.run_turn("chat-1", [], "сколько стоит баня?")
+
+    assert "10 500" not in result.text
+    assert result.escalated is True
+    assert "цена" in (result.escalation_reason or "")
+
+
+async def test_the_incident_text_never_reaches_the_client(kb):
+    """Текст инцидента 2026-09-01, дословно.
+
+    Клиент: «Есть окошко сегодня?» (22:52). Ответ через 23 секунды при ПУСТОМ
+    tool_trace: «окошко на 14:00 давно закрыто» (клиент 14:00 не называл),
+    «ближайшие свободные — завтра, 1 сентября» (1 сентября и было тем самым
+    «сегодня»), «весь день» (занятость не проверялась).
+
+    Ценовой рубеж это пропустил и был прав: цены в тексте нет.
+    """
+    incident = (
+        "Прошу прощения, но запись на уже прошедшее время невозможна — сейчас "
+        "22:53, и окошко на 14:00 давно закрыто.\n\nБлижайшие свободные — "
+        "завтра, 1 сентября, весь день. Могу записать вас на удобное время?"
+    )
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(incident)])])
+    result = await agent.run_turn("chat-1", [], "Есть окошко сегодня?")
+
+    assert "1 сентября" not in result.text
+    assert "14:00" not in result.text
+    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.llm_meta["guard_rail"] == AVAILABILITY_GUARD_VIOLATION
+    assert result.llm_meta["withheld_text"] == incident
+
+
+async def test_a_correct_tomorrow_date_passes_without_any_tool_call(kb):
+    """«Завтра будет 2 сентября» — проходит.
+
+    Ровно тот случай, на котором сломалась первая редакция рубежа: инструмент
+    для этого не нужен, дата лежит в блоке «Сейчас:». Требовать здесь вызов
+    значит запретить агенту отвечать, какое завтра число.
+    """
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра будет 2 сентября, среда.")])])
+    result = await agent.run_turn("chat-1", [], "а завтра какое число?")
+
+    assert result.text == "Завтра будет 2 сентября, среда."
+    assert result.llm_meta.get("guard_rail") is None
+
+
+async def test_a_wrong_relative_date_is_blocked_even_without_availability_words(kb):
+    """«завтра, 1 сентября», когда 1 сентября — сегодня.
+
+    Слов занятости здесь нет вовсе; ловит именно сверка с блоком промта.
+    """
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Ждём вас завтра, 1 сентября.")])])
+    result = await agent.run_turn("chat-1", [], "когда приезжать?")
+
+    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert DATE_GUARD_VIOLATION in result.llm_meta["guard_rail"]
+
+
+async def test_availability_words_are_blocked_without_a_tool_even_when_the_date_is_right(kb):
+    """«Ближайшие свободные — завтра, 2 сентября» без вызова инструмента.
+
+    Дата верная, но занятости никто не проверял — этих данных в промте нет
+    ни в каком виде.
+    """
+    agent = loop_at(
+        kb, [FakeResponse(content=[TextBlock("Ближайшие свободные — завтра, 2 сентября.")])]
+    )
+    result = await agent.run_turn("chat-1", [], "когда свободно?")
+
+    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.llm_meta["guard_rail"] == AVAILABILITY_GUARD_VIOLATION
+
+
+async def test_availability_guard_is_not_an_escalation(kb):
+    """Спросить число — работа агента, а не повод звать человека. Если бы
+    рубеж эскалировал, как ценовой, каждый вопрос «когда свободно?» уводил бы
+    диалог к оператору."""
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра весь день свободно!")])])
+    result = await agent.run_turn("chat-1", [], "когда можно?")
+
+    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.escalated is False
+
+
+async def test_the_answer_passes_after_a_real_availability_tool_call(kb):
+    """Инструмент вызван — текст проходит как есть. Без этого «рубеж» можно
+    было бы удовлетворить, заглушив вообще все ответы про занятость."""
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="check_availability", input={"date": "2026-09-02"})]),
+        FakeResponse(content=[TextBlock("Завтра, 2 сентября, свободно с 14:00 — записать?")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "есть завтра время?")
+
+    assert "2 сентября" in result.text
+    assert result.llm_meta.get("guard_rail") is None
+
+
+async def test_an_unrelated_tool_call_does_not_buy_the_right_to_talk_about_availability(kb):
+    """ГЛАВНОЕ ОТЛИЧИЕ ОТ ЦЕНОВОГО РУБЕЖА.
+
+    Ценовой смотрит `not tool_calls` — «не было ни одного вызова». Здесь
+    этого мало: get_zones не даёт оснований говорить о занятости, а под
+    условие «хоть что-то вызвали» он бы подошёл.
+    """
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="get_zones", input={})]),
+        FakeResponse(content=[TextBlock("В эти выходные всё свободно, приезжайте.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "а на выходных?")
+
+    assert result.text == AVAILABILITY_GUARD_REPLY
+
+
+async def test_resolve_date_alone_does_not_authorise_availability_claims(kb):
+    """resolve_date НЕ входит в AVAILABILITY_TOOLS: он разбирает дату, а не
+    занятость. Разобрать «завтра» и на этом основании сказать «свободно» —
+    та же выдумка."""
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="resolve_date", input={"text": "завтра"})]),
+        FakeResponse(content=[TextBlock("Завтра, 2 сентября, всё свободно.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "а завтра свободно?")
+
+    assert result.text == AVAILABILITY_GUARD_REPLY
+
+
+def test_the_guard_reply_does_not_trip_the_guard_itself():
+    """Самосогласованность: подставленный ответ не должен сам выглядеть как
+    утверждение о календаре. Первая редакция («уточню свободное время») под
+    собственный словарь попадала."""
+    assert AVAILABILITY_WORDS.search(AVAILABILITY_GUARD_REPLY) is None
+    assert date_contradicts_now(AVAILABILITY_GUARD_REPLY, INCIDENT_NOW) is None
+
+
+def test_the_greeting_from_production_is_not_caught():
+    """Рубеж не должен глушить обычный разговор. Текст — реальное первое
+    сообщение агента из прода 2026-09-01."""
+    greeting = (
+        "Здравствуйте! Меня зовут Иришка, я администратор комплекса «ПарМангал». "
+        "Вижу, вы интересовались нашим объявлением — расскажите, пожалуйста, на "
+        "какую дату планируете отдых и сколько будет гостей?"
+    )
+    assert AVAILABILITY_WORDS.search(greeting) is None
+    assert date_contradicts_now(greeting, INCIDENT_NOW) is None
+
+
+def test_a_plain_future_date_without_a_relative_word_is_not_touched():
+    """«Приезжайте 15 сентября» — сверять не с чем и незачем."""
+    assert date_contradicts_now("Приезжайте 15 сентября, будем рады.", INCIDENT_NOW) is None
