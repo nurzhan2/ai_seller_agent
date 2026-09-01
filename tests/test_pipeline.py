@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -191,6 +192,40 @@ async def _settle():
         await asyncio.sleep(0)
 
 
+async def _take_over(ops_service, store=None, chat_id: str = "chat-1", at=None):
+    """Поставить перехват В ОБА СТОРА — так, как он выглядит в проде.
+
+    Раньше тесты ставили `is_human_takeover` в `InMemoryDialogStore`, потому
+    что конвейер читал флаг оттуда сам, отдельной безусловной проверкой. Эта
+    проверка убрана: она видела только флаг, не видела `takeover_at` и
+    поэтому отменяла кулдаун — чат замолкал навсегда (см. комментарий в
+    app/pipeline.py на месте, где она стояла).
+
+    Решение принимает `should_agent_reply`, а она берёт состояние из
+    операторского стора. В ПРОДЕ это одно и то же: `SqlAlchemyOpsStore.
+    get_flags` читает колонки `is_human_takeover`/`takeover_at` той же
+    строки `chats`, что и `DialogStore` (app/ops/state.py). Стора два только
+    здесь, на стенде.
+
+    ИМЕННО ПОЭТОМУ ФЛАГ СТАВИТСЯ В ОБА. Если ставить только в операторский,
+    тест перестаёт быть регрессионным: возвращённая в конвейер безусловная
+    проверка читает `DialogStore`, не увидит там ничего и мутацию никто не
+    заметит. Проверено — первая версия helper'а мутацию пропускала.
+
+    `at=None` означает «человек в чате, а когда писал — неизвестно»:
+    `takeover_blocks` в этом случае молчит бессрочно (fail closed).
+    """
+    flags = await ops_service.store.get_flags(chat_id)
+    flags.is_human_takeover = True
+    flags.takeover_at = at
+    await ops_service.store.set_flags(chat_id, flags)
+
+    if store is not None:
+        existing = store.chats.get(chat_id)
+        if existing is not None:
+            store.chats[chat_id] = replace(existing, is_human_takeover=True)
+
+
 # --------------------------------------------------------------------------
 # Сквозной путь
 # --------------------------------------------------------------------------
@@ -316,11 +351,9 @@ async def test_our_own_message_echo_is_ignored():
 
 async def test_agent_is_not_called_when_the_chat_is_taken_over():
     store = InMemoryDialogStore()
-    pipeline, store, agent, _ = _build(store=store)
+    pipeline, store, agent, ops_service = _build(store=store)
     await store.get_or_create_chat("chat-1")
-    store.chats["chat-1"] = store.chats["chat-1"].__class__(
-        chat_id="chat-1", is_human_takeover=True
-    )
+    await _take_over(ops_service, store)
 
     await pipeline.handle_message(_payload())
     await _settle()
@@ -348,13 +381,11 @@ async def test_takeover_during_the_debounce_window_stops_the_turn():
     """Окно длится десятки секунд — оператор успевает нажать кнопку ровно
     посередине, и ход агента после этого запускаться не должен."""
     store = InMemoryDialogStore()
-    pipeline, store, agent, _ = _build(store=store)
+    pipeline, store, agent, ops_service = _build(store=store)
 
     await pipeline.handle_message(_payload())
     # Перехват уже после submit, но до срабатывания окна.
-    store.chats["chat-1"] = store.chats["chat-1"].__class__(
-        chat_id="chat-1", is_human_takeover=True
-    )
+    await _take_over(ops_service, store)
     await _settle()
 
     assert agent.calls == []
@@ -500,9 +531,7 @@ async def test_image_message_respects_human_takeover():
     store = InMemoryDialogStore()
     pipeline, store, agent, ops_service = _build(store=store)
     await store.get_or_create_chat("chat-1")
-    store.chats["chat-1"] = store.chats["chat-1"].__class__(
-        chat_id="chat-1", is_human_takeover=True
-    )
+    await _take_over(ops_service, store)
 
     await pipeline.handle_message(_image_payload())
     await _settle()
@@ -1995,6 +2024,56 @@ async def test_the_agent_answers_again_after_the_cooldown_window():
 
     allowed, _ = await ops.should_agent_reply("chat-1")
     assert allowed is True
+
+
+async def test_chat_taken_over_longer_than_the_cooldown_gets_an_agent_reply():
+    """ЧЕРЕЗ КОНВЕЙЕР, а не через should_agent_reply напрямую.
+
+    Тест выше спрашивает решение у `should_agent_reply` — и всё это время
+    отвечал «да», пока конвейер до неё не доходил: в `_accept` стояла
+    отдельная безусловная проверка `chat.is_human_takeover`, срабатывавшая
+    раньше debounce. Флаг она видела, `takeover_at` — нет, поэтому окно
+    TAKEOVER_COOLDOWN_MINUTES не значило ничего и чат замолкал навсегда.
+    Прод: в чате u2i-6a6eWsZlhloSXQh4rHRdNw менеджер написал 31.08 в 13:52,
+    а 01.09 в 22:13 агент всё ещё молчал — 32 часа при окне в 15 минут.
+
+    Поэтому проверка идёт СНАРУЖИ, через `handle_message`: только такой тест
+    ловит лишний стопор, поставленный перед единой точкой решения.
+    """
+    settings = _settings()
+    settings.takeover_mode = "cooldown"
+    settings.takeover_cooldown_minutes = 15
+    pipeline, store, agent, ops = _build(settings=settings)
+    await store.get_or_create_chat("chat-1")
+
+    # Менеджер писал 16 минут назад — окно истекло.
+    await _take_over(ops, store, at=datetime.now(timezone.utc) - timedelta(minutes=16))
+
+    await pipeline.handle_message(_payload(text="Так сколько всё-таки выходит?"))
+    await _settle()
+
+    assert agent.calls, (
+        "перехват старше окна не должен останавливать агента: окно истекло, "
+        "решение принимает should_agent_reply, и оно — «отвечать»"
+    )
+
+
+async def test_chat_taken_over_inside_the_cooldown_still_silences_the_agent():
+    """Обратная сторона того же правила — иначе предыдущий тест можно было бы
+    «починить», сняв перехват вообще."""
+    settings = _settings()
+    settings.takeover_mode = "cooldown"
+    settings.takeover_cooldown_minutes = 15
+    pipeline, store, agent, ops = _build(settings=settings)
+    await store.get_or_create_chat("chat-1")
+
+    # Менеджер писал 5 минут назад — окно ещё идёт.
+    await _take_over(ops, store, at=datetime.now(timezone.utc) - timedelta(minutes=5))
+
+    await pipeline.handle_message(_payload(text="Так сколько всё-таки выходит?"))
+    await _settle()
+
+    assert agent.calls == [], "внутри окна агент обязан молчать"
 
 
 # --------------------------------------------------------------------------

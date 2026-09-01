@@ -564,3 +564,38 @@ def test_a_set_daily_limit_is_not_a_warning(monkeypatch):
     warnings = _startup_log(monkeypatch, {"OUTBOUND_DAILY_LIMIT": "300"})
 
     assert "OUTBOUND_DAILY_LIMIT" not in warnings
+
+
+# --------------------------------------------------------------------------
+# TOUCH_ENABLED — выключатель единственного пути «агент пишет первым»
+#
+# Требование заказчика (2026-09-02): агент отвечает всем, но никогда не
+# пишет первым. Аудит путей наружу дал ровно один, которому не нужно свежее
+# входящее, — воркер отложенных касаний. Остальные исходящие порождаются
+# либо ответом на сообщение клиента, либо действием оператора.
+# --------------------------------------------------------------------------
+
+def test_touches_disabled_says_so_and_starts_no_worker(monkeypatch):
+    """Выключено — воркер не запущен, и об этом сказано в стартовом логе.
+
+    Оба состояния обязаны быть в логе (как у AUTO_BOOKING_ENABLED и
+    OUTBOUND_DAILY_LIMIT): молчащий воркер, о котором лог молчит,
+    неотличим от воркера, которому просто некого коснуться.
+    """
+    text = _startup_log(monkeypatch, {"TOUCH_ENABLED": "false"})
+
+    assert "TOUCH_ENABLED=false" in text
+    assert "касания ВЫКЛЮЧЕНЫ" in text
+    # Приложение обязано подняться И КОРРЕКТНО ПОГАСНУТЬ: touch_task при
+    # выключенных касаниях остаётся None, и shutdown не должен об это
+    # споткнуться. _startup_log поднимает приложение через TestClient и
+    # выходит из контекста — то есть проходит весь lifespan целиком.
+
+
+def test_touches_enabled_by_default_and_the_log_says_it(monkeypatch):
+    """Обратное состояние — иначе тест выше проходил бы и на приложении,
+    где касания выключены намертво."""
+    text = _startup_log(monkeypatch, {"TOUCH_ENABLED": "true"}, level=logging.INFO)
+
+    assert "touch scheduler: started" in text
+    assert "TOUCH_ENABLED=true" in text

@@ -620,27 +620,43 @@ async def lifespan(app: FastAPI):
 
     touch_store = SqlAlchemyTouchStore(get_sessionmaker())
     touch_sender = build_touch_sender(settings, ops_service, ops_bot, outbound)
-    touch_task = asyncio.create_task(
-        supervised_touch_scheduler(
-            # Функция, а не снимок: рабочее окно правится из Telegram на
-            # лету (app/ops/menu_service.py), и воркер обязан видеть правку
-            # без рестарта — см. докстринг supervised_touch_scheduler.
-            touch_store, lambda: app.state.kb, touch_sender,
-            delay_minutes=settings.touch_reminder_delay_minutes,
-            max_count=settings.touch_max_count,
-            interval_seconds=settings.touch_scheduler_interval_seconds,
-            # Отдельно от гейта внутри touch_sender: воркеру нужно не просто
-            # не отправить, а погасить таймер — иначе чат остаётся due
-            # навсегда. См. run_scheduler_pass.
-            can_send=outbound.is_allowed,
-            # AGENT_MIN_INBOUND_TS — тот же порог, что у конвейера. Воркер
-            # был вторым путём наружу, который его не спрашивал: таймер
-            # переживает и смену порога, и месяцы простоя.
-            last_inbound=dialog_store.last_incoming_at,
-            min_inbound_ts=settings.agent_min_inbound_ts,
+    touch_task = None
+    if not settings.touch_enabled:
+        # ОБА СОСТОЯНИЯ В СТАРТОВОМ ЛОГЕ — как у AUTO_BOOKING_ENABLED и
+        # OUTBOUND_DAILY_LIMIT. Выключенный воркер, о котором лог молчит,
+        # неотличим от воркера, который просто не нашёл, кого коснуться.
+        logger.warning(
+            "TOUCH_ENABLED=false — отложенные касания ВЫКЛЮЧЕНЫ, воркер не "
+            "запущен. Это единственный путь, которым агент писал клиенту без "
+            "его сообщения; остальные исходящие — только в ответ. Взведённые "
+            "таймеры остаются в БД и оживут при обратном включении"
         )
-    )
-    logger.info("touch scheduler: started")
+    else:
+        touch_task = asyncio.create_task(
+            supervised_touch_scheduler(
+                # Функция, а не снимок: рабочее окно правится из Telegram на
+                # лету (app/ops/menu_service.py), и воркер обязан видеть
+                # правку без рестарта — см. докстринг.
+                touch_store, lambda: app.state.kb, touch_sender,
+                delay_minutes=settings.touch_reminder_delay_minutes,
+                max_count=settings.touch_max_count,
+                interval_seconds=settings.touch_scheduler_interval_seconds,
+                # Отдельно от гейта внутри touch_sender: воркеру нужно не
+                # просто не отправить, а погасить таймер — иначе чат остаётся
+                # due навсегда. См. run_scheduler_pass.
+                can_send=outbound.is_allowed,
+                # AGENT_MIN_INBOUND_TS — тот же порог, что у конвейера. Воркер
+                # был вторым путём наружу, который его не спрашивал: таймер
+                # переживает и смену порога, и месяцы простоя.
+                last_inbound=dialog_store.last_incoming_at,
+                min_inbound_ts=settings.agent_min_inbound_ts,
+            )
+        )
+        logger.info(
+            "touch scheduler: started (TOUCH_ENABLED=true) — агент может "
+            "напомнить о себе через %d мин молчания, максимум %d раза",
+            settings.touch_reminder_delay_minutes, settings.touch_max_count,
+        )
 
     # Конвейер обработки входящих — последнее звено: вебхук → агент → ответ.
     # Собирается здесь, а не в webhooks.py, потому что ему нужны ВСЕ части
@@ -939,9 +955,12 @@ async def lifespan(app: FastAPI):
     concession_timeout_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await concession_timeout_task
-    touch_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await touch_task
+    # None при TOUCH_ENABLED=false — воркер не запускался. Тот же приём, что
+    # у bot_task ниже: гасить нечего, но и падать на shutdown нельзя.
+    if touch_task is not None:
+        touch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await touch_task
     await avito_client.aclose()
     await avito_items_client.aclose()
     if bot_task is not None:

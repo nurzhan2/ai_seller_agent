@@ -378,9 +378,10 @@ class MessagePipeline:
             await self._reset_touch_timer(chat_id)
             self._log_textless_payload(payload, chat_id)
 
-            if chat.is_human_takeover:
-                logger.info("pipeline: chat is with a human, agent skipped", extra={"chat_id": chat_id})
-                return
+            # Перехвата здесь БОЛЬШЕ НЕ ПРОВЕРЯЕМ: решение принимает
+            # `_handle_image_without_text` -> `should_agent_reply`, то есть
+            # та же единая точка, что и для текста. Смотри её докстринг и
+            # комментарий у второй такой проверки ниже.
             if is_image_message(payload) and not too_old:
                 await self._handle_image_without_text(chat)
             return
@@ -409,9 +410,29 @@ class MessagePipeline:
         # Шаг 4 — до всех проверок ниже. См. докстринг модуля.
         await self._reset_touch_timer(chat_id)
 
-        if chat.is_human_takeover:
-            logger.info("pipeline: chat is with a human, agent skipped", extra={"chat_id": chat_id})
-            return
+        # ПЕРЕХВАТ ЗДЕСЬ НЕ РЕШАЕТСЯ — И ЭТО ГЛАВНОЕ В ЭТОМ МЕСТЕ.
+        #
+        # Тут стояло безусловное `if chat.is_human_takeover: return`. Оно
+        # срабатывало ДО `debouncer.submit`, то есть до того, как правило с
+        # кулдауном (`takeover_blocks`, app/channels/outbound_gate.py) вообще
+        # будет вызвано, — а значит TAKEOVER_COOLDOWN_MINUTES для чата с
+        # поднятым флагом не значил НИЧЕГО: чат замолкал навсегда. Найдено на
+        # чате u2i-6a6eWsZlhloSXQh4rHRdNw: менеджер написал в нём 31.08 в
+        # 13:52, а агент продолжал молчать 01.09 в 22:13 — 32 часа при окне
+        # в 15 минут.
+        #
+        # Флаг и окно — одно состояние, и читать его надо целиком. Проверка
+        # смотрела только `is_human_takeover`, игнорируя `takeover_at` в той
+        # же строке; `should_agent_reply` и гейт читают ОБА поля и зовут одну
+        # общую функцию. Обе стороны берут данные из одной таблицы `chats`
+        # (app/ops/state.py:SqlAlchemyOpsStore.get_flags), так что «вторым
+        # источником правды» эта проверка тоже не была — только третьим
+        # прочтением первого, причём неполным.
+        #
+        # Молчание в чате с человеком по-прежнему гарантировано, и дважды:
+        # заранее в `should_agent_reply` (чтобы не платить за ход модели) и
+        # на границе отправки в `OutboundGate` — там же, где рубильник,
+        # manual_hold и суточные лимиты.
 
         if too_old:
             # Записано в историю (save_incoming выше) — просто не отвечаем.
@@ -670,15 +691,16 @@ class MessagePipeline:
         chat = await self.store.get_or_create_chat(chat_id)
 
         # Перепроверка после окна debounce — оператор мог забрать чат, пока
-        # клиент дописывал. Проверяем оба источника: `Chat.is_human_takeover`
-        # в БД (переживает рестарт) и `OpsService` (кнопки в Telegram, где
-        # состояние живёт в InMemoryOpsStore). Они пока не синхронизированы
-        # между собой — известный пробел, см. README; поэтому уважаем ЛЮБОЙ
-        # из двух, а не выбираем «более правильный».
-        if chat.is_human_takeover:
-            logger.info("pipeline: takeover during debounce window", extra={"chat_id": chat_id})
-            return
-
+        # клиент дописывал. Её делает `should_agent_reply` строкой ниже: она
+        # читает состояние ЗАНОВО, уже после паузы, и этого достаточно.
+        #
+        # Здесь стояла отдельная безусловная проверка `chat.is_human_takeover`
+        # с комментарием про «два несинхронизированных источника: БД и
+        # InMemoryOpsStore». Комментарий устарел: прод давно ходит через
+        # SqlAlchemyOpsStore (app/main.py), и `get_flags` читает те же
+        # колонки той же строки `chats`, что и `chat` выше. Источник один,
+        # а проверка была вторым его прочтением — неполным, без `takeover_at`,
+        # то есть без кулдауна.
         allowed, reason = await self.ops_service.should_agent_reply(chat_id)
         if not allowed:
             logger.info("pipeline: agent stays silent", extra={"chat_id": chat_id, "reason": reason})
