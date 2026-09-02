@@ -78,6 +78,7 @@ class DeepSeekProvider(LLMProvider):
         system: Any = None,
         tools: Optional[Sequence[dict]] = None,
         max_tokens: int,
+        tool_choice: Optional[dict] = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -88,6 +89,16 @@ class DeepSeekProvider(LLMProvider):
             kwargs["system"] = system
         if tools:
             kwargs["tools"] = tools
+        if tool_choice is not None:
+            # ФОРМА ВАЖНА, И РАБОТАЕТ ОНА НЕ ТАК, КАК КАЖЕТСЯ.
+            # {"type": "any"} DeepSeek принимает и МОЛЧА ИГНОРИРУЕТ: замер
+            # 2026-09-02 — 1 вызов инструмента на 10 ходов, столько же,
+            # сколько без него вовсе. Адресное {"type": "tool", "name": ...}
+            # вызов включает надёжно (10 из 10), но ИМЯ НЕ ИСПОЛНЯЕТ: из 40
+            # принуждений по четырём разным именам заказанный инструмент
+            # позвался 5 раз. Для DeepSeek имя — выключатель, а не выбор;
+            # разбор целиком — в докстринге app/agent/tool_forcing.py.
+            kwargs["tool_choice"] = tool_choice
         if not self.enable_thinking:
             kwargs["thinking"] = {"type": "disabled"}
         return await self.client.messages.create(**kwargs)

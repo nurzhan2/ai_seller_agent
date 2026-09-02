@@ -45,6 +45,7 @@ class AnthropicProvider(LLMProvider):
         system: Any = None,
         tools: Optional[Sequence[dict]] = None,
         max_tokens: int,
+        tool_choice: Optional[dict] = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -55,6 +56,8 @@ class AnthropicProvider(LLMProvider):
             kwargs["system"] = system
         if tools:
             kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         return await self.client.messages.create(**kwargs)
 
     def estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> Decimal:

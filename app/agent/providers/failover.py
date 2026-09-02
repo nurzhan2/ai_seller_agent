@@ -54,11 +54,12 @@ class FailoverProvider(LLMProvider):
         system: Any = None,
         tools: Optional[Sequence[dict]] = None,
         max_tokens: int,
+        tool_choice: Optional[dict] = None,
     ) -> Any:
         try:
             response = await self._active.complete(
                 model=model, messages=messages, system=system, tools=tools,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens, tool_choice=tool_choice,
             )
         except Exception:
             self._consecutive_errors += 1
@@ -76,7 +77,7 @@ class FailoverProvider(LLMProvider):
                 # переключение случилось прямо на нём — пробуем сразу же.
                 response = await self._active.complete(
                     model=model, messages=messages, system=system, tools=tools,
-                    max_tokens=max_tokens,
+                    max_tokens=max_tokens, tool_choice=tool_choice,
                 )
                 self._consecutive_errors = 0
             else:

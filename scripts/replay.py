@@ -139,8 +139,11 @@ def build_judge_client() -> tuple[Any, bool]:
 # Прогон
 # --------------------------------------------------------------------------
 
-def load_dialogs(limit: Optional[int] = None) -> list[dict]:
-    data = json.loads(DIALOGS.read_text(encoding="utf-8"))
+def load_dialogs(limit: Optional[int] = None, path: Optional[Path] = None) -> list[dict]:
+    """Диалоги для прогона. `path` — чтобы прогнать не корпус, а конкретный
+    набор: разбор инцидента заканчивается вопросом «а теперь проходит?», и
+    отвечать на него удобнее тем же харнессом, что считает эталон."""
+    data = json.loads((path or DIALOGS).read_text(encoding="utf-8"))
     return data[:limit] if limit else data
 
 
@@ -157,6 +160,7 @@ async def replay(
     limit: Optional[int] = None,
     judge_enabled: bool = True,
     provider_name: str = "anthropic",
+    dialogs_path: Optional[Path] = None,
 ) -> RunResult:
     kb = load_catalog()
     agent_client, online = build_agent_provider(provider_name)
@@ -170,7 +174,7 @@ async def replay(
     known_zone_ids = [z.id for z in kb.catalog.zones]
     result = RunResult(model_available=online, judge_available=judge_online, provider=provider_name)
 
-    for dialog in load_dialogs(limit):
+    for dialog in load_dialogs(limit, dialogs_path):
         dialog_id = dialog["id"]
         history: list[dict] = []
         # Состояние уступок живёт на весь диалог — как в проде.
@@ -193,18 +197,14 @@ async def replay(
             if outcome.text:
                 history.append({"role": "assistant", "content": outcome.text})
 
-            quoted_totals = [
-                str(executor.last_quote.total)
-                for _ in [0]
-                if executor.last_quote is not None and executor.last_quote.total is not None
-            ]
-
             violations = check_turn(
                 TurnUnderTest(
                     text=outcome.text,
                     tool_calls=outcome.tool_calls,
                     quote_statuses=outcome.quote_statuses,
-                    quoted_totals=quoted_totals,
+                    # Не только `total`: предоплата и цены допов приходят от
+                    # тех же инструментов и выдумкой не являются.
+                    tool_amounts=sorted(outcome.tool_amounts),
                     concession_granted=bool(outcome.granted_offer_templates),
                     known_zone_ids=known_zone_ids,
                     applied_promo=(
@@ -227,6 +227,8 @@ async def replay(
                 hit_iteration_limit=outcome.hit_iteration_limit,
                 tool_call_errors=outcome.tool_call_errors,
                 cost_rub=str(outcome.llm_meta.get("cost_rub", "0")),
+                guard_rail=str(outcome.llm_meta.get("guard_rail") or ""),
+                withheld_text=str(outcome.llm_meta.get("withheld_text") or ""),
             )
 
             if judge is not None:
@@ -253,6 +255,11 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", action="store_true", help="записать результат как эталон")
     parser.add_argument("--limit", type=int, help="прогнать только N диалогов")
+    parser.add_argument(
+        "--dialogs", type=Path,
+        help="файл с диалогами вместо docs/analysis/dialogs.json — например, "
+             "воспроизведение инцидента (tests/incidents/*.json)",
+    )
     parser.add_argument("--no-judge", action="store_true", help="без оценок судьи")
     parser.add_argument(
         "--provider", choices=["anthropic", "deepseek"], default="anthropic",
@@ -269,7 +276,8 @@ async def main() -> int:
         )
         return 2
 
-    result = await replay(limit=args.limit, judge_enabled=not args.no_judge, provider_name=args.provider)
+    result = await replay(limit=args.limit, judge_enabled=not args.no_judge,
+                          provider_name=args.provider, dialogs_path=args.dialogs)
     write_report(result, REPORT_HTML, REPORT_JSON)
     data = result.as_json()
 

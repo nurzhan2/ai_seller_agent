@@ -27,6 +27,12 @@ class TurnRecord:
     hit_iteration_limit: bool = False
     tool_call_errors: int = 0
     cost_rub: str = "0"
+    # ЧТО ИМЕННО ЗАДЕРЖАЛ РУБЕЖ. Без этого по отчёту нельзя отличить
+    # «рубеж спас клиента от выдумки» от «рубеж срезал нормальный ответ»:
+    # видно только подставленную заглушку, одинаковую в обоих случаях.
+    # Разбор прогона 2026-09-02 упёрся ровно в это.
+    guard_rail: str = ""
+    withheld_text: str = ""
 
 
 @dataclass
@@ -177,7 +183,11 @@ def render_html(result: RunResult, title: str = "Прогон на реальн�
             f"<td>{e(turn.dialog_id)}<br><small>{e(turn.zone_topic)}</small></td>"
             f'<td>{e(turn.client_text[:300])}</td>'
             f'<td class="mgr">{e(turn.manager_text[:300])}</td>'
-            f'<td class="agent">{e(turn.agent_text[:300])}</td>'
+            f'<td class="agent">{e(turn.agent_text[:300])}'
+            + (f'<br><small><b>рубеж:</b> {e(turn.guard_rail)}<br>'
+               f'<b>задержано:</b> {e(turn.withheld_text[:300])}</small>'
+               if turn.guard_rail else "")
+            + "</td>"
             f"<td>{rules}<br><small>{detail}</small></td>"
             f"<td>{score}</td>"
             "</tr>"

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
 from app.agent.loop import PRICE_LIKE_WITHOUT_TOOL_CALL as _MONEY
+from app.agent.loop import invented_amounts
 
 MAX_REPLY_LENGTH = 700
 MAX_QUESTION_MARKS = 1
@@ -55,7 +56,11 @@ class TurnUnderTest:
     text: str
     tool_calls: Sequence[str] = ()
     quote_statuses: Sequence[str] = ()
-    quoted_totals: Sequence[str] = ()      # суммы, которые вернул движок
+    # Числа, которые вернули инструменты за этот ход (AgentLoop отдаёт их в
+    # TurnResult.tool_amounts). Раньше здесь лежал только `total` расчёта, и
+    # правило ниже считало выдумкой предоплату и цену шампуров — обе честные
+    # и обе из инструментов.
+    tool_amounts: Sequence[str] = ()
     concession_granted: bool = False
     known_zone_ids: Sequence[str] = ()
     applied_promo: Optional[str] = None
@@ -76,14 +81,17 @@ def check_turn(turn: TurnUnderTest) -> list[Violation]:
             Violation("price_without_tool", "в тексте есть сумма, но calculate_price не вызывался")
         )
 
-    # 2. Названные суммы совпадают с результатом расчёта.
-    if turn.quoted_totals:
-        for match in _MONEY.finditer(text):
-            digits = re.sub(r"\D", "", match.group())
-            if digits and digits not in {re.sub(r"\D", "", t) for t in turn.quoted_totals}:
-                violations.append(
-                    Violation("price_mismatch", f"сумма {match.group().strip()} не из calculate_price")
-                )
+    # 2. Названные суммы — из ответов инструментов, а не из головы.
+    #
+    # Проверка живёт в app/agent/loop.py и работает в проде как рубеж перед
+    # отправкой; здесь она ТОЛЬКО вызывается. Своя копия правила разошлась бы
+    # с рантаймом молча — ровно та же причина, по которой отсюда же берётся
+    # и денежный паттерн.
+    if turn.tool_amounts:
+        for amount in invented_amounts(text, set(turn.tool_amounts)):
+            violations.append(
+                Violation("price_mismatch", f"сумма {amount} не из ответа инструмента")
+            )
 
     # 3. При blocked в тексте не должно быть суммы вообще.
     if "blocked" in turn.quote_statuses:

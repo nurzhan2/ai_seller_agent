@@ -120,6 +120,57 @@ async def test_deepseek_provider_passes_cache_control_through_without_crashing()
     assert client.messages.calls[0]["system"] == system
 
 
+async def test_deepseek_provider_forwards_the_forced_tool_choice():
+    """САМАЯ ХРУПКАЯ СТРОЧКА ВО ВСЁМ ПРИНУЖДЕНИИ.
+
+    Прод ходит через DeepSeek. Если эта строка потеряется, `tool_choice`
+    просто не доедет до модели — а весь остальной код останется на месте, и
+    ни один другой тест этого не заметит: тесты петли ходят через
+    AnthropicProvider. Найдено мутацией 2026-09-02.
+
+    Форма проверяется дословно: {"type": "any"} DeepSeek принимает и молча
+    игнорирует, работает только адресное {"type": "tool", "name": ...}.
+    """
+    client = FakeClient()
+    provider = DeepSeekProvider(client=client)
+    await provider.complete(
+        model=DIALOG_MODEL, messages=[], max_tokens=8, tools=[{"name": "x"}],
+        tool_choice={"type": "tool", "name": "check_availability"},
+    )
+    assert client.messages.calls[0]["tool_choice"] == {
+        "type": "tool", "name": "check_availability",
+    }
+
+
+async def test_deepseek_provider_omits_tool_choice_when_nothing_is_forced():
+    """Ключ не должен появляться со значением None: обычный ход — это ход
+    БЕЗ принуждения, и посылать в него пустое поле незачем."""
+    client = FakeClient()
+    provider = DeepSeekProvider(client=client)
+    await provider.complete(model=DIALOG_MODEL, messages=[], max_tokens=8,
+                            tools=[{"name": "x"}])
+    assert "tool_choice" not in client.messages.calls[0]
+
+
+async def test_anthropic_provider_forwards_the_forced_tool_choice():
+    """Тот же вопрос к резервному провайдеру — и к тому, через который
+    гоняется харнесс качества."""
+    client = FakeClient()
+    provider = AnthropicProvider(client=client)
+    await provider.complete(
+        model="claude-sonnet-5", messages=[], max_tokens=8, tools=[{"name": "x"}],
+        tool_choice={"type": "tool", "name": "calculate_price"},
+    )
+    assert client.messages.calls[0]["tool_choice"] == {
+        "type": "tool", "name": "calculate_price",
+    }
+    client2 = FakeClient()
+    await AnthropicProvider(client=client2).complete(
+        model="claude-sonnet-5", messages=[], max_tokens=8, tools=[{"name": "x"}]
+    )
+    assert "tool_choice" not in client2.messages.calls[0]
+
+
 def test_deepseek_provider_cost_known_and_unknown_model():
     provider = DeepSeekProvider(client=FakeClient())
     assert provider.estimate_cost(DIALOG_MODEL, 10_000, 1_000) > 0
@@ -163,6 +214,28 @@ async def test_failover_switches_after_threshold_and_retries_on_fallback():
     assert router.active is fallback
     assert switches == [("anthropic", "anthropic")]  # оба провайдера тут AnthropicProvider
     assert response.content[0].text == "ok"
+
+
+async def test_failover_carries_the_forced_tool_choice_to_both_providers():
+    """Переключение на резерв не должно ронять принуждение.
+
+    Иначе ровно в момент аварии — когда модель и так отвечает хуже — агент
+    тихо возвращался бы к поведению «инструмент по настроению».
+    """
+    primary_client = FakeClient(error=RuntimeError("boom"))
+    fallback_client = FakeClient()
+    router = FailoverProvider(
+        AnthropicProvider(client=primary_client),
+        AnthropicProvider(client=fallback_client),
+        max_consecutive_errors=1,
+    )
+    forced = {"type": "tool", "name": "find_next_available"}
+
+    await router.complete(model="m", messages=[], max_tokens=8,
+                          tools=[{"name": "x"}], tool_choice=forced)
+
+    assert primary_client.messages.calls[0]["tool_choice"] == forced
+    assert fallback_client.messages.calls[0]["tool_choice"] == forced
 
 
 async def test_failover_without_fallback_configured_raises_as_is():

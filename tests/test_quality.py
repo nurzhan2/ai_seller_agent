@@ -42,7 +42,7 @@ def test_price_with_tool_call_passes():
     turn = TurnUnderTest(
         text="3 ч × 3500 ₽ = 10500 ₽",
         tool_calls=["calculate_price"],
-        quoted_totals=["10500", "3500"],
+        tool_amounts=["10500", "3500"],
     )
     assert "price_without_tool" not in rules(turn)
 
@@ -53,7 +53,12 @@ def test_text_without_money_needs_no_tool():
 
 
 # --------------------------------------------------------------------------
-# 2. Названные суммы совпадают с расчётом
+# 2. Названные суммы — из ответов инструментов
+#
+# Правило переехало в app/agent/loop.py и работает в проде рубежом перед
+# отправкой; здесь оно только вызывается. Заодно оно перестало быть правилом
+# «любая сумма обязана равняться total»: полный прогон 2026-09-02 показал два
+# ПРАВИЛЬНЫХ ответа, которые та редакция рубила, — оба ниже.
 # --------------------------------------------------------------------------
 
 def test_invented_amount_is_caught():
@@ -61,7 +66,7 @@ def test_invented_amount_is_caught():
     turn = TurnUnderTest(
         text="Выйдет 9000 ₽.",
         tool_calls=["calculate_price"],
-        quoted_totals=["10500"],
+        tool_amounts=["10500"],
     )
     assert "price_mismatch" in rules(turn)
 
@@ -70,7 +75,33 @@ def test_matching_amount_passes():
     turn = TurnUnderTest(
         text="Итого 10500 ₽ за 3 часа.",
         tool_calls=["calculate_price"],
-        quoted_totals=["10500"],
+        tool_amounts=["10500"],
+    )
+    assert "price_mismatch" not in rules(turn)
+
+
+def test_the_prepayment_is_not_an_invented_amount():
+    """«Юрта на сутки — 4000 ₽, предоплата 3000 ₽» — из прогона 2026-09-02.
+
+    3000 — это `prepayment` того же расчёта. Прежнее правило сверяло только
+    с `total` и объявляло предоплату выдумкой.
+    """
+    turn = TurnUnderTest(
+        text="Юрта на сутки — 4000 ₽, предоплата 3000 ₽.",
+        tool_calls=["calculate_price"],
+        tool_amounts=["4000", "3000"],
+    )
+    assert "price_mismatch" not in rules(turn)
+
+
+def test_an_extra_priced_by_its_own_tool_is_not_invented_either():
+    """«Набор из 6 штук за 500 ₽» — цена допа из get_extras, оттуда же из
+    прогона. Расчёта аренды в этом ходу не было вовсе, и требовать
+    совпадения с ним не с чем."""
+    turn = TurnUnderTest(
+        text="Да, шампуры есть — набор из 6 штук за 500 ₽.",
+        tool_calls=["get_extras"],
+        tool_amounts=["500", "6"],
     )
     assert "price_mismatch" not in rules(turn)
 
@@ -156,7 +187,7 @@ def test_derived_hourly_rate_under_promo_is_caught():
     turn = TurnUnderTest(
         text="Получается 1250 ₽ в час.",
         tool_calls=["calculate_price"],
-        quoted_totals=["1250"],
+        tool_amounts=["1250"],
         applied_promo="sixth_hour_free",
     )
     assert "derived_rate" in rules(turn)
@@ -166,7 +197,7 @@ def test_line_breakdown_under_promo_passes():
     turn = TurnUnderTest(
         text="5 ч × 1500 ₽ = 7500 ₽, шестой час в подарок.",
         tool_calls=["calculate_price"],
-        quoted_totals=["7500", "1500"],
+        tool_amounts=["7500", "1500"],
         applied_promo="sixth_hour_free",
         concession_granted=True,
     )

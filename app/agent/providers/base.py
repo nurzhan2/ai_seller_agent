@@ -31,6 +31,7 @@ class LLMProvider(ABC):
         system: Any = None,
         tools: Optional[Sequence[dict]] = None,
         max_tokens: int,
+        tool_choice: Optional[dict] = None,
     ) -> Any:
         """Один вызов модели. Возвращает Anthropic-форму ответа."""
 

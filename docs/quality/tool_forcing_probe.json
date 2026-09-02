@@ -1,0 +1,1360 @@
+{
+  "provider": "deepseek",
+  "model": "deepseek-v4-pro",
+  "repeats": 5,
+  "cases": [
+    {
+      "id": "incident_window_today",
+      "client_text": "на сегодня есть окошко 4 часа , нас 6теро",
+      "expected_tool": "check_availability",
+      "why": "дословный текст клиента из инцидента 2026-09-01: дата, время и вопрос про занятость в одном сообщении",
+      "forced": [
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02",
+              "start_time": "18:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Клиент спрашивает про свободное окошко на сегодня на 4 часа для 6 человек; занятость всех трёх бань вернула unknown — не могу подтвердить свободно/занято.",
+              "urgency": "normal"
+            }
+          },
+          "text": "Здравствуйте! На сегодня уточню занятость у менеджера и вернусь с ответом. ☀️\n\nПодскажите только, чтобы подобрать под вашу компанию из 6 человек: вам баня, купол или гриль-домик интересует?",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 10952.99999997951
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02",
+              "start_time": "00:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Клиент запросил свободное время на сегодня на 4 часа для 6 человек, но система занятости вернула unknown по всем зонам — не могу подтвердить наличие свободного времени.",
+              "urgency": "normal"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Уточню у менеджера свободное время на сегодня и вернусь к вам с ответом — дайте пару минут 🌸",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 13282.00000000652
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "find_next_available",
+          "tools": [
+            "find_next_available",
+            "find_next_available",
+            "find_next_available",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "find_next_available": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Занятость зон на сегодня неизвестна, клиент хочет окошко на 4 часа на 6 человек"
+            }
+          },
+          "text": "Здравствуйте! Уточню у менеджера по свободным окошкам на сегодня и вернусь к вам с ответом. Подскажите, кстати, что вас интересует — баня, купол или гриль-домик?",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 9139.999999984866
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "dummy",
+              "date": "2026-09-02",
+              "start_time": "14:00",
+              "hours": 4
+            }
+          },
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол или гриль-домик? А я пока уточню занятость на сегодня по вашему времени.",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5500.0
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "find_next_available",
+          "tools": [
+            "find_next_available",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "find_next_available": {
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Клиент просит проверить занятость на сегодня на 4 часа для 6 гостей, но зона неизвестна и занятость не определилась"
+            }
+          },
+          "text": "Пока не знаю, какая зона вам нужна, но по свободному времени сегодня уточню у менеджера и вернусь с ответом. А вы пока подскажите, что вас интересует — баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 8407.00000000652
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1171.9999999913853
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1030.9999999881256
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1032.0000000065193
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1125.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 812.0000000053551
+        }
+      ]
+    },
+    {
+      "id": "incident_second_turn",
+      "client_text": "сегодня 16 00",
+      "expected_tool": "check_availability",
+      "why": "ВТОРОЙ ход того же инцидента: слова про занятость в самом сообщении нет, признак остался в предыдущей реплике",
+      "forced": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Конечно, сейчас передам менеджеру — он свяжется с вами.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 1500.0
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "date": "2026-09-02",
+              "start_time": "16:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Занятость неизвестна для запроса 02.09.2026 16:00, 4 часа, 6 гостей",
+              "urgency": "normal"
+            }
+          },
+          "text": "Уточню занятость на сегодня 16:00 и вернусь с ответом. Если появятся вопросы — пишите!",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 7108.99999999674
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "bath_knight",
+              "date": "2026-09-02",
+              "start_time": "16:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Занятость бань на 02.09.2026 в 16:00 неизвестна, нужно уточнить у менеджера",
+              "urgency": "normal"
+            }
+          },
+          "text": "Сейчас уточню наличие на сегодня, 2 сентября, к 16:00, и вернусь с ответом. Какую баню предпочитаете — «Русский стиль», «Гараж» или «Рыцарскую»?",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 8796.999999991385
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02",
+              "start_time": "16:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Занятость бань на сегодня 16:00 неизвестна, нужно уточнить у менеджера",
+              "urgency": "normal"
+            }
+          },
+          "text": "Уточню у менеджера и вернусь к вам с ответом — спасибо, что подождали! 💫",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 9875.0
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "all",
+              "date": "2026-09-02",
+              "start_time": "16:00",
+              "hours": 4
+            },
+            "escalate_to_human": {
+              "reason": "Клиент просит окошко сегодня в 16:00 на 4 часа, 6 гостей, но занятость вернулась unknown.",
+              "urgency": "normal"
+            }
+          },
+          "text": "Уже уточняю у менеджера по свободному времени на сегодня с 16:00 — скоро вернусь к вам с ответом.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 7000.0
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1078.0000000086147
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1062.999999994645
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1155.9999999881256
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 859.0000000258442
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 640.9999999741558
+        }
+      ]
+    },
+    {
+      "id": "window_relative_day",
+      "client_text": "Есть окошко сегодня?",
+      "expected_tool": "resolve_date",
+      "why": "относительная дата без времени — сначала разобрать «сегодня» в число, считать это в уме модели нельзя (инциденты 31.08 и 01.09)",
+      "forced": [
+        {
+          "asked_tool": "resolve_date",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability"
+          ],
+          "tool_args": {
+            "check_availability": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка — администратор ПарМангала. ☀️\n\nПодскажите, что вас интересует: баня, купол, гриль-домик или шатёр? Тогда подберу свободное время на сегодня.",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5016.00000000326
+        },
+        {
+          "asked_tool": "resolve_date",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability"
+          ],
+          "tool_args": {
+            "check_availability": {}
+          },
+          "text": "Здравствуйте! С удовольствием помогу — подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? 🏕️",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4171.0000000020955
+        },
+        {
+          "asked_tool": "resolve_date",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability"
+          ],
+          "tool_args": {
+            "check_availability": {}
+          },
+          "text": "Здравствуйте! Подскажите, что вас интересует — баня, купол, гриль-домик или шатёр? И на какое время планируете отдых?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3953.9999999979045
+        },
+        {
+          "asked_tool": "resolve_date",
+          "first_tool": "find_next_available",
+          "tools": [
+            "find_next_available",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "find_next_available": {},
+            "escalate_to_human": {
+              "reason": "Клиент спрашивает про свободное окно сегодня, но зона неизвестна и занятость по всем зонам не определена",
+              "urgency": "normal"
+            }
+          },
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? А по свободному окну на сегодня уточню у менеджера и вернусь с ответом.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 7125.0
+        },
+        {
+          "asked_tool": "resolve_date",
+          "first_tool": "check_availability",
+          "tools": [
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "tool_args": {
+            "check_availability": {
+              "zone_id": "__all__",
+              "date": "2026-09-02"
+            },
+            "escalate_to_human": {
+              "reason": "Клиент спрашивает про свободное окошко на сегодня, зона неизвестна; занятость вернула unknown",
+              "urgency": "normal"
+            }
+          },
+          "text": "Уточню у менеджера и вернусь с ответом. А пока подскажите, пожалуйста, что вас интересует — так смогу дать точные варианты. 🌸",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 8530.999999988126
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 750.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 969.0000000118744
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 967.9999999934807
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 782.0000000065193
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 937.0000000053551
+        }
+      ]
+    },
+    {
+      "id": "nearest_available",
+      "client_text": "когда ближайшее свободное?",
+      "expected_tool": "find_next_available",
+      "why": "числа клиент не называет — спрашивать его у клиента незачем",
+      "forced": [
+        {
+          "asked_tool": "find_next_available",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5594.000000011874
+        },
+        {
+          "asked_tool": "find_next_available",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? Тогда подберу ближайшие свободные даты 🌸",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4671.0000000020955
+        },
+        {
+          "asked_tool": "find_next_available",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? 🌞",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4282.000000006519
+        },
+        {
+          "asked_tool": "find_next_available",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, что вас интересует — баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4375.0
+        },
+        {
+          "asked_tool": "find_next_available",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? 🍀",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4202.999999979511
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1125.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1140.0000000139698
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1046.9999999913853
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1110.000000015134
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1108.9999999967404
+        }
+      ]
+    },
+    {
+      "id": "concrete_booking",
+      "client_text": "можно записаться на 5 сентября в 18:00?",
+      "expected_tool": "check_availability",
+      "why": "конкретная дата плюс слово про запись",
+      "forced": [
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "resolve_date",
+          "tools": [
+            "resolve_date"
+          ],
+          "tool_args": {
+            "resolve_date": {
+              "date": "5 сентября"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, что вас интересует — баня, купол, гриль-домик или шатёр?\n\n5 сентября — это, насколько я понимаю, суббота. Уточню по дате позже, а пока подскажите зону, чтобы я могла проверить время.",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6391.00000000326
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "resolve_date",
+          "tools": [
+            "resolve_date"
+          ],
+          "tool_args": {
+            "resolve_date": {
+              "date": "5 сентября"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?\n\nА по дате — уточните, пожалуйста, число: это 5 сентября 2026 года? 😊",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4842.999999993481
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "resolve_date",
+          "tools": [
+            "resolve_date"
+          ],
+          "tool_args": {
+            "resolve_date": {
+              "date": "5 сентября"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4437.999999994645
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "resolve_date",
+          "tools": [
+            "resolve_date"
+          ],
+          "tool_args": {
+            "resolve_date": {
+              "text": "5 сентября"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4687.000000005355
+        },
+        {
+          "asked_tool": "check_availability",
+          "first_tool": "resolve_date",
+          "tools": [
+            "resolve_date"
+          ],
+          "tool_args": {
+            "resolve_date": {
+              "date": "5 сентября"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, а что вас интересует — баня, купол, гриль-домик или шатёр? И уточните, на какое число: 5 сентября выпадает на субботу, всё верно?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5032.000000006519
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 717.9999999934807
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 922.0000000204891
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 671.9999999913853
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 983.9999999967404
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 719.0000000118744
+        }
+      ]
+    },
+    {
+      "id": "price_with_hours",
+      "client_text": "Сколько стоит баня на 4 часа?",
+      "expected_tool": "calculate_price",
+      "why": "цена: без вызова инструмента её нельзя называть вообще",
+      "forced": [
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02",
+              "hours": 4
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, какая баня вас интересует — «Русский стиль», «Гараж» или «Рыцарская»?\n\nИ со скольки планируете заезд?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5718.9999999827705
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "?need_input",
+              "date": "2026-09-02"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. У нас три бани — «Русский стиль» (до 12 чел.), «Гараж» (до 10 чел.) и «Рыцарская» (до 6 чел.). Подскажите, какая вас интересует и на какую дату планируете?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5766.00000000326
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, какая баня вас интересует — «Русский стиль», «Гараж» или «Рыцарская»?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4092.9999999934807
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "Здравствуйте! Меня зовут Иришка. Какая баня вас интересует — «Русский стиль», «Гараж» или «Рыцарская»?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4110.000000015134
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "invoke_accept",
+          "tools": [
+            "invoke_accept"
+          ],
+          "tool_args": {
+            "invoke_accept": {
+              "client-first-message": "client"
+            }
+          },
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4421.999999991385
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 937.0000000053551
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 641.0000000032596
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 937.0000000053551
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 827.9999999795109
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1016.0000000032596
+        }
+      ]
+    },
+    {
+      "id": "price_bare",
+      "client_text": "а цена какая?",
+      "expected_tool": null,
+      "why": "цена без зоны и без даты — принуждать НЕЧЕГО. calculate_price требует zone_id и date; принуждение здесь заставляло модель выдумать оба поля, получить needs_input и спросить у клиента всё разом. Замер 2026-09-02: доля ответов больше чем с одним вопросом 18% против 2% без принуждения",
+      "forced": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3062.000000005355
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Меня зовут Иришка. Цена зависит от зоны и дня — подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2687.999999994645
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2578.0000000086147
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Меня зовут Иришка. Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр? От этого зависит стоимость.",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2483.9999999967404
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Меня зовут Иришка, администратор ПарМангала. Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2984.99999998603
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1078.0000000086147
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1156.0000000172295
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1187.999999994645
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1171.9999999913853
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1296.0000000020955
+        }
+      ]
+    },
+    {
+      "id": "price_after_zone",
+      "client_text": "а цена какая?",
+      "expected_tool": "calculate_price",
+      "why": "тот же вопрос, но зона уже названа ходом раньше — вызов снова осмыслен. Именно этот случай и делает сужение безопасным: разговор почти всегда начинается с зоны",
+      "forced": [
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02"
+            }
+          },
+          "text": "Подскажите, на сколько часов планируете баню?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5141.00000000326
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02"
+            }
+          },
+          "text": "Подскажите, на сколько часов планируете баню? И на какое число — сегодня или другой день?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4452.999999979511
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "get_zones",
+          "tools": [
+            "get_zones"
+          ],
+          "tool_args": {
+            "get_zones": {}
+          },
+          "text": "У нас три бани: «Русский стиль», «Гараж» и «Рыцарская». Чтобы назвать цену, подскажите, пожалуйста, на какую дату и на сколько часов планируете?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4969.000000011874
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02"
+            }
+          },
+          "text": "На сколько часов хотите баню?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4092.9999999934807
+        },
+        {
+          "asked_tool": "calculate_price",
+          "first_tool": "calculate_price",
+          "tools": [
+            "calculate_price"
+          ],
+          "tool_args": {
+            "calculate_price": {
+              "zone_id": "bath_russian",
+              "date": "2026-09-02"
+            }
+          },
+          "text": "Подскажите, на сколько часов хотите баню?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3610.000000015134
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1030.9999999881256
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1125.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 719.0000000118744
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1125.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1171.9999999913853
+        }
+      ]
+    },
+    {
+      "id": "callback_tomorrow",
+      "client_text": "завтра перезвоню",
+      "expected_tool": null,
+      "why": "требование заказчика дословно: дата есть, вопроса про запись нет — календарь дёргать не за что",
+      "forced": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Конечно, сейчас передам менеджеру — он свяжется с вами.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 1500.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Хорошо, жду вашего звонка 🌸 А чтобы заранее подготовиться — что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3062.000000005355
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Конечно, сейчас передам менеджеру — он свяжется с вами.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 672.0000000204891
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Хорошо, буду ждать вашего звонка 🌸\n\nЕсли захотите уточнить что-то раньше — пишите. Подскажите, кстати, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3125.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Здравствуйте! Договорились, будем на связи 🌸\n\nПодскажите, чтобы я сориентировалась: что вас интересует — баня, купол, гриль-домик или шатёр?",
+          "guard_rail": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2718.9999999827705
+        }
+      ],
+      "control": [
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 625.0
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 703.0000000086147
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "Конечно, сейчас передам менеджеру — он свяжется с вами.",
+          "guard_rail": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 608.9999999967404
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 984.9999999860302
+        },
+        {
+          "asked_tool": null,
+          "first_tool": null,
+          "tools": [],
+          "tool_args": {},
+          "text": "",
+          "guard_rail": null,
+          "escalated": false,
+          "error": "TypeError: probe.<locals>.<lambda>() takes 1 positional argument but 2 were given",
+          "latency_ms": 1047.000000020489
+        }
+      ]
+    }
+  ]
+}

@@ -17,14 +17,22 @@ import pytest
 
 from app.agent.debounce import Debouncer
 from app.agent.loop import (
-    AVAILABILITY_GUARD_REPLY,
+    AVAILABILITY_GUARD_HANDOFF,
+    AVAILABILITY_GUARD_HANDOFF_REASON,
+    AVAILABILITY_GUARD_REPLIES,
     AVAILABILITY_GUARD_VIOLATION,
-    AVAILABILITY_WORDS,
     DATE_GUARD_VIOLATION,
     AgentLoop,
     TurnResult,
+    AMOUNT_MISMATCH_VIOLATION,
+    _canonical_amount,
+    amounts_in_payload,
+    availability_claim,
     date_contradicts_now,
     estimate_cost_rub,
+    guard_repeats,
+    invented_amounts,
+    normalize_tool_use,
     summarize_history,
 )
 from app.agent.prompts import build_system_prompt
@@ -1547,16 +1555,17 @@ def test_system_prompt_ties_create_booking_to_the_payment_handoff(kb):
 # --------------------------------------------------------------------------
 # ПОСЛЕДНИЕ РУБЕЖИ
 #
-# Оба заведены по живым инцидентам и до сих пор не имели ни одного теста —
-# ценовой в том числе.
+# Ни у одного из них не было тестов до 2026-09-02 — у ценового в том числе.
 #
-# Рубеж занятости и дат — ДВА разных правила, и это главное про него:
-#   занятость («свободно», «занято», «окошко») — нужен инструмент, этих
-#     данных в промте нет;
-#   дата — инструмент НЕ нужен, она в промте есть; сверяем не факт вызова,
-#     а совпадение с тем, что модели показали.
+# Рубеж занятости и дат — ДВА разных правила:
+#   занятость — нужен инструмент, этих данных в промте нет;
+#   дата      — инструмент НЕ нужен, она в промте есть; сверяем совпадение.
 # Первая редакция требовала инструмент и для дат — и на живом прогоне сразу
 # срезала правильный ответ «завтра будет 2 сентября».
+#
+# Вторая редакция ловила ОБЕЩАНИЕ проверить наравне с утверждением — и в
+# проде срезала честное «уточню свободное время», из-за чего клиент получил
+# третью подряд одинаковую отписку.
 # --------------------------------------------------------------------------
 
 _MSK = timezone(timedelta(hours=3))
@@ -1575,7 +1584,7 @@ async def test_price_without_a_tool_call_never_reaches_the_client(kb):
     agent, _ = loop_for(
         kb, [FakeResponse(content=[TextBlock("Баня выйдет 10 500 ₽ за четыре часа.")])]
     )
-    result = await agent.run_turn("chat-1", [], "сколько стоит баня?")
+    result = await agent.run_turn("chat-1", [], "просто вопрос")
 
     assert "10 500" not in result.text
     assert result.escalated is True
@@ -1585,10 +1594,9 @@ async def test_price_without_a_tool_call_never_reaches_the_client(kb):
 async def test_the_incident_text_never_reaches_the_client(kb):
     """Текст инцидента 2026-09-01, дословно.
 
-    Клиент: «Есть окошко сегодня?» (22:52). Ответ через 23 секунды при ПУСТОМ
-    tool_trace: «окошко на 14:00 давно закрыто» (клиент 14:00 не называл),
-    «ближайшие свободные — завтра, 1 сентября» (1 сентября и было тем самым
-    «сегодня»), «весь день» (занятость не проверялась).
+    «окошко на 14:00 давно закрыто» (клиент 14:00 не называл), «ближайшие
+    свободные — завтра, 1 сентября» (1 сентября и было тем самым «сегодня»),
+    «весь день» (занятость не проверялась). tool_trace был ПУСТ.
 
     Ценовой рубеж это пропустил и был прав: цены в тексте нет.
     """
@@ -1598,21 +1606,19 @@ async def test_the_incident_text_never_reaches_the_client(kb):
         "завтра, 1 сентября, весь день. Могу записать вас на удобное время?"
     )
     agent = loop_at(kb, [FakeResponse(content=[TextBlock(incident)])])
-    result = await agent.run_turn("chat-1", [], "Есть окошко сегодня?")
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
 
     assert "1 сентября" not in result.text
     assert "14:00" not in result.text
-    assert result.text == AVAILABILITY_GUARD_REPLY
-    assert result.llm_meta["guard_rail"] == AVAILABILITY_GUARD_VIOLATION
+    assert result.text == AVAILABILITY_GUARD_REPLIES[0]
     assert result.llm_meta["withheld_text"] == incident
 
 
 async def test_a_correct_tomorrow_date_passes_without_any_tool_call(kb):
     """«Завтра будет 2 сентября» — проходит.
 
-    Ровно тот случай, на котором сломалась первая редакция рубежа: инструмент
-    для этого не нужен, дата лежит в блоке «Сейчас:». Требовать здесь вызов
-    значит запретить агенту отвечать, какое завтра число.
+    Случай, на котором сломалась первая редакция: инструмент не нужен, дата
+    лежит в блоке «Сейчас:».
     """
     agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра будет 2 сентября, среда.")])])
     result = await agent.run_turn("chat-1", [], "а завтра какое число?")
@@ -1622,108 +1628,614 @@ async def test_a_correct_tomorrow_date_passes_without_any_tool_call(kb):
 
 
 async def test_a_wrong_relative_date_is_blocked_even_without_availability_words(kb):
-    """«завтра, 1 сентября», когда 1 сентября — сегодня.
-
-    Слов занятости здесь нет вовсе; ловит именно сверка с блоком промта.
-    """
+    """«завтра, 1 сентября», когда 1 сентября — сегодня. Слов занятости нет
+    вовсе; ловит сверка с блоком промта."""
     agent = loop_at(kb, [FakeResponse(content=[TextBlock("Ждём вас завтра, 1 сентября.")])])
     result = await agent.run_turn("chat-1", [], "когда приезжать?")
 
-    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.text == AVAILABILITY_GUARD_REPLIES[0]
     assert DATE_GUARD_VIOLATION in result.llm_meta["guard_rail"]
 
 
 async def test_availability_words_are_blocked_without_a_tool_even_when_the_date_is_right(kb):
-    """«Ближайшие свободные — завтра, 2 сентября» без вызова инструмента.
-
-    Дата верная, но занятости никто не проверял — этих данных в промте нет
-    ни в каком виде.
-    """
+    """Дата верная, но занятости никто не проверял."""
     agent = loop_at(
         kb, [FakeResponse(content=[TextBlock("Ближайшие свободные — завтра, 2 сентября.")])]
     )
-    result = await agent.run_turn("chat-1", [], "когда свободно?")
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
 
-    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.text == AVAILABILITY_GUARD_REPLIES[0]
     assert result.llm_meta["guard_rail"] == AVAILABILITY_GUARD_VIOLATION
 
 
-async def test_availability_guard_is_not_an_escalation(kb):
-    """Спросить число — работа агента, а не повод звать человека. Если бы
-    рубеж эскалировал, как ценовой, каждый вопрос «когда свободно?» уводил бы
-    диалог к оператору."""
-    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра весь день свободно!")])])
-    result = await agent.run_turn("chat-1", [], "когда можно?")
+# --- сумма обязана быть из ответа инструмента ------------------------------
+#
+# Первый рубеж спрашивает «был ли вызов вообще», и его устраивает ЛЮБОЙ.
+# Полный прогон 2026-09-02 показал, зачем нужен второй вопрос: агент вызвал
+# calculate_price с выдуманными zone_id и датой, а клиент спрашивал о другом.
 
-    assert result.text == AVAILABILITY_GUARD_REPLY
+def test_amounts_are_collected_from_anywhere_in_the_tool_answer():
+    """Суммы лежат и полями, и внутри строк, и в списках позиций.
+
+    Число из строки взято ОТДЕЛЬНОЕ (2400) и полем нигде не повторяется —
+    иначе тест проходил бы и с выключенным разбором строк. Найдено мутацией.
+    """
+    payload = {
+        "status": "ok",
+        "total": Decimal("10500.00"),
+        "prepayment": 3000,
+        "lines": [{"amount": 500, "description": "Шампуры — набор, залог 2400 ₽"}],
+    }
+    found = amounts_in_payload(payload)
+    assert {"10500", "3000", "500", "2400"} <= found, found
+
+
+def test_the_same_number_written_differently_is_the_same_number():
+    """«10 500 ₽» в тексте и Decimal('10500.00') в ответе — одно и то же.
+    Без общей формы сверка расходилась бы на форматировании, а не на сути."""
+    allowed = amounts_in_payload({"total": Decimal("10500.00")})
+    assert invented_amounts("Выйдет 10 500 ₽.", allowed) == []
+    assert invented_amounts("Выйдет 10500 руб.", allowed) == []
+    # Неразрывный пробел приходит из текста модели чаще обычного.
+    assert invented_amounts("Выйдет 10\u00a0500 ₽.", allowed) == []
+
+
+def test_the_canonical_form_of_a_number_is_pinned():
+    """Обе половины приведения — дробная часть и ведущие нули.
+
+    Проверяются прямо, а не через сверку: через сверку мутация ведущих нулей
+    незаметна, потому что реальные суммы с нуля не начинаются. Незаметная
+    строчка кода — это строчка, которую следующий читатель удалит наугад.
+    """
+    assert _canonical_amount("10500.00") == "10500"
+    assert _canonical_amount("10500,50") == "10500.5"
+    assert _canonical_amount("10 500") == "10500"
+    assert _canonical_amount("0500") == "500"
+    assert _canonical_amount("0") == "0"
+
+
+def test_an_amount_nobody_returned_is_reported():
+    allowed = amounts_in_payload({"total": Decimal("10500.00")})
+    assert invented_amounts("Выйдет 11 000 ₽.", allowed) == ["11 000 ₽"]
+
+
+def test_hours_and_guests_are_not_amounts():
+    """Сверяем только то, что выглядит как деньги. Часы, гости и время —
+    не про деньги, и сверять их не с чем."""
+    assert invented_amounts("Баня на 4 часа для 6 гостей, с 18:00.", set()) == []
+
+
+async def test_an_invented_total_never_reaches_the_client(kb):
+    """Вызов был, статус ok, а сумма в тексте — своя.
+
+    Ровно тот случай, который первый рубеж пропускает: инструмент вызывался,
+    значит «цена без вызова» его устраивает.
+    """
+    script = [
+        FakeResponse(content=[ToolUseBlock(
+            name="calculate_price",
+            input={"zone_id": "bath_russian", "date": "2026-09-05", "hours": 4},
+        )]),
+        FakeResponse(content=[TextBlock("Выйдет 9 000 ₽ за четыре часа.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    assert "9 000" not in result.text
+    assert result.escalated is True
+    assert result.llm_meta["guard_rail"] == AMOUNT_MISMATCH_VIOLATION
+    assert result.llm_meta["withheld_text"] == "Выйдет 9 000 ₽ за четыре часа."
+
+
+async def test_a_price_straight_from_the_tool_passes(kb):
+    """Обратная сторона — иначе рубеж «чинится» глушением всех цен подряд."""
+    script = [
+        FakeResponse(content=[ToolUseBlock(
+            name="get_extras", input={},
+        )]),
+        FakeResponse(content=[TextBlock("Шампуры есть — набор за 500 ₽.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "шампура есть?")
+
+    assert "500" in result.text
+    assert result.llm_meta.get("guard_rail") is None
+
+
+async def test_the_amounts_are_exposed_on_the_path_where_the_text_reaches_the_client(kb):
+    """`TurnResult.tool_amounts` обязан быть заполнен на УСПЕШНОМ пути.
+
+    Именно этот текст уходит клиенту, и именно его проверяет харнесс
+    качества (правило price_mismatch). Пустой набор там означает не «всё
+    чисто», а «проверка ослепла» — и отчёт при этом выглядит зелёным.
+    Пропуск был реальным: сначала поле проставили только на путях рубежей.
+    """
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="get_extras", input={})]),
+        FakeResponse(content=[TextBlock("Шампуры есть — набор за 500 ₽.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "шампура есть?")
+
+    assert result.text == "Шампуры есть — набор за 500 ₽."
+    assert "500" in result.tool_amounts, result.tool_amounts
+
+
+# --- утверждение против обещания ------------------------------------------
+
+def test_a_promise_to_check_is_not_a_claim_about_the_calendar():
+    """Прод 2026-09-02: рубеж срезал честное «уточню свободное время на
+    сегодня вечером» — и клиент получил третью подряд одинаковую отписку.
+
+    Обещание посмотреть не сообщает НИКАКОГО факта о календаре.
+    """
+    assert availability_claim("уточню свободное время на сегодня вечером") is False
+    assert availability_claim("посмотрю по календарю свободное время") is False
+    assert availability_claim("проверю, есть ли время") is False
+
+
+def test_an_actual_claim_about_the_calendar_still_counts():
+    """Обратная сторона — иначе предыдущий тест «чинится» отключением
+    рубежа целиком."""
+    assert availability_claim("Ближайшие свободные — завтра, весь день") is True
+    assert availability_claim("Завтра всё занято") is True
+    assert availability_claim("есть время в субботу") is True
+
+
+def test_a_condition_is_not_a_claim():
+    """«Баню можно взять отдельной зоной, ЕСЛИ СВОБОДНА» — дословный ответ
+    модели из прогона 2026-09-02, срезанный рубежом целиком.
+
+    Оговорка «если свободна» ничего о календаре не сообщает — она ровно
+    противоположна утверждению «свободна».
+    """
+    assert availability_claim(
+        "Баню можно взять отдельной зоной, если свободна. Давайте я проверю "
+        "занятость шатра на 5 сентября."
+    ) is False
+
+
+def test_a_question_about_availability_is_not_a_claim():
+    """«свободна ЛИ» — вопрос, а не ответ.
+
+    Без глагола намерения слева — иначе тест проверял бы соседнюю ветку и
+    проходил бы с выключенной этой. Найдено мутацией.
+    """
+    assert availability_claim("Пока не знаю, свободна ли баня на эту дату.") is False
+    assert availability_claim("Вопрос в том, занято ли 5 сентября.") is False
+
+
+def test_a_claim_after_a_condition_still_counts():
+    """Оговорка прикрывает СЛЕДУЮЩЕЕ СЛОВО, а не весь остаток фразы.
+
+    Иначе достаточно было бы начать с «если» — и дальше говори что угодно.
+    Второй случай важнее первого: там «если» стоит близко, в том же окне, и
+    только привязка вплотную отличает оговорку от утверждения после неё.
+    Найдено мутацией.
+    """
+    assert availability_claim("Если свободна — запишу. Но суббота уже занята.") is True
+    assert availability_claim("Если удобно — суббота занята.") is True
+
+
+def test_a_purpose_clause_in_the_past_form_is_still_a_promise():
+    """«чтобы я ПРОВЕРИЛА свободное время» — намерение, а не доклад.
+
+    Четыре дословных ответа из полного прогона 2026-09-02, все срезанные
+    редакцией, которая считала утверждением любое прошедшее время. По форме
+    это прошедшее, по смыслу — придаточная цели: то, что ещё не сделано.
+    Отличает их маркер цели («чтобы», «смогу», «могла»), и без него правило
+    выбирает, какую из двух ошибок совершать, а не избегает обеих.
+    """
+    for text in (
+        "А на какое число планируете, чтобы я проверила свободное время?",
+        "Давайте уточню по времени и смогу проверить занятость.",
+        "Подскажите зону, чтобы я могла проверить свободное время.",
+        "Какая зона вас интересует, чтобы я сразу проверила свободные даты?",
+    ):
+        assert availability_claim(text) is False, text
+
+
+def test_nearest_about_a_weekday_or_a_month_is_not_about_our_calendar():
+    """«Ближайшее воскресенье — 6 сентября» и «ближайший август уже прошёл»
+    — оба из того же прогона, оба срезаны.
+
+    Это разговор про календарь как таковой, а не про наши слоты: никакого
+    инструмента для такого ответа не нужно.
+    """
+    assert availability_claim("Ближайшее воскресенье — 6 сентября.") is False
+    assert availability_claim("ближайший август уже прошёл, а до следующего далеко") is False
+
+
+def test_the_verb_nearest_to_the_availability_word_is_the_one_that_counts():
+    """«посмотрю, уточнила: суббота занята» — обещание и доклад в одной
+    фразе. Управляет словом занятости ближайший глагол, а не первый
+    попавшийся: иначе одного «посмотрю» в начале хватало бы, чтобы прикрыть
+    любой доклад следом. Найдено мутацией."""
+    assert availability_claim("посмотрю, уточнила: суббота занята") is True
+
+
+def test_the_weekday_exception_belongs_to_nearest_alone():
+    """«Свободна суббота» — утверждение о календаре, и день недели рядом его
+    таковым быть не перестаёт. Исключение заведено ровно для «ближайшего» и
+    только для него."""
+    assert availability_claim("Свободна суббота") is True
+    assert availability_claim("Занят понедельник") is True
+
+
+def test_nearest_inside_a_question_is_not_a_claim():
+    """«вы имеете в виду ближайшее число?» и «ближайшие выходные (5-6
+    сентября)?» — оба из прогона 2026-09-02, оба срезаны.
+
+    Спросить у клиента, какое число он имеет в виду, — не утверждение о
+    занятости ни в каком виде.
+    """
+    assert availability_claim(
+        "И уточните дату — 4 июля будет только в следующем году, "
+        "вы имеете в виду ближайшее число?"
+    ) is False
+    assert availability_claim(
+        "Подскажите, какого числа вас интересует — ближайшие выходные (5-6 сентября)?"
+    ) is False
+
+
+def test_a_question_mark_does_not_excuse_the_rest_of_the_dictionary():
+    """«Завтра всё занято, перенесём?» — тоже вопрос, но утверждение в нём
+    есть. Послабление заведено для «ближайшего» и только для него."""
+    assert availability_claim("Завтра всё занято, перенесём?") is True
+
+
+def test_nearest_dates_without_the_word_free_is_still_a_claim():
+    """Обратная сторона: ради этого «ближайш» и стоит в словаре. Факт о
+    занятости здесь есть, а слова «свободно» нет."""
+    assert availability_claim("Ближайшие даты — 5 и 6 сентября.") is True
+
+
+def test_the_past_tense_is_a_report_about_the_calendar_not_a_promise():
+    """«Посмотрела — завтра всё занято» — это ДОКЛАД, а не намерение.
+
+    Найдено при разборе живых ответов 2026-09-02: первая редакция ловила
+    основу глагола (`посмотр\\w*`) и потому считала обещанием и «посмотрю», и
+    «посмотрела». Агент говорит от женского лица, прошедшее время у него в
+    каждом втором ответе — дыра открывалась в самом частом случае.
+    """
+    assert availability_claim("Посмотрела — завтра всё занято") is True
+    assert availability_claim("Уточнила у менеджера: сегодня свободно весь день") is True
+    assert availability_claim("Проверила, свободно с 14:00") is True
+
+
+def test_a_request_addressed_to_the_client_is_not_a_claim_either():
+    """«Уточните, какое время вам удобно» — просьба К КЛИЕНТУ. Фактом о
+    календаре она не является, и глушить её не за что."""
+    assert availability_claim(
+        "Уточните, пожалуйста, какое время вам удобно — посмотрю, что свободно"
+    ) is False
+
+
+def test_one_unguarded_word_is_enough_even_next_to_a_promise():
+    """«уточню свободное время, но завтра всё занято» — второе слово и есть
+    нарушение, и прикрытость первого его не отменяет."""
+    assert availability_claim("уточню свободное время, но завтра всё занято") is True
+
+
+async def test_a_promise_to_check_reaches_the_client(kb):
+    """То же самое, но через весь ход: текст обязан дойти."""
+    promise = "Секунду, уточню свободное время на сегодня и напишу."
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(promise)])])
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    assert result.text == promise
+    assert result.llm_meta.get("guard_rail") is None
+
+
+# --- нарастающий ответ -----------------------------------------------------
+
+def test_the_repeat_counter_ignores_client_replies_in_between():
+    """Клиент отвечает на каждую подстановку — счёт от этого не сбрасывается.
+    Ровно так и было в проде: три подстановки, три ответа клиента между."""
+    history = [
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]},
+        {"role": "user", "content": "сегодня 16 00"},
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[1]},
+    ]
+    assert guard_repeats(history) == 2
+
+
+def test_an_ordinary_reply_in_between_resets_the_streak():
+    """Считаются подстановки ПОДРЯД, а не за всю историю диалога.
+
+    Найдено мутацией 2026-09-02 (`break` → `continue`): без обрыва старая
+    подстановка из начала переписки складывалась бы с сегодняшней, и первое
+    же срабатывание в новом эпизоде улетало бы сразу к оператору. Диалог
+    между тем давно поехал дальше — модель успела нормально ответить.
+    """
+    assert guard_repeats([{"role": "assistant", "content": "обычный ответ"}]) == 0
+    assert guard_repeats([
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]},
+        {"role": "user", "content": "а сколько стоит?"},
+        {"role": "assistant", "content": "Четыре часа в бане — 10 500 ₽."},
+    ]) == 0
+    # А сразу после подстановки — считается.
+    assert guard_repeats([
+        {"role": "assistant", "content": "Четыре часа в бане — 10 500 ₽."},
+        {"role": "user", "content": "а завтра?"},
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]},
+    ]) == 1
+
+
+async def test_the_second_firing_is_worded_differently(kb):
+    """Три одинаковых сообщения подряд хуже, чем позвать человека, — поэтому
+    второй раз формулировка другая."""
+    history = [{"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]}]
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра всё занято.")])])
+    result = await agent.run_turn("chat-1", history, "вопрос без принуждения")
+
+    assert result.text == AVAILABILITY_GUARD_REPLIES[1]
+    assert result.text != AVAILABILITY_GUARD_REPLIES[0]
     assert result.escalated is False
 
 
+async def test_the_third_firing_hands_the_chat_to_a_human(kb):
+    """Разговор не двигается — зовём оператора, а не повторяем в третий раз."""
+    history = [
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]},
+        {"role": "user", "content": "сегодня 16 00"},
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[1]},
+    ]
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра всё занято.")])])
+    result = await agent.run_turn("chat-1", history, "вопрос без принуждения")
+
+    assert result.text == AVAILABILITY_GUARD_HANDOFF
+    assert result.escalated is True
+    assert result.escalation_reason == AVAILABILITY_GUARD_HANDOFF_REASON
+
+
+def test_no_guard_reply_promises_the_agent_will_come_back():
+    """Агент первым не пишет (TOUCH_ENABLED=false) — значит «вернусь с
+    вариантами» он исполнить не может. Следующий ход обязан быть за клиентом.
+
+    Исключение — карточка оператору: вернуться обещает ЧЕЛОВЕК, и это правда.
+    """
+    for text in AVAILABILITY_GUARD_REPLIES:
+        assert "вернусь" not in text.lower()
+        assert "напишу вам" not in text.lower()
+
+
+def test_the_guard_replies_do_not_trip_the_guard_itself():
+    """Самосогласованность всех трёх подстановок."""
+    for text in list(AVAILABILITY_GUARD_REPLIES) + [AVAILABILITY_GUARD_HANDOFF]:
+        assert availability_claim(text) is False, text
+        assert date_contradicts_now(text, INCIDENT_NOW) is None, text
+
+
+# --- инструменты дают право говорить ---------------------------------------
+
 async def test_the_answer_passes_after_a_real_availability_tool_call(kb):
-    """Инструмент вызван — текст проходит как есть. Без этого «рубеж» можно
-    было бы удовлетворить, заглушив вообще все ответы про занятость."""
     script = [
         FakeResponse(content=[ToolUseBlock(name="check_availability", input={"date": "2026-09-02"})]),
         FakeResponse(content=[TextBlock("Завтра, 2 сентября, свободно с 14:00 — записать?")]),
     ]
     agent = loop_at(kb, script)
-    result = await agent.run_turn("chat-1", [], "есть завтра время?")
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
 
     assert "2 сентября" in result.text
     assert result.llm_meta.get("guard_rail") is None
 
 
 async def test_an_unrelated_tool_call_does_not_buy_the_right_to_talk_about_availability(kb):
-    """ГЛАВНОЕ ОТЛИЧИЕ ОТ ЦЕНОВОГО РУБЕЖА.
-
-    Ценовой смотрит `not tool_calls` — «не было ни одного вызова». Здесь
-    этого мало: get_zones не даёт оснований говорить о занятости, а под
-    условие «хоть что-то вызвали» он бы подошёл.
-    """
+    """Ценовой рубеж смотрит «не было НИ ОДНОГО вызова». Здесь этого мало:
+    get_zones не даёт оснований говорить о занятости."""
     script = [
         FakeResponse(content=[ToolUseBlock(name="get_zones", input={})]),
         FakeResponse(content=[TextBlock("В эти выходные всё свободно, приезжайте.")]),
     ]
     agent = loop_at(kb, script)
-    result = await agent.run_turn("chat-1", [], "а на выходных?")
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
 
-    assert result.text == AVAILABILITY_GUARD_REPLY
+    assert result.text == AVAILABILITY_GUARD_REPLIES[0]
 
 
 async def test_resolve_date_alone_does_not_authorise_availability_claims(kb):
-    """resolve_date НЕ входит в AVAILABILITY_TOOLS: он разбирает дату, а не
-    занятость. Разобрать «завтра» и на этом основании сказать «свободно» —
-    та же выдумка."""
+    """resolve_date разбирает дату, а не занятость."""
     script = [
         FakeResponse(content=[ToolUseBlock(name="resolve_date", input={"text": "завтра"})]),
         FakeResponse(content=[TextBlock("Завтра, 2 сентября, всё свободно.")]),
     ]
     agent = loop_at(kb, script)
-    result = await agent.run_turn("chat-1", [], "а завтра свободно?")
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
 
-    assert result.text == AVAILABILITY_GUARD_REPLY
-
-
-def test_the_guard_reply_does_not_trip_the_guard_itself():
-    """Самосогласованность: подставленный ответ не должен сам выглядеть как
-    утверждение о календаре. Первая редакция («уточню свободное время») под
-    собственный словарь попадала."""
-    assert AVAILABILITY_WORDS.search(AVAILABILITY_GUARD_REPLY) is None
-    assert date_contradicts_now(AVAILABILITY_GUARD_REPLY, INCIDENT_NOW) is None
+    assert result.text == AVAILABILITY_GUARD_REPLIES[0]
 
 
 def test_the_greeting_from_production_is_not_caught():
-    """Рубеж не должен глушить обычный разговор. Текст — реальное первое
-    сообщение агента из прода 2026-09-01."""
+    """Реальное первое сообщение агента из прода 2026-09-01."""
     greeting = (
         "Здравствуйте! Меня зовут Иришка, я администратор комплекса «ПарМангал». "
         "Вижу, вы интересовались нашим объявлением — расскажите, пожалуйста, на "
         "какую дату планируете отдых и сколько будет гостей?"
     )
-    assert AVAILABILITY_WORDS.search(greeting) is None
+    assert availability_claim(greeting) is False
     assert date_contradicts_now(greeting, INCIDENT_NOW) is None
 
 
+def test_a_self_correction_about_dates_is_not_a_contradiction():
+    """«сегодня 2 сентября, и 20 июня действительно уже позади» — дословный
+    ответ модели из прогона 2026-09-02, срезанный рубежом.
+
+    Текст ВЕРЕН: модель исправляет саму себя. Прежняя редакция сверяла
+    «сегодня» с каждой датой в окне, натыкалась на 20 июня и рубила
+    правильный ответ. Относительное слово расшифровывает соседнее число —
+    всё, что дальше, уже про другое.
+    """
+    text = ("Прошу прощения, я немного сбилась с датой — сегодня 2 сентября, "
+            "и 20 июня действительно уже позади.")
+    # Часы — 2 сентября: именно в этот день ответ и был написан.
+    assert date_contradicts_now(text, datetime(2026, 9, 2, 10, 0, tzinfo=_MSK)) is None
+
+
+def test_the_nearest_date_is_still_checked():
+    """Обратная сторона: сужение до ближайшей даты не должно превращаться в
+    «не проверять вовсе». Инцидент 1 сентября обязан ловиться по-прежнему."""
+    assert date_contradicts_now("Ждём вас завтра, 1 сентября.", INCIDENT_NOW) is not None
+
+
 def test_a_plain_future_date_without_a_relative_word_is_not_touched():
-    """«Приезжайте 15 сентября» — сверять не с чем и незачем."""
     assert date_contradicts_now("Приезжайте 15 сентября, будем рады.", INCIDENT_NOW) is None
+
+
+# --- принуждение инструмента ------------------------------------------------
+
+async def test_the_forced_tool_is_sent_only_on_the_first_iteration(kb):
+    """Принуждение на ВСЕХ витках заставило бы модель звать инструмент
+    бесконечно и никогда не дойти до текста ответа."""
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="check_availability", input={"date": "2026-09-02"})]),
+        FakeResponse(content=[TextBlock("Посмотрела, записать вас?")]),
+    ]
+    client = FakeAnthropic(script, "question")
+    agent = AgentLoop(client, kb, now_fn=lambda: INCIDENT_NOW)
+    await agent.run_turn("chat-1", [], "на сегодня есть окошко 4 часа, нас 6теро")
+
+    calls = [c for c in client.messages.calls if not c.get("model", "").startswith("claude-haiku")]
+    assert calls[0].get("tool_choice") == {"type": "tool", "name": "check_availability"}, (
+        "первый виток обязан принуждать, и именно адресной формой: "
+        '{"type": "any"} DeepSeek молча игнорирует'
+    )
+    assert calls[1].get("tool_choice") is None, "дальше модель свободна"
+
+
+async def test_the_clients_earlier_words_reach_the_forcing_decision(kb):
+    """«А цена какая?» после «интересует баня» — принуждаем.
+
+    Сужение цены (зона или дата обязательны) держится на том, что контекст
+    ДОЕЗЖАЕТ до решения. Без этого сужение превратилось бы в «никогда не
+    принуждать цену»: голый вопрос о стоимости — самый частый.
+    """
+    history = [
+        {"role": "user", "content": "Здравствуйте, интересует баня"},
+        {"role": "assistant", "content": "Здравствуйте! На какую дату планируете?"},
+    ]
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="calculate_price", input={"zone_id": "bath_russian", "date": "2026-09-05"})]),
+        FakeResponse(content=[TextBlock("Уточните, пожалуйста, дату.")]),
+    ]
+    client = FakeAnthropic(script, "question")
+    agent = AgentLoop(client, kb, now_fn=lambda: INCIDENT_NOW)
+    await agent.run_turn("chat-1", history, "а цена какая?")
+
+    calls = [c for c in client.messages.calls if not c.get("model", "").startswith("claude-haiku")]
+    assert calls[0].get("tool_choice") == {"type": "tool", "name": "calculate_price"}
+
+
+async def test_the_agents_own_greeting_does_not_count_as_a_named_zone(kb):
+    """Приветствие агента перечисляет ВСЕ зоны разом.
+
+    Если считать его за «клиент назвал зону», условие выполнялось бы всегда
+    начиная со второго хода — то есть не значило бы ничего, и сужение было
+    бы декоративным.
+    """
+    history = [
+        {"role": "assistant",
+         "content": "Здравствуйте! Что вас интересует: баня, купол, гриль-домик или шатёр?"},
+    ]
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("Подскажите зону.")])], "question")
+    agent = AgentLoop(client, kb, now_fn=lambda: INCIDENT_NOW)
+    await agent.run_turn("chat-1", history, "а цена какая?")
+
+    calls = [c for c in client.messages.calls if not c.get("model", "").startswith("claude-haiku")]
+    assert calls[0].get("tool_choice") is None
+
+
+async def test_no_forcing_when_the_client_is_not_asking_about_availability(kb):
+    """«Завтра перезвоню» — календарь дёргать не за что."""
+    client = FakeAnthropic([FakeResponse(content=[TextBlock("Хорошо, будем ждать!")])], "question")
+    agent = AgentLoop(client, kb, now_fn=lambda: INCIDENT_NOW)
+    await agent.run_turn("chat-1", [], "завтра перезвоню")
+
+    calls = [c for c in client.messages.calls if not c.get("model", "").startswith("claude-haiku")]
+    assert calls[0].get("tool_choice") is None
+
+
+async def test_an_unknown_tool_name_from_the_provider_does_not_kill_the_turn(kb):
+    """DeepSeek 2026-09-02 вернул блок tool_use с именем "tool_calls" —
+    такого инструмента мы не объявляли.
+
+    Ход обязан продолжиться: модель получает ошибку и зовёт заново.
+    """
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="tool_calls", input={})]),
+        FakeResponse(content=[TextBlock("Готово, чем ещё помочь?")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    assert result.text == "Готово, чем ещё помочь?"
+    assert "tool_calls" in result.tool_calls
+    assert result.tool_call_errors >= 1
+
+
+# --- мусорный блок tool_use ------------------------------------------------
+#
+# Имя "tool_calls" — это ключ ОБЁРТКИ из OpenAI-формата, а не инструмента.
+# Раз протёк ключ обёртки, протечь может и её содержимое: там аргументы
+# лежат строкой JSON, а не объектом. Поэтому проверяется не только чужое
+# имя, но и чужая форма.
+
+def test_string_arguments_are_parsed_instead_of_crashing_the_turn():
+    """OpenAI-форма: `arguments` — строка JSON. Разбирается, а не теряется."""
+    name, args, block_id = normalize_tool_use(
+        ToolUseBlock(name="check_availability", input='{"date": "2026-09-05"}')
+    )
+    assert (name, args) == ("check_availability", {"date": "2026-09-05"})
+    assert block_id == "tu_1"
+
+
+def test_unparsable_arguments_become_empty_and_keep_the_name():
+    """Строка не разобралась — аргументов нет, но ход не падает, и имя
+    инструмента остаётся: по нему исполнитель ответит осмысленно."""
+    assert normalize_tool_use(ToolUseBlock(name="get_zones", input="{не json"))[:2] == (
+        "get_zones", {}
+    )
+
+
+def test_missing_pieces_of_the_block_do_not_raise():
+    """Ни имени, ни аргументов, ни id. `dict(None)` здесь поднимал бы
+    TypeError и убивал ход целиком — из-за поля, которое мы даже не
+    собирались исполнять."""
+    class Bare:
+        type = "tool_use"
+
+    name, args, block_id = normalize_tool_use(Bare())
+    assert name == ""
+    assert args == {}
+    assert block_id, "id-заглушка нужна, иначе результат не с чем связать"
+
+
+async def test_a_garbage_block_with_string_arguments_does_not_kill_the_turn(kb):
+    """Тот же мусор, что и выше, но через весь ход.
+
+    До 2026-09-02 здесь падал `dict(block.input)`, и клиент не получал
+    ничего — ни ответа, ни отбивки.
+    """
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="tool_calls", input='[{"function": {}}]')]),
+        FakeResponse(content=[TextBlock("Готово, чем ещё помочь?")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    assert result.text == "Готово, чем ещё помочь?"
+    assert result.tool_call_errors >= 1
+
+
+async def test_a_real_tool_with_string_arguments_still_runs(kb):
+    """Разбор строки — не косметика: аргументы обязаны доехать до
+    исполнителя, иначе «спасённый» вызов уходит в календарь пустым."""
+    script = [
+        FakeResponse(content=[ToolUseBlock(name="resolve_date", input='{"text": "завтра"}')]),
+        FakeResponse(content=[TextBlock("Завтра будет 2 сентября.")]),
+    ]
+    agent = loop_at(kb, script)
+    result = await agent.run_turn("chat-1", [], "а завтра какое число?")
+
+    assert result.tool_calls == ["resolve_date"]
+    assert result.tool_call_errors == 0

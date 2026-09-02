@@ -599,3 +599,22 @@ def test_touches_enabled_by_default_and_the_log_says_it(monkeypatch):
 
     assert "touch scheduler: started" in text
     assert "TOUCH_ENABLED=true" in text
+
+
+def test_startup_log_states_that_the_guard_rails_are_active(monkeypatch):
+    """«Рубеж активен» должно подтверждаться логом, а не догадкой о коммите.
+
+    2026-09-02: после выкатки рубежа занятости выяснилось, что проверить его
+    наличие в контейнере нечем — стартовых строк у него не было, и «активен»
+    приходилось выводить из того, какой коммит уехал в прод. Строка не про
+    «включено/выключено» (рубежи не настраиваются), а про то, КАКАЯ версия
+    правил сейчас работает.
+    """
+    text = _startup_log(monkeypatch, {}, level=logging.INFO)
+
+    assert "последние рубежи активны" in text
+    # Инструменты названы поимённо: именно их отсутствие и блокирует ответ.
+    assert "check_availability" in text
+    assert "find_next_available" in text
+    # resolve_date права говорить о занятости НЕ даёт — и в строке его нет.
+    assert "resolve_date" not in text
