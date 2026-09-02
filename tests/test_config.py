@@ -58,3 +58,17 @@ def test_settings_exposes_the_same_normalization():
     url, connect_args = settings.normalized_database_url()
     assert url.startswith("postgresql+asyncpg://")
     assert connect_args == {"ssl": True}
+
+
+def test_the_agent_does_not_write_first_by_default():
+    """«Не пишет первым» держится КОДОМ, а не переменной Railway.
+
+    Дефолт был True, и обещание обоих документов держалось только на
+    TOUCH_ENABLED=false в переменных окружения прода. Потеряется переменная
+    (новое окружение, восстановление из бэкапа, опечатка) — и агент начнёт
+    писать первым молча, без единой строки в логе о том, что что-то
+    изменилось. Дефолт должен быть безопасным сам по себе.
+    """
+    from app.config import Settings
+
+    assert Settings(_env_file=None).touch_enabled is False

@@ -59,7 +59,14 @@ TOOL_TRACE_LIMIT = 600
 KNOWN_TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
 
 
-def normalize_tool_use(block: Any) -> tuple[str, dict, str]:
+# Имя, под которым мусорный блок уходит ОБРАТНО провайдеру. Пустое имя в
+# запросе не примет ни один из них, а наш исполнитель на него всё равно
+# ответит «неизвестный инструмент» — расхождения тут нет: на проводе должно
+# стоять что-то валидное, в исполнителе — правда о том, что имени не было.
+WIRE_UNKNOWN_TOOL = "unknown_tool"
+
+
+def normalize_tool_use(block: Any, index: int = 0) -> tuple[str, dict, str]:
     """Имя, аргументы и id из блока tool_use — каким бы он ни пришёл.
 
     ЗАЧЕМ. Блок приходит от ЧУЖОГО слоя совместимости, и его форма не наша
@@ -97,11 +104,42 @@ def normalize_tool_use(block: Any) -> tuple[str, dict, str]:
 
     block_id = getattr(block, "id", None)
     if not isinstance(block_id, str) or not block_id:
-        # id нужен только для того, чтобы связать результат с вызовом. Своя
-        # заглушка честнее падения: ответ модели всё равно будет про ошибку.
-        block_id = "unknown_tool_use"
+        # id нужен, чтобы связать результат с вызовом. Заглушка НУМЕРОВАННАЯ:
+        # два блока без id в одном ответе получали одинаковый id и
+        # схлопывались в один — модель видела ответ на второй вызов как ответ
+        # на первый, а первый оставался без ответа вовсе.
+        block_id = f"unknown_tool_use_{index}"
 
     return name, arguments, block_id
+
+
+def sanitized_assistant_content(content: Sequence[Any], calls: list[tuple[str, dict, str]]) -> list[Any]:
+    """Ответ модели, пригодный к отправке ОБРАТНО провайдеру.
+
+    ЗАЧЕМ. Мы обязаны вернуть провайдеру его же ответ (`assistant`), а следом
+    свои `tool_result`. Раньше `assistant` уходил СЫРЫМ, а `tool_result`
+    ссылался на нормализованный id — и если у блока id не было, ссылаться
+    было не на что: следующий запрос уходил с `tool_use_id`, которого в
+    переписке нет. Ход при этом умирал не у нас, а на стороне провайдера,
+    то есть ровно там, где «мусор не должен ронять ход» проверить трудно.
+
+    Блоки, которые не `tool_use` (текст, размышление), проходят как есть —
+    трогать их незачем и опасно.
+    """
+    normalized: list[Any] = []
+    pending = iter(calls)
+    for block in content:
+        if getattr(block, "type", None) != "tool_use":
+            normalized.append(block)
+            continue
+        name, arguments, block_id = next(pending)
+        normalized.append({
+            "type": "tool_use",
+            "id": block_id,
+            "name": name or WIRE_UNKNOWN_TOOL,
+            "input": arguments,
+        })
+    return normalized
 
 MAX_TOOL_ITERATIONS = 5
 MAX_TOKENS = 1024
@@ -134,9 +172,31 @@ PRICE_PER_MTOK_RUB: dict[str, tuple[Decimal, Decimal]] = {
 # после «руб») харнесс засчитал как «цена без инструмента», а этот рубеж —
 # нет, потому что пропустил мимо. Два разных regex для одного и того же
 # инварианта расходятся молча; один источник истины этого не допускает.
+#
+# ЧТО СЧИТАЕТСЯ ЗАПИСЬЮ СУММЫ. Проверено на живом корпусе проекта (291 реплика
+# из docs/analysis/dialogs.json): новых ложных срабатываний ноль, зато нашлись
+# две НАСТОЯЩИЕ цены, которые прежний паттерн пропускал, — «Стоимость 1500р
+# час» и «можно взять в аренду - 500 р». Буква «р» без точки в переписке
+# обычнее, чем с точкой, а прежний паттерн требовал точку.
+#
+# Добавлены также: копейки («14 000,50 ₽»), сокращение тысяч («14 тыс.»,
+# «15 т.р.») и НИЖНЯЯ граница вилки «от 8000 до 12000 ₽» — верхнюю ловил и
+# старый паттерн, а нижняя проходила мимо, то есть выдуманное «от» уходило
+# клиенту непроверенным.
+#
+# Чего он НЕ должен ловить и не ловит: «на 4 часа», «6 гостей», «с 18:00 до
+# 23:00», «2-3 человека», «дом 1 строение 2», «Ленина 12к», телефон.
+# Денежной единицы рядом с числом нет — значит, это не сумма.
+_MONEY_UNIT = r"(?:₽|руб\w*|р\.|р\b|тыс\w*|т\.?\s?р\.?)"
 PRICE_LIKE_WITHOUT_TOOL_CALL = re.compile(
-    r"\b\d[\d\s]{1,9}\d\s*(?:₽|руб|р\.)|\b\d{3,6}\s*(?:₽|руб)", re.IGNORECASE
+    r"\b\d[\d\u00a0 ]*(?:[.,]\d{1,2})?\s*" + _MONEY_UNIT
+    # Нижняя граница вилки: числа с единицей при ней нет, единица — у верхней.
+    + r"|\b\d[\d\u00a0 ]*(?=\s*(?:-|—|–|до)\s*\d[\d\u00a0 ]*\s*" + _MONEY_UNIT + r")",
+    re.IGNORECASE,
 )
+# «14 тыс.» — это 14000, а не 14. Без приведения честная цена из расчёта
+# превращалась бы в «выдуманную»: в наборе разрешённых чисел лежит 14000.
+_THOUSANDS = re.compile(r"тыс|т\.?\s?р", re.IGNORECASE)
 GUARD_RAIL_VIOLATION = "цена в тексте без вызова инструмента (последний рубеж)"
 
 # ТРЕТИЙ РУБЕЖ: СУММА ДОЛЖНА БЫТЬ ИЗ ОТВЕТА ИНСТРУМЕНТА, А НЕ «ПОХОЖЕЙ НА
@@ -209,7 +269,13 @@ def invented_amounts(text: str, allowed: set[str]) -> list[str]:
         digits = _NUMBER_IN_TEXT.search(match.group())
         if digits is None:
             continue
-        if _canonical_amount(digits.group()) not in allowed:
+        value = _canonical_amount(digits.group())
+        if _THOUSANDS.search(match.group()):
+            try:
+                value = _canonical_amount(str(Decimal(value) * 1000))
+            except (InvalidOperation, ValueError):
+                pass
+        if value not in allowed:
             bad.append(match.group().strip())
     return bad
 
@@ -240,8 +306,36 @@ AVAILABILITY_TOOLS = frozenset({"check_availability", "find_next_available"})
 
 # Словарь занятости. Намеренно без «дата», «число», «время» самих по себе:
 # «на какую дату планируете?» — вопрос, а не утверждение о календаре.
+# СЛОВАРЬ РУБЕЖА УЖЕ, ЧЕМ СЛОВАРЬ ПРИНУЖДЕНИЯ, И ЭТО НАМЕРЕННО. Цена ошибки
+# здесь другая: лишнее срабатывание рубежа = агент промолчал там, где мог
+# ответить, и клиент получил отписку. Поэтому «окна» во множественном числе
+# сюда НЕ входят — в бане это сплошь и рядом настоящие окна («вид из окна»,
+# «окна выходят на пруд», «у нас в куполе окна во всю стену»), и на такой
+# фразе рубеж глушил бы честный ответ. Занятость в таких репликах всё равно
+# ловится словами «свободно» и «занято», которые стоят рядом.
+#
+# КРАТКИЕ ФОРМЫ ОБЯЗАТЕЛЬНЫ. `свободн\w*` не матчит «свободен»: основа
+# обрывается на «свобод». Зон мужского рода у нас четыре из десяти (купол,
+# домик, гриль-домик, шатёр), и «купол свободен» — самая естественная фраза
+# из возможных. До этой правки она уходила клиенту БЕЗ вызова календаря.
+# ЗАНЯТОСТЬ ГОВОРИТСЯ НЕ ТОЛЬКО СЛОВАМИ «СВОБОДНО» И «ЗАНЯТО». Разбор форм
+# 2026-09-03 против живых формулировок дал ещё четыре класса, каждый из
+# которых — утверждение о календаре и каждый проходил мимо словаря:
+#
+#   «всё расписано на выходные»          -> расписан[оаы]
+#   «всё забито до конца месяца»         -> забит[оаы]
+#   «нет мест на 6 сентября»             -> нет мест / мест нет
+#   «на это число уже забронировано»     -> заброниров\w*
+#
+# Формы намеренно КОРОТКИЕ, а не по основе: `расписан\w*` поймал бы
+# «расписание работы», `забит\w*` — «мангал забит углём». Обе фразы
+# нормальные, и глушить на них ответ не за что.
 AVAILABILITY_WORDS = re.compile(
-    r"\b(?:свободн\w*|занят\w*|окошк\w*|окно\b|есть\s+врем\w*|ближайш\w*)",
+    r"\bсвобод(?:ен|ны|на|но|н\w*)|\bосвобод\w*|\bосвобожд\w*|\bпосвободн\w*|"
+    r"\bзанят\w*|\bнезанят\w*|\bнесвободн\w*|\bнесвобод(?:ен|на|но|ны)\b|"
+    r"\bрасписан[оаы]\b|\bзабит[оаы]\b|\bзаброниров\w*|"
+    r"\bнет\s+мест|\bмест\s+нет|\bмест\s+не\s+остал\w*|"
+    r"\bокошк\w*|\bокно\b|есть\s+врем\w*|\bближайш\w*",
     re.IGNORECASE,
 )
 
@@ -284,8 +378,14 @@ PROMISE_VERBS = re.compile(
     re.IGNORECASE,
 )
 _PAST_FORM = re.compile(r"(?:л|ла|ло|ли)$", re.IGNORECASE)
+# «СЕЙЧАС» ЗДЕСЬ НЕТ, И ЭТО ИСПРАВЛЕНИЕ. Оно стояло в наборе и легализовало
+# доклад о календаре в прошедшем времени: availability_claim('Сейчас
+# проверила: занято') возвращал False, то есть утверждение о занятости
+# уходило клиенту без единого вызова инструмента. «Сейчас» выражает ВРЕМЯ, а
+# не цель: «сейчас уточню» — обещание по глаголу («уточню» — будущее),
+# «сейчас проверила» — доклад, и различать их должен глагол, а не наречие.
 _PURPOSE = re.compile(
-    r"\b(?:чтобы|чтоб|смог\w*|мог\w*|давайте|давай|хочу|надо|нужно|сейчас)\b",
+    r"\b(?:чтобы|чтоб|смог\w*|мог\w*|давайте|давай|хочу|надо|нужно)\b",
     re.IGNORECASE,
 )
 
@@ -297,8 +397,21 @@ _PURPOSE = re.compile(
 # оговорка, ровно противоположная утверждению «свободна».
 #
 # Сюда же «свободна ЛИ», «занято ЛИ» — вопрос, а не ответ.
-_CONDITIONAL_BEFORE = re.compile(r"\b(?:если|когда|вдруг|при\s+условии)\b\s*$",
-                                 re.IGNORECASE)
+_CONDITION_WORDS = re.compile(r"\b(?:если|когда|вдруг|при\s+условии)\b", re.IGNORECASE)
+# Граница части фразы. Оговорка действует до ближайшего знака, а не до конца
+# сообщения: «Если удобно — суббота занята» это утверждение, «если желаемая
+# дата свободна» — оговорка.
+_CLAUSE_BREAK = re.compile(r"[,;:.!?—–]")
+# Окно шире, чем у глагола: между «если» и словом занятости стоит подлежащее
+# («если ЖЕЛАЕМАЯ ДАТА свободна» — 15 символов).
+_CONDITION_WINDOW = 60
+
+# «СВОБОДНО РАЗМЕЩАЮТСЯ» — ПРО ПРОСТОР, А НЕ ПРО КАЛЕНДАРЬ. Наречие образа
+# действия при глаголе размещения: «в куполе свободно размещаются 8 гостей».
+# Рубеж глушил такой ответ, хотя о занятости в нём нет ни слова.
+_FREELY_AS_MANNER = re.compile(
+    r"^\s*(?:размещ|помещ|помест|вмещ|вмест|встан|располож|рассад|сид|усажив)", re.IGNORECASE
+)
 _QUESTION_AFTER = re.compile(r"^\w*\s*(?:ли)\b", re.IGNORECASE)
 
 # «БЛИЖАЙШИЙ» НЕ ВСЕГДА ПРО ЗАНЯТОСТЬ. Прогон 2026-09-02 дал четыре таких
@@ -344,6 +457,22 @@ def _nearest_is_not_about_our_calendar(right: str) -> bool:
 _PROMISE_WINDOW = 30
 
 
+def _under_a_condition(left: str) -> bool:
+    r"""Стоит ли слово занятости под оговоркой «если/когда» ТОЙ ЖЕ части фразы.
+
+    Прежняя редакция требовала «если» ВПЛОТНУЮ к слову (`\s*$`) — и ломалась
+    от одного слова между ними. Живой пример из нашей же базы знаний
+    (app/kb/payment.yaml): «дату можно перенести, если желаемая дата
+    свободна» — рубеж глушил честный ответ про возврат предоплаты.
+
+    Но и на всю фразу оговорку распространять нельзя, иначе достаточно
+    начать с «если» и дальше говорить что угодно. Поэтому смотрим только до
+    ближайшего знака препинания: «Если удобно — суббота занята» — за
+    границей, и это утверждение.
+    """
+    return bool(_CONDITION_WORDS.search(_CLAUSE_BREAK.split(left)[-1]))
+
+
 def _promises_to_check(left: str) -> bool:
     """Обещает ли левая часть фразы ПОСМОТРЕТЬ (а не докладывает результат).
 
@@ -375,7 +504,9 @@ def availability_claim(text: str) -> bool:
         right = text[m.end():m.end() + 120]
         if _promises_to_check(left):
             continue
-        if _CONDITIONAL_BEFORE.search(left):
+        if _under_a_condition(text[max(0, m.start() - _CONDITION_WINDOW):m.start()]):
+            continue
+        if m.group().lower().startswith("свободно") and _FREELY_AS_MANNER.match(right):
             continue
         if _QUESTION_AFTER.match(right):
             continue
@@ -492,7 +623,60 @@ AVAILABILITY_GUARD_HANDOFF_REASON = (
     "последний рубеж сработал третий раз подряд — модель не может ответить "
     "по датам и занятости"
 )
-_GUARD_TEXTS = frozenset(AVAILABILITY_GUARD_REPLIES) | {AVAILABILITY_GUARD_HANDOFF}
+# Отбивка ценового рубежа, рубежа суммы и упора в лимит витков. Один текст на
+# три случая: с точки зрения клиента они неразличимы — агент не ответил и
+# отправил ждать менеджера.
+GUARD_RAIL_FALLBACK = "Секунду, уточню детали у менеджера и вернусь с ответом."
+
+# ВСЕ подстановки разом. Отбивка входит сюда наравне с лестницей, и это не
+# мелочь: без неё серия рвалась. Последовательность «вопрос -> ценовой рубеж
+# -> рубеж занятости» давала клиенту ПЕРВЫЙ вопрос второй раз, потому что
+# счётчик обнулялся на ценовой отбивке, которую он в этот счёт не брал.
+_GUARD_TEXTS = (
+    frozenset(AVAILABILITY_GUARD_REPLIES)
+    | {AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK}
+)
+
+
+def guard_substitution(repeats: int) -> tuple[str, bool]:
+    """Что подставить на `repeats`-е срабатывание подряд и звать ли человека.
+
+        0 -> вопрос
+        1 -> он же другими словами
+        2 -> карточка оператору
+        3 и дальше -> МОЛЧАНИЕ
+
+    ПОЧЕМУ ПОСЛЕ КАРТОЧКИ МОЛЧАНИЕ, А НЕ ЧЕТВЁРТЫЙ ТЕКСТ. Прежняя редакция
+    считала `repeats >= len(REPLIES)` и на четвёртом, пятом, шестом
+    срабатывании отдавала ОДНУ И ТУ ЖЕ карточку слово в слово — ровно то, на
+    что заказчик жаловался («клиент уже получал три одинаковых сообщения
+    подряд»), только этажом выше. Разговор к этому моменту уже передан
+    человеку: сказать клиенту нечего, а повторить то же самое — хуже, чем
+    промолчать. Эскалация при этом НЕ снимается, оператор получает карточку и
+    на молчаливых ходах (см. app/pipeline.py, ветка «ответа нет»).
+
+    Возвращает (текст, эскалировать). Пустой текст — штатный исход: тот же
+    путь, что у спама, конвейер его понимает.
+    """
+    if repeats < len(AVAILABILITY_GUARD_REPLIES):
+        return AVAILABILITY_GUARD_REPLIES[repeats], False
+    if repeats == len(AVAILABILITY_GUARD_REPLIES):
+        return AVAILABILITY_GUARD_HANDOFF, True
+    return "", True
+
+
+def not_a_verbatim_repeat(text: str, history: Optional[list[dict]]) -> str:
+    """`text`, но не второй раз подряд — иначе пустая строка.
+
+    Для рубежей БЕЗ лестницы (ценовой, суммы, лимит витков): у них один
+    текст на все случаи, и два срабатывания подряд означали бы дословный
+    повтор, который заказчик запретил отдельным пунктом.
+    """
+    for msg in reversed(history or []):
+        if msg.get("role") != "assistant":
+            continue
+        return "" if (msg.get("content") or "").strip() == text else text
+    return text
 
 
 def guard_repeats(history: Optional[list[dict]]) -> int:
@@ -803,10 +987,16 @@ class AgentLoop:
                 final_text = _text_from_blocks(response.content)
                 break
 
-            messages.append({"role": "assistant", "content": response.content})
+            # Нормализация ДО того, как ответ уедет обратно провайдеру:
+            # см. sanitized_assistant_content.
+            calls = [normalize_tool_use(b, i) for i, b in enumerate(tool_uses)]
+            messages.append({
+                "role": "assistant",
+                "content": sanitized_assistant_content(response.content, calls),
+            })
 
             results = []
-            for block in tool_uses:
+            for block, (name, arguments, block_id) in zip(tool_uses, calls):
                 # МУСОР ОТ СЛОЯ СОВМЕСТИМОСТИ. DeepSeek 2026-09-02 вернул
                 # блок tool_use с именем "tool_calls" — такого инструмента мы
                 # не объявляли. Ход из-за этого не падает и раньше:
@@ -814,7 +1004,6 @@ class AgentLoop:
                 # модель получает ошибку и на следующем витке зовёт заново.
                 # Не хватало только видимости — без строки в логе это
                 # выглядит как «модель зачем-то ошиблась инструментом».
-                name, arguments, block_id = normalize_tool_use(block)
                 if name not in KNOWN_TOOL_NAMES:
                     logger.warning(
                         "провайдер вернул неизвестный инструмент %r — не наш, "
@@ -859,7 +1048,7 @@ class AgentLoop:
             hit_limit = True
             executor.escalated = True
             executor.escalation_reason = "превышен лимит витков инструментов"
-            final_text = "Секунду, уточню детали у менеджера и вернусь с ответом."
+            final_text = GUARD_RAIL_FALLBACK
 
         llm_meta = {
             "provider": self.provider.name,
@@ -900,7 +1089,7 @@ class AgentLoop:
             executor.escalated = True
             executor.escalation_reason = GUARD_RAIL_VIOLATION
             return TurnResult(
-                text="Секунду, уточню детали у менеджера и вернусь с ответом.",
+                text=not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, history),
                 escalated=True,
                 escalation_reason=GUARD_RAIL_VIOLATION,
                 classification=classification,
@@ -909,7 +1098,13 @@ class AgentLoop:
                 tool_amounts=allowed_amounts,
                 granted_offer_templates=list(executor.granted_offer_templates),
                 hit_iteration_limit=hit_limit,
-                llm_meta=llm_meta,
+                # guard_rail и withheld_text — как у остальных рубежей.
+                # Без них стартовый баннер обещал «задержанный текст
+                # сохраняется в llm_meta», а по срабатываниям ЦЕНОВОГО рубежа
+                # в отчётах было пусто: разобрать, что именно он зарубил,
+                # было нечем.
+                llm_meta={**llm_meta, "guard_rail": GUARD_RAIL_VIOLATION,
+                          "withheld_text": final_text},
                 tool_call_errors=tool_call_errors,
                 concession_state=getattr(executor, "state", None),
                 concession_events=getattr(executor, "concession_events", []),
@@ -933,7 +1128,7 @@ class AgentLoop:
                 executor.escalated = True
                 executor.escalation_reason = AMOUNT_MISMATCH_VIOLATION
                 return TurnResult(
-                    text="Секунду, уточню детали у менеджера и вернусь с ответом.",
+                    text=not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, history),
                     escalated=True,
                     escalation_reason=AMOUNT_MISMATCH_VIOLATION,
                     classification=classification,
@@ -976,11 +1171,7 @@ class AgentLoop:
 
         if guard_reason:
             repeats = guard_repeats(history)
-            escalate = repeats >= len(AVAILABILITY_GUARD_REPLIES)
-            reply = (
-                AVAILABILITY_GUARD_HANDOFF if escalate
-                else AVAILABILITY_GUARD_REPLIES[repeats]
-            )
+            reply, escalate = guard_substitution(repeats)
             logger.error(
                 "guard rail: %s (подряд %d)%s",
                 guard_reason, repeats + 1,

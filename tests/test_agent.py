@@ -30,9 +30,14 @@ from app.agent.loop import (
     availability_claim,
     date_contradicts_now,
     estimate_cost_rub,
+    GUARD_RAIL_FALLBACK,
+    GUARD_RAIL_VIOLATION,
     guard_repeats,
+    guard_substitution,
+    not_a_verbatim_repeat,
     invented_amounts,
     normalize_tool_use,
+    sanitized_assistant_content,
     summarize_history,
 )
 from app.agent.prompts import build_system_prompt
@@ -1694,6 +1699,44 @@ def test_the_canonical_form_of_a_number_is_pinned():
     assert _canonical_amount("0") == "0"
 
 
+def test_money_is_written_in_more_ways_than_one():
+    """Записей суммы в переписке больше, чем ловил прежний паттерн.
+
+    Две последние строки — НАСТОЯЩИЕ цены из живого корпуса проекта
+    (docs/analysis/dialogs.json), которые он пропускал: буква «р» без точки
+    в переписке обычнее, чем с точкой.
+    """
+    allowed = {"14000", "3500"}
+    for text in ("Выйдет 9999р", "Выйдет 9999 р", "Итого 9999,50 ₽",
+                 "Около 9 тыс. рублей", "Ровно 9 т.р.",
+                 "Стоимость 1500р час", "можно взять в аренду - 500 р"):
+        assert invented_amounts(text, allowed), f"сумма не замечена: {text}"
+
+
+def test_the_lower_bound_of_a_range_is_checked_too():
+    """«от 8000 до 12000 ₽» — единица стоит у верхней границы, и нижняя
+    проходила мимо: выдуманное «от» уходило клиенту непроверенным."""
+    found = invented_amounts("Выйдет от 8000 до 12000 ₽", {"14000"})
+    assert any("8000" in f for f in found), found
+    assert any("12000" in f for f in found), found
+
+
+def test_thousands_shorthand_is_the_same_number():
+    """«14 тыс.» — это 14000. Без приведения честная цена из расчёта
+    объявлялась бы выдуманной: в наборе разрешённых лежит 14000."""
+    assert invented_amounts("Около 14 тыс. рублей", {"14000"}) == []
+    assert invented_amounts("Ровно 14 т.р.", {"14000"}) == []
+    assert invented_amounts("Около 15 тыс. рублей", {"14000"}) != []
+
+
+def test_hours_guests_and_addresses_are_not_money():
+    """Обратная сторона: без денежной единицы рядом это не сумма.
+    Иначе рубеж глушил бы каждый ответ с числом гостей или временем."""
+    for text in ("на 4 часа", "6 гостей", "с 18:00 до 23:00", "2-3 человека",
+                 "дом 1 строение 2", "Адрес: Ленина 12к", "бронь на 5-6 сентября"):
+        assert invented_amounts(text, set()) == [], text
+
+
 def test_an_amount_nobody_returned_is_reported():
     allowed = amounts_in_payload({"total": Decimal("10500.00")})
     assert invented_amounts("Выйдет 11 000 ₽.", allowed) == ["11 000 ₽"]
@@ -1782,6 +1825,82 @@ def test_an_actual_claim_about_the_calendar_still_counts():
     assert availability_claim("есть время в субботу") is True
 
 
+def test_the_short_masculine_form_is_a_claim_too():
+    """«Купол свободен» уходило клиенту БЕЗ вызова календаря.
+
+    `свободн\\w*` не матчит «свободен»: основа обрывается на «свобод». Зон
+    мужского рода четыре из десяти, и краткая форма для них — самая
+    естественная. Это дыра в самой защите, ради которой всё делалось.
+    """
+    for text in ("Купол свободен", "Домик свободен завтра",
+                 "Гриль-домик свободен на 5 сентября", "Шатёр свободен весь день"):
+        assert availability_claim(text) is True, text
+
+
+def test_a_slot_that_frees_up_is_a_claim():
+    """«Юрта освободится завтра» — тоже утверждение о календаре."""
+    assert availability_claim("Юрта освободится завтра") is True
+    assert availability_claim("Место освободилось на 18:00") is True
+
+
+def test_now_is_a_time_word_not_a_purpose_marker():
+    """«Сейчас» стояло в маркерах цели и легализовало доклад в прошедшем
+    времени: утверждение о занятости уходило клиенту без вызова инструмента.
+
+    «Сейчас» выражает ВРЕМЯ, а не цель. Различать обещание и доклад должен
+    глагол: «сейчас уточню» — будущее, «сейчас проверила» — прошедшее.
+    """
+    assert availability_claim("Сейчас проверила: занято") is True
+    assert availability_claim("Сейчас узнала — свободно") is True
+    # Обратная сторона: будущее время «сейчас» не портит.
+    assert availability_claim("Сейчас уточню свободное время") is False
+    assert availability_claim("Сейчас гляну, что свободно") is False
+
+
+def test_busy_is_said_in_more_ways_than_one_word():
+    """«Занято» — не единственный способ сказать, что мест нет.
+
+    Все четыре формы — из разбора живых формулировок 2026-09-03, и все
+    проходили мимо словаря, то есть уходили клиенту без вызова календаря.
+    """
+    for text in ("Всё расписано на выходные",
+                 "Всё забито до конца месяца",
+                 "Юрта забита в субботу",
+                 "Нет мест на 6 сентября",
+                 "Мест нет ни в одной бане",
+                 "На это число уже забронировано",
+                 "Купол освободится в 20:00",
+                 "Домик освобождается в 19:00",
+                 "Завтра незанято",
+                 "Баня несвободна"):
+        assert availability_claim(text) is True, text
+
+
+def test_the_busy_dictionary_does_not_swallow_ordinary_words():
+    """Формы взяты КОРОТКИЕ намеренно: по основе `расписан\\w*` поймал бы
+    «расписание работы», `забит\\w*` — «мангал забит углём». Обе фразы
+    нормальные, и глушить на них ответ не за что."""
+    for text in ("какое расписание работы?",
+                 "расписание бань есть на сайте",
+                 "мангал забит углём",
+                 "у нас есть места для парковки",
+                 "разобрали мангал после гостей"):
+        assert availability_claim(text) is False, text
+
+
+def test_real_windows_are_not_a_calendar_claim():
+    """В бане окна — сплошь и рядом НАСТОЯЩИЕ окна. Словарь рубежа поэтому
+    уже словаря принуждения: здесь лишнее срабатывание стоит молчания агента.
+
+    Тексты — из разбора живых формулировок 2026-09-03.
+    """
+    for text in ("У нас в куполе окна во всю стену, звёзды видно прямо из кровати",
+                 "а вид из окна вечером на закат красивый?",
+                 "окна выходят на пруд",
+                 "Юрта без окон, свет только от гирлянды"):
+        assert availability_claim(text) is False, text
+
+
 def test_a_condition_is_not_a_claim():
     """«Баню можно взять отдельной зоной, ЕСЛИ СВОБОДНА» — дословный ответ
     модели из прогона 2026-09-02, срезанный рубежом целиком.
@@ -1805,6 +1924,29 @@ def test_a_question_about_availability_is_not_a_claim():
     assert availability_claim("Вопрос в том, занято ли 5 сентября.") is False
 
 
+def test_a_condition_with_a_subject_in_between_still_counts_as_a_condition():
+    """Дословный текст из НАШЕЙ ЖЕ базы знаний (app/kb/payment.yaml).
+
+    Рубеж глушил честный ответ про возврат предоплаты: `если` требовалось
+    вплотную к слову занятости, а здесь между ними подлежащее.
+    """
+    assert availability_claim(
+        "дату можно перенести, если желаемая дата свободна"
+    ) is False
+    assert availability_claim("если суббота занята, предложу воскресенье") is False
+
+
+def test_free_as_in_roomy_is_not_about_the_calendar():
+    """«В куполе свободно размещаются 8 гостей» — наречие образа действия при
+    глаголе размещения. О занятости здесь нет ни слова."""
+    for text in ("В куполе свободно размещаются 8 гостей",
+                 "в шатре свободно поместятся 20 человек",
+                 "за столом свободно сидят 10 гостей"):
+        assert availability_claim(text) is False, text
+    # А «свободно» про календарь по-прежнему утверждение.
+    assert availability_claim("Завтра свободно") is True
+
+
 def test_a_claim_after_a_condition_still_counts():
     """Оговорка прикрывает СЛЕДУЮЩЕЕ СЛОВО, а не весь остаток фразы.
 
@@ -1814,7 +1956,9 @@ def test_a_claim_after_a_condition_still_counts():
     Найдено мутацией.
     """
     assert availability_claim("Если свободна — запишу. Но суббота уже занята.") is True
+    # Оговорка действует до ближайшего знака: за тире уже другая часть фразы.
     assert availability_claim("Если удобно — суббота занята.") is True
+    assert availability_claim("Если хотите, скажу прямо: суббота занята.") is True
 
 
 def test_a_purpose_clause_in_the_past_form_is_still_a_promise():
@@ -1987,6 +2131,76 @@ async def test_the_third_firing_hands_the_chat_to_a_human(kb):
     assert result.text == AVAILABILITY_GUARD_HANDOFF
     assert result.escalated is True
     assert result.escalation_reason == AVAILABILITY_GUARD_HANDOFF_REASON
+
+
+def test_the_fourth_firing_is_silence_not_the_same_card_again():
+    """ГЛАВНОЕ ПРАВИЛО ПУНКТА: дословный повтор запрещён.
+
+    Прежняя редакция считала `repeats >= len(REPLIES)` и на четвёртом,
+    пятом, шестом срабатывании отдавала ОДНУ И ТУ ЖЕ карточку слово в слово —
+    ровно та жалоба, из-за которой лестницу и заводили, только этажом выше.
+    Разговор к этому моменту уже у человека: повторять нечего.
+    """
+    assert guard_substitution(0) == (AVAILABILITY_GUARD_REPLIES[0], False)
+    assert guard_substitution(1) == (AVAILABILITY_GUARD_REPLIES[1], False)
+    assert guard_substitution(2) == (AVAILABILITY_GUARD_HANDOFF, True)
+    for repeats in (3, 4, 10):
+        text, escalate = guard_substitution(repeats)
+        assert text == "", f"на {repeats}-м срабатывании клиенту уходит текст: {text!r}"
+        # Молчание НЕ снимает эскалацию: оператор обязан узнать и об этом ходе.
+        assert escalate is True
+
+
+def test_no_two_substitutions_in_a_row_are_identical():
+    """Свойство лестницы целиком, а не отдельных её ступеней: сколько бы раз
+    рубеж ни срабатывал подряд, клиент не получает одно и то же дважды."""
+    said = [guard_substitution(n)[0] for n in range(8)]
+    spoken = [t for t in said if t]
+    assert len(spoken) == len(set(spoken)), f"есть повтор: {said}"
+    for a, b in zip(said, said[1:]):
+        assert not (a and a == b), f"дословный повтор подряд: {a!r}"
+
+
+def test_a_guard_without_a_ladder_does_not_repeat_itself_either():
+    """Ценовой рубеж, рубеж суммы и упор в лимит витков говорят одним текстом
+    на все случаи — значит, два срабатывания подряд дали бы дословный повтор."""
+    assert not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, [
+        {"role": "assistant", "content": GUARD_RAIL_FALLBACK},
+    ]) == ""
+    assert not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, [
+        {"role": "assistant", "content": "Баня свободна, записать?"},
+    ]) == GUARD_RAIL_FALLBACK
+    # Реплика клиента между ними ничего не меняет: смотрим последний ответ АГЕНТА.
+    assert not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, [
+        {"role": "assistant", "content": GUARD_RAIL_FALLBACK},
+        {"role": "user", "content": "ну так что?"},
+    ]) == ""
+    assert not_a_verbatim_repeat(GUARD_RAIL_FALLBACK, []) == GUARD_RAIL_FALLBACK
+
+
+def test_the_price_guard_does_not_break_the_streak():
+    """«вопрос -> ценовой рубеж -> рубеж занятости» давало клиенту ПЕРВЫЙ
+    вопрос второй раз: отбивка ценового рубежа не входила в _GUARD_TEXTS, и
+    счётчик подстановок обнулялся на ней."""
+    history = [
+        {"role": "assistant", "content": AVAILABILITY_GUARD_REPLIES[0]},
+        {"role": "user", "content": "а сколько стоит?"},
+        {"role": "assistant", "content": GUARD_RAIL_FALLBACK},
+    ]
+    assert guard_repeats(history) == 2
+    assert guard_substitution(guard_repeats(history))[0] == AVAILABILITY_GUARD_HANDOFF
+
+
+async def test_the_price_guard_keeps_the_withheld_text(kb):
+    """Стартовый баннер обещает «задержанный текст сохраняется в llm_meta».
+    По ценовому рубежу там было пусто — разобрать, что он зарубил, нечем."""
+    invented = "Баня выйдет 10 500 ₽ за четыре часа."
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(invented)])])
+    result = await agent.run_turn("chat-1", [], "просто вопрос")
+
+    assert "10 500" not in result.text
+    assert result.llm_meta["guard_rail"] == GUARD_RAIL_VIOLATION
+    assert result.llm_meta["withheld_text"] == invented
 
 
 def test_no_guard_reply_promises_the_agent_will_come_back():
@@ -2208,6 +2422,96 @@ def test_missing_pieces_of_the_block_do_not_raise():
     assert name == ""
     assert args == {}
     assert block_id, "id-заглушка нужна, иначе результат не с чем связать"
+
+
+def test_two_id_less_blocks_do_not_collapse_into_one():
+    """Два блока без id в одном ответе получали ОДИНАКОВЫЙ id-заглушку.
+
+    Результат второго вызова тогда приходит как ответ на первый, а первый
+    остаётся без ответа вовсе — провайдеру такая переписка невалидна.
+    """
+    class Bare:
+        type = "tool_use"
+
+    first = normalize_tool_use(Bare(), 0)
+    second = normalize_tool_use(Bare(), 1)
+    assert first[2] != second[2], (first[2], second[2])
+
+
+def test_the_answer_sent_back_to_the_provider_is_the_normalized_one():
+    """Мы обязаны вернуть провайдеру его же `assistant`, а следом свои
+    `tool_result`. Раньше `assistant` уходил СЫРЫМ, а `tool_result` ссылался
+    на нормализованный id — если id у блока не было, ссылаться было не на
+    что, и следующий запрос уходил с несуществующим tool_use_id.
+    """
+    class Bare:
+        type = "tool_use"
+
+    blocks = [TextBlock("сейчас посмотрю"), Bare()]
+    calls = [normalize_tool_use(blocks[1], 0)]
+    content = sanitized_assistant_content(blocks, calls)
+
+    assert content[0] is blocks[0], "текстовый блок трогать незачем"
+    tool_block = content[1]
+    assert tool_block["type"] == "tool_use"
+    assert tool_block["id"] == calls[0][2], "id на проводе обязан совпасть с id в tool_result"
+    assert tool_block["name"], "пустое имя на проводе не примет ни один провайдер"
+    assert tool_block["input"] == {}
+
+
+def test_a_well_formed_block_survives_normalization_unchanged():
+    """Обратная сторона: нормализация не должна ПЕРЕПИСЫВАТЬ нормальный вызов."""
+    block = ToolUseBlock(name="check_availability", input={"date": "2026-09-05"}, id="tu_7")
+    content = sanitized_assistant_content([block], [normalize_tool_use(block, 0)])
+    assert content[0] == {
+        "type": "tool_use", "id": "tu_7",
+        "name": "check_availability", "input": {"date": "2026-09-05"},
+    }
+
+
+async def test_the_turn_sends_the_provider_a_consistent_pair(kb):
+    """СКВОЗНАЯ проверка: id в assistant и в tool_result обязаны совпасть.
+
+    Тест на саму функцию нормализации проходит и тогда, когда петля её не
+    зовёт: мутация «отправлять response.content как есть» оставалась зелёной.
+    Ловится это только осмотром того, что реально ушло провайдеру.
+
+    Без совпадения id следующий запрос уходит с tool_use_id, которого в
+    переписке нет, и ход умирает на стороне провайдера — то есть ровно там,
+    где «мусор не должен ронять ход» проверить труднее всего.
+    """
+    class IdLessBlock:
+        type = "tool_use"
+        name = "tool_calls"
+        input = None
+
+    script = [
+        FakeResponse(content=[IdLessBlock()]),
+        FakeResponse(content=[TextBlock("Готово, чем ещё помочь?")]),
+    ]
+    client = FakeAnthropic(script, "question")
+    agent = AgentLoop(client, kb, now_fn=lambda: INCIDENT_NOW)
+    await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    dialog_calls = [c for c in client.messages.calls
+                    if not c.get("model", "").startswith("claude-haiku")]
+    sent = dialog_calls[1]["messages"]
+
+    assistant = [m for m in sent if m["role"] == "assistant"][-1]
+    tool_uses = [b for b in assistant["content"]
+                 if (b.get("type") if isinstance(b, dict) else getattr(b, "type", None)) == "tool_use"]
+    assert tool_uses, "ответ модели с вызовом инструмента обязан уехать обратно"
+    assert isinstance(tool_uses[0], dict), "сырой объект блока не нормализован"
+    assert tool_uses[0]["id"], "у вызова на проводе нет id"
+    assert tool_uses[0]["name"], "у вызова на проводе пустое имя"
+
+    results = [b for m in sent if m["role"] == "user"
+               for b in (m["content"] if isinstance(m["content"], list) else [])
+               if isinstance(b, dict) and b.get("type") == "tool_result"]
+    assert results, "результат инструмента обязан уехать обратно"
+    assert results[0]["tool_use_id"] == tool_uses[0]["id"], (
+        "tool_result ссылается на id, которого нет в assistant-сообщении"
+    )
 
 
 async def test_a_garbage_block_with_string_arguments_does_not_kill_the_turn(kb):

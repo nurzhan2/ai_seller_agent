@@ -1482,6 +1482,47 @@ async def test_daily_limit_exhausted_logs_even_without_a_bot(caplog):
     assert "daily limit exhausted" in caplog.text
 
 
+async def test_a_silent_escalation_still_reaches_the_operator():
+    """МОЛЧАЛИВАЯ ЭСКАЛАЦИЯ — не «ничего не произошло».
+
+    Рубеж, сработавший в четвёртый раз подряд, клиенту не отвечает: карточку
+    человеку уже отправляли, а повторить то же самое дословно запрещено
+    (app/agent/loop.py, guard_substitution). Ветка «ответа нет» в конвейере
+    выходила ДО уведомления оператора — и такой ход не оставлял следа нигде:
+    клиенту ничего, оператору ничего.
+    """
+    bot = _FakeOpsBot()
+    agent = _FakeConcessionAgentLoop(TurnResult(
+        text="",
+        escalated=True,
+        escalation_reason="последний рубеж сработал четвёртый раз подряд",
+    ))
+    pipeline, store, avito, ops_service, settings = _build_live(agent=agent, ops_bot=bot)
+    settings.telegram_ops_chat_id = "-100500"
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert not avito.sent, "клиенту не должно уйти ничего"
+    assert bot.messages, "оператор обязан узнать об эскалации"
+    assert any("рубеж" in m["text"] for m in bot.messages), bot.messages
+
+
+async def test_a_plain_silent_turn_does_not_bother_the_operator():
+    """Обратная сторона: спам и «классификатор велел молчать» — не эскалация,
+    и карточку по ним слать незачем. Иначе оператор утонет в пустых ходах."""
+    bot = _FakeOpsBot()
+    agent = _FakeConcessionAgentLoop(TurnResult(text="", classification="spam"))
+    pipeline, store, avito, ops_service, settings = _build_live(agent=agent, ops_bot=bot)
+    settings.telegram_ops_chat_id = "-100500"
+
+    await pipeline.handle_message(_payload())
+    await _settle()
+
+    assert not avito.sent
+    assert not bot.messages
+
+
 async def test_no_daily_limit_event_means_no_notification():
     """Обычная автономная отправка шлёт свою FYI-карточку (см. раздел
     «Автономная отправка + FYI» выше) — но не карточку про дневной лимит."""

@@ -732,6 +732,14 @@ class MessagePipeline:
                 "pipeline: agent produced no reply",
                 extra={"chat_id": chat_id, "classification": result.classification},
             )
+            # НО ЕСЛИ ХОД ЭСКАЛИРОВАН — оператор обязан узнать. Молчаливая
+            # эскалация бывает ровно в одном случае: рубеж сработал в
+            # четвёртый раз подряд, карточку человеку уже отправляли, и
+            # повторять клиенту то же самое нельзя (app/agent/loop.py,
+            # guard_substitution). Без этой ветки такой ход не оставлял
+            # СЛЕДА НИГДЕ: клиенту ничего, оператору ничего.
+            if result.escalated:
+                await self._notify_operator(chat, result, merged_text)
             return
 
         gate = self._concession_gate(result)

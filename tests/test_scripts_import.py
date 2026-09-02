@@ -93,3 +93,23 @@ def test_every_local_import_from_scripts_is_tracked_by_git():
         "Локальный модуль импортируется, но не отслеживается git — на Railway "
         f"(сборка из git) это ModuleNotFoundError: {untracked}"
     )
+
+
+def test_the_probe_stub_accepts_what_the_loop_passes():
+    """Заглушку зовут с тем же числом аргументов, что и настоящую функцию.
+
+    Повод живой: заглушка была `lambda _text: None`, в `forced_tool_for`
+    добавился второй аргумент, и контрольное плечо замера стало падать на
+    КАЖДОЙ попытке — 43 TypeError из 45. Отчёт при этом показывал «0 из 5»,
+    то есть выглядел как измерение, а был обломками. Сигнатуры расходятся
+    молча; пусть расходятся громко.
+    """
+    import inspect
+
+    from app.agent.tool_forcing import forced_tool_for
+    from scripts.probe_tool_forcing import no_forcing
+
+    signature = inspect.signature(forced_tool_for)
+    # Настоящую функцию петля зовёт с текстом и контекстом.
+    bound = signature.bind("на сегодня есть окошко?", "интересует баня")
+    assert no_forcing(*bound.args, **bound.kwargs) is None

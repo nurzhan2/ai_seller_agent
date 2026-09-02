@@ -192,6 +192,37 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
             return
         await message.answer(await service.unhold(parts[1].strip(), message.from_user.id))
 
+    @dp.message(Command("return"))
+    async def on_return(message: Message) -> None:
+        """Вернуть перехваченный чат агенту КОМАНДОЙ.
+
+        ЗАЧЕМ КОМАНДА, ЕСЛИ ЕСТЬ КНОПКА. Кнопка «↩️ Вернуть ИИ» рисуется
+        только на карточке с `taken_over=True`
+        (app/ops/notifications.py:dialog_keyboard) — а пока чат
+        действительно у оператора, новых карточек не появляется вовсе:
+        `should_agent_reply` не пускает ход, и рисовать нечего. Нажатие
+        «Взять на себя» карточку тоже не перерисовывает — оператор видит
+        только всплывающее уведомление. Итог: кнопка есть в коде, а нажать
+        её негде, и инструкция описывала способ, которого нет.
+
+        В режиме `cooldown` чат возвращается сам через окно молчания, но
+        «подождите 15 минут» — не ответ на «верните сейчас»; в режиме
+        `permanent` не возвращался бы вообще.
+        """
+        if not await _guard(message, message.from_user.id):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "Использование: /return <chat_id>\n"
+                "Вернуть чат ассистенту сразу, не дожидаясь окна молчания."
+            )
+            return
+        result = await service.return_to_ai(parts[1].strip(), message.from_user.id)
+        await message.answer(
+            result.get("message", "Готово") if isinstance(result, dict) else str(result)
+        )
+
     @dp.message(Command("reset"))
     async def on_reset(message: Message) -> None:
         """Сбросить счётчик ответов агента в одном чате.
@@ -328,6 +359,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("provider", "LLM-провайдер"),
     ("chat", "Статус чата по id"),
     ("reset", "Сбросить счётчик ответов в чате"),
+    ("return", "Вернуть перехваченный чат ассистенту"),
     ("hold", "Заткнуть чат до /unhold"),
     ("unhold", "Снять ручной hold с чата"),
 )

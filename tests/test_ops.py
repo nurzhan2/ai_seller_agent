@@ -962,6 +962,51 @@ async def test_hold_and_unhold_set_the_manual_flag():
     assert [a["action"] for a in service.store.actions] == ["hold", "unhold"]
 
 
+async def test_a_taken_over_chat_can_be_returned_without_waiting():
+    """Вернуть чат агенту должно быть чем, а не только «подождите 15 минут».
+
+    Кнопка «↩️ Вернуть ИИ» рисуется только на карточке с taken_over=True
+    (app/ops/notifications.py:dialog_keyboard), а пока чат действительно у
+    оператора, новых карточек не появляется: should_agent_reply не пускает
+    ход. Нажатие «Взять на себя» карточку не перерисовывает. Итог: кнопка
+    в коде есть, нажать её негде, а инструкция описывала именно её.
+    """
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER]),
+    )
+
+    await service.takeover("c1", ALLOWED_USER)
+    assert (await service.store.get_flags("c1")).is_human_takeover is True
+
+    result = await service.return_to_ai("c1", ALLOWED_USER)
+
+    assert result["changed"] is True
+    assert (await service.store.get_flags("c1")).is_human_takeover is False
+    assert "return_ai" in [a["action"] for a in service.store.actions]
+
+
+async def test_returning_a_chat_nobody_took_is_honest_about_it():
+    """Оператор не должен гадать, сработала команда или нет."""
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER]),
+    )
+
+    result = await service.return_to_ai("c1", ALLOWED_USER)
+
+    assert result["changed"] is False
+    assert "и так у агента" in result["message"]
+
+
+def test_the_return_command_is_offered_in_the_bot_menu():
+    """Команда бесполезна, если о ней никто не знает: список команд —
+    единственное место, где оператор её увидит."""
+    from app.ops.handlers import BOT_COMMANDS
+
+    assert any(name == "return" for name, _ in BOT_COMMANDS), BOT_COMMANDS
+
+
 async def test_hold_refuses_honestly_without_a_database():
     """Без доступа к базе команда обязана сказать «не могу», а не сделать
     вид, что чат заткнут: оператор ставит hold по инциденту."""

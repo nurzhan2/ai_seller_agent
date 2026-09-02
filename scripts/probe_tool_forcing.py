@@ -62,6 +62,22 @@ REPORT_JSON = ROOT / "docs" / "quality" / "tool_forcing_probe.json"
 GROUNDING_TOOLS = AVAILABILITY_TOOLS | {"calculate_price"}
 
 
+def no_forcing(*_args, **_kwargs) -> None:
+    """Контрольное плечо: «принуждения нет», что бы ни спросили.
+
+    ПРИНИМАЕТ ЛЮБЫЕ АРГУМЕНТЫ, И ЭТО НЕ ПЕДАНТИЗМ. Прежняя заглушка была
+    однопараметрической лямбдой и пережила добавление второго аргумента
+    (`context`) в `forced_tool_for`. Итог: КАЖДАЯ попытка контрольного плеча
+    падала с TypeError — 43 из 45, — а в отчёте стояло «0 из 5» и читалось
+    как измерение «модель без принуждения не позвала инструмент». Вывод из
+    такого замера был бы ложным целиком.
+
+    Отдельной функцией, а не лямбдой на месте, ровно чтобы это можно было
+    проверить тестом: см. tests/test_scripts_import.py.
+    """
+    return None
+
+
 @dataclass(frozen=True)
 class Case:
     """Один случай: что сказал клиент и что обязано произойти."""
@@ -314,7 +330,7 @@ async def probe(repeats: int, only: Optional[str], provider_name: str,
         # Контрольное плечо: тот же ход без принуждения. Заглушаем имя ровно
         # там, где loop.py его читает, — это и есть прод до правки.
         if control:
-            loop_module.forced_tool_for = lambda _text: None
+            loop_module.forced_tool_for = no_forcing
             try:
                 for _ in range(repeats):
                     attempt = await run_attempt(agent, kb, case)
@@ -352,6 +368,21 @@ def _obeyed_name(attempts: list[dict]) -> int:
 def _called_anything(attempts: list[dict]) -> int:
     """Сколько раз вызов инструмента вообще состоялся."""
     return sum(1 for a in attempts if a["tools"])
+
+
+def _many_questions(attempts: list[dict]) -> int:
+    """Сколько ответов содержат больше одного вопросительного знака.
+
+    «Анкетность» — цена принуждения. Инструмент, вызванный без зоны и даты,
+    возвращает needs_input, и модель спрашивает у клиента всё разом. Метрика
+    жила сбоку в чужой голове; теперь считается здесь, рядом с тем, что её
+    порождает, и попадает в отчёт вместе с остальными цифрами.
+    """
+    return sum(1 for a in attempts if (a["text"] or "").count("?") > 1)
+
+
+def _rate(part: int, whole: int) -> str:
+    return f"{part}/{whole} = {part / whole:.0%}" if whole else "нет данных"
 
 
 def _grounded(attempts: list[dict]) -> int:
@@ -406,7 +437,29 @@ def render(report: dict) -> str:
                if case["control"] else "— |")
         )
 
-    lines += ["", "## По случаям", ""]
+    forced_all = [a for case in report["cases"] for a in case["forced"]]
+    control_all = [a for case in report["cases"] for a in case["control"]]
+    broken = sum(1 for a in forced_all + control_all if a.get("error"))
+    lines += [
+        "",
+        "## Анкетность",
+        "",
+        "Доля ответов, в которых больше одного вопросительного знака. Это цена "
+        "принуждения: инструмент, вызванный без зоны и даты, возвращает "
+        "`needs_input`, и модель спрашивает у клиента всё разом.",
+        "",
+        f"- с принуждением: **{_rate(_many_questions(forced_all), len(forced_all))}**",
+        f"- без принуждения: **{_rate(_many_questions(control_all), len(control_all))}**",
+        "",
+    ]
+    if broken:
+        lines += [
+            f"⚠️ **{broken} попыток из {len(forced_all) + len(control_all)} упали с ошибкой** "
+            "— цифры выше на столько же недостоверны. Упавшая попытка не «не "
+            "позвала инструмент», она просто не состоялась.",
+            "",
+        ]
+    lines += ["## По случаям", ""]
     for case in report["cases"]:
         lines += [
             f"### `{case['id']}`",
@@ -503,6 +556,14 @@ async def main() -> int:
         print(f"{case['id']:<24} просим {case['expected_tool']:<20} "
               f"позвал {_called_anything(case['forced'])}/{n}   "
               f"именно его {_obeyed_name(case['forced'])}/{n}   {control}")
+    forced_all = [a for case in report["cases"] for a in case["forced"]]
+    control_all = [a for case in report["cases"] for a in case["control"]]
+    print(f"\nанкетность (больше одного вопроса в ответе):")
+    print(f"  с принуждением  {_rate(_many_questions(forced_all), len(forced_all))}")
+    print(f"  без принуждения {_rate(_many_questions(control_all), len(control_all))}")
+    broken = sum(1 for a in forced_all + control_all if a.get("error"))
+    if broken:
+        print(f"  ⚠️ упавших попыток: {broken} — цифры настолько же недостоверны")
     print(f"\nОтчёт: {md_path}")
     return 0
 
