@@ -15,7 +15,10 @@ from decimal import Decimal
 from typing import Any, Optional, Protocol
 
 # Через сколько бездействия оператора чат возвращается агенту.
-TAKEOVER_TIMEOUT = timedelta(hours=24)
+# Запасное значение на случай, когда настройки не передали (старые вызовы в
+# тестах). Живое значение — `Settings.takeover_auto_return_hours`, по
+# умолчанию 72 часа.
+TAKEOVER_TIMEOUT = timedelta(hours=72)
 
 
 @dataclass
@@ -282,15 +285,26 @@ class SqlAlchemyOpsStore:
         return stats
 
 
-def should_auto_return(flags: ChatFlags, now: Optional[datetime] = None) -> bool:
-    """Оператор взял чат и забыл — через сутки возвращаем агенту."""
+def should_auto_return(
+    flags: ChatFlags, now: Optional[datetime] = None, settings: Any = None
+) -> bool:
+    """Оператор взял чат и забыл — через `takeover_auto_return_hours` вернуть.
+
+    Срок читается из настроек и НЕ зависит от режима перехвата: даже в
+    `permanent` забытый чат когда-то должен вернуться агенту, иначе клиент
+    остаётся без ответа навсегда. Заказчик 2026-09-06 поднял срок с суток до
+    трёх: сутки тишины в чате — это не «бот вклинивается», это забытый
+    диалог.
+    """
     if not flags.is_human_takeover or flags.takeover_at is None:
         return False
     now = now or datetime.now(timezone.utc)
     taken_at = flags.takeover_at
     if taken_at.tzinfo is None:
         taken_at = taken_at.replace(tzinfo=timezone.utc)
-    return now - taken_at >= TAKEOVER_TIMEOUT
+    hours = getattr(settings, "takeover_auto_return_hours", None)
+    timeout = timedelta(hours=int(hours)) if hours else TAKEOVER_TIMEOUT
+    return now - taken_at >= timeout
 
 
 def auto_return_reason(
@@ -308,8 +322,9 @@ def auto_return_reason(
     """
     if not flags.is_human_takeover:
         return None
-    if should_auto_return(flags, now):
-        return "24h без активности"
+    if should_auto_return(flags, now, settings):
+        hours = getattr(settings, "takeover_auto_return_hours", None) or 72
+        return f"{hours}ч без активности"
     if settings is not None and getattr(settings, "takeover_mode", "cooldown") == "cooldown":
         from app.channels.outbound_gate import TakeoverState, takeover_blocks
 

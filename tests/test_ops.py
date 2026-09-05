@@ -188,7 +188,47 @@ async def test_return_to_ai_restores_agent(service):
     assert allowed is True
 
 
-async def test_auto_return_after_24h():
+async def test_a_chat_taken_yesterday_is_not_returned_yet():
+    """Заказчик 2026-09-06 поднял срок с суток до трёх: сутки тишины в чате —
+    это не «бот вклинивается», это забытый диалог, и возвращать агента так
+    рано незачем. Проверяем ГРАНИЦУ, а не только «когда-нибудь вернётся»."""
+    service = OpsService(
+        store=InMemoryOpsStore(),
+        settings=Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True,
+                          takeover_mode="permanent"),
+    )
+    await service.store.set_flags("c1", ChatFlags(
+        is_human_takeover=True,
+        takeover_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    ))
+
+    assert await service.auto_return_if_stale("c1") is False
+    allowed, _ = await service.should_agent_reply("c1")
+    assert allowed is False, "через сутки чат обязан остаться у оператора"
+
+
+async def test_the_configured_hours_are_actually_read():
+    """Срок берётся ИЗ НАСТРОЙКИ, а не из запасной константы.
+
+    Обе сейчас равны 72 часам, поэтому подмена одной другой ничего не меняет
+    и тестом не ловится — мутационный разбор 2026-09-06 это и показал.
+    Значение здесь нарочно НЕдефолтное.
+    """
+    settings = Settings(telegram_allowed_users=[ALLOWED_USER], dry_run=True,
+                        takeover_mode="permanent", takeover_auto_return_hours=1)
+    service = OpsService(store=InMemoryOpsStore(), settings=settings)
+    await service.store.set_flags("c1", ChatFlags(
+        is_human_takeover=True,
+        takeover_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    ))
+
+    assert await service.auto_return_if_stale("c1") is True
+    assert any(a["action"] == "auto_return"
+               and a["payload"]["reason"] == "1ч без активности"
+               for a in service.store.actions), service.store.actions
+
+
+async def test_auto_return_after_the_configured_hours():
     """Страховка «взял и забыл» — и проверяется она в режиме `permanent`,
     где сработать может ТОЛЬКО она. В `cooldown` те же сутки возвращают чат
     по истёкшему окну, и тест зеленел бы, даже если суточное правило
@@ -200,7 +240,7 @@ async def test_auto_return_after_24h():
     )
     flags = ChatFlags(
         is_human_takeover=True,
-        takeover_at=datetime.now(timezone.utc) - timedelta(hours=25),
+        takeover_at=datetime.now(timezone.utc) - timedelta(hours=73),
     )
     await service.store.set_flags("c1", flags)
 
@@ -208,7 +248,7 @@ async def test_auto_return_after_24h():
     allowed, _ = await service.should_agent_reply("c1")
     assert allowed is True
     assert any(
-        a["action"] == "auto_return" and a["payload"]["reason"] == "24h без активности"
+        a["action"] == "auto_return" and a["payload"]["reason"] == "72ч без активности"
         for a in service.store.actions
     )
 

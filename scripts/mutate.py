@@ -80,6 +80,9 @@ LADDER = "лестница"
 GARBAGE = "мусорный-tool_use"
 WIRING = "проводка"
 MORPH = "морфология"
+PROMISE = "обещания"
+ALTERNATIVES = "альтернативы"
+TAKEOVER = "перехват"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -335,8 +338,8 @@ MUTATIONS: tuple[Mutation, ...] = (
              "tests/test_agent.py",
              "обычный ответ агента не обрывает счёт подстановок"),
     Mutation(LADDER, "app/agent/loop.py",
-             "    | {AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK}",
-             "    | {AVAILABILITY_GUARD_HANDOFF}",
+             "    | {AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK, HANDED_TO_MANAGER}",
+             "    | {AVAILABILITY_GUARD_HANDOFF, HANDED_TO_MANAGER}",
              "tests/test_agent.py",
              "отбивка ценового рубежа снова рвёт серию"),
     Mutation(LADDER, "app/agent/loop.py",
@@ -376,6 +379,62 @@ MUTATIONS: tuple[Mutation, ...] = (
              '            "name": name,',
              "tests/test_agent.py",
              "на провод уходит пустое имя инструмента"),
+
+    # -- обещание вернуться -------------------------------------------------
+    Mutation(PROMISE, "app/agent/loop.py",
+             "        if final_text and PROMISE_TO_RETURN.search(final_text):",
+             "        if False:",
+             "tests/test_agent.py",
+             "рубеж обещаний выключен — «вернусь с ответом» уходит клиенту"),
+    Mutation(PROMISE, "app/agent/loop.py",
+             r"\bверн[уё]сь\b|\bвернемся\b|\bвернёмся\b|",
+             r"\bникогданетакого\b|",
+             "tests/test_agent.py",
+             "«вернусь» выпало из словаря обещаний"),
+    Mutation(PROMISE, "app/agent/loop.py",
+             r"\bсвяж[уе]сь\b|\bсвяжемся\b|\bсвяжётся\b|\bсвяжется\b|\bсвяжутся\b|",
+             "",
+             "tests/test_agent.py",
+             "«менеджер свяжется» снова разрешено"),
+    Mutation(PROMISE, "app/agent/loop.py",
+             'HANDED_TO_MANAGER = "Передала вопрос менеджеру — напишите, если нужно что-то ещё."',
+             'HANDED_TO_MANAGER = "Конечно, сейчас передам менеджеру — он свяжется с вами."',
+             "tests/test_agent.py",
+             "ответ на «позовите человека» снова обещает звонок"),
+
+    # -- альтернативы при занятости -----------------------------------------
+    Mutation(ALTERNATIVES, "app/agent/tools.py",
+             "            alternatives = await self._free_neighbours(",
+             "            alternatives = [] or await self._nothing(",
+             "tests/test_agent.py",
+             "альтернативы не подбираются вовсе"),
+    Mutation(ALTERNATIVES, "app/agent/tools.py",
+             "            if zone.id == busy_zone_id:\n                continue",
+             "            if False:\n                continue",
+             "tests/test_agent.py",
+             "занятая зона предлагается сама себе как альтернатива"),
+    Mutation(ALTERNATIVES, "app/agent/tools.py",
+             "            if guests and zone.capacity.is_resolved() and zone.capacity.value < guests:",
+             "            if False:",
+             "tests/test_agent.py",
+             "вместимость не проверяется — предлагаем зону, куда компания не влезет"),
+    Mutation(ALTERNATIVES, "app/agent/tools.py",
+             "            if len(found) >= self.MAX_ALTERNATIVES:",
+             "            if False:",
+             "tests/test_agent.py",
+             "потолок альтернатив снят — десять запросов к YCLIENTS на ход"),
+
+    # -- автовозврат перехвата ----------------------------------------------
+    Mutation(TAKEOVER, "app/config.py",
+             "    takeover_auto_return_hours: int = 72",
+             "    takeover_auto_return_hours: int = 24",
+             "tests/test_ops.py",
+             "срок автовозврата вернулся к суткам"),
+    Mutation(TAKEOVER, "app/ops/state.py",
+             "    timeout = timedelta(hours=int(hours)) if hours else TAKEOVER_TIMEOUT",
+             "    timeout = TAKEOVER_TIMEOUT",
+             "tests/test_ops.py",
+             "настройка срока не читается — константа вместо неё"),
 
     # -- проводка: без неё всё остальное декоративно ------------------------
     Mutation(WIRING, "app/agent/providers/deepseek_provider.py",

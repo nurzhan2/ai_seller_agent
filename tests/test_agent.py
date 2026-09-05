@@ -31,6 +31,9 @@ from app.agent.loop import (
     date_contradicts_now,
     estimate_cost_rub,
     GUARD_RAIL_FALLBACK,
+    HANDED_TO_MANAGER,
+    PROMISE_GUARD_VIOLATION,
+    PROMISE_TO_RETURN,
     GUARD_RAIL_VIOLATION,
     guard_repeats,
     guard_substitution,
@@ -417,6 +420,114 @@ class _DatedBookingProvider:
         if date in self.free_dates:
             return Availability(AvailabilityStatus.FREE, free_slots=self.slots)
         return Availability(AvailabilityStatus.BUSY, reason="занято")
+
+
+class _BusyExceptZones:
+    """Занято везде, кроме перечисленных зон — для подбора альтернатив."""
+
+    def __init__(self, free_zone_ids):
+        self.free_zone_ids = set(free_zone_ids)
+        self.asked: list = []
+
+    async def check_availability(self, zone_id, date, start_time=None, hours=None):
+        from app.booking.base import Availability, AvailabilityStatus
+
+        self.asked.append(zone_id)
+        if zone_id in self.free_zone_ids:
+            return Availability(AvailabilityStatus.FREE, free_slots=("18:00",))
+        return Availability(AvailabilityStatus.BUSY, reason="занято")
+
+
+async def test_busy_answer_carries_ready_alternatives(kb):
+    """ЗАНЯТО — НЕ ТУПИК. Соседние свободные зоны приходят ДАННЫМИ.
+
+    Прежняя редакция возвращала на busy текст «предложи соседнюю подходящую
+    зону» — то есть инструкцию модели, а DeepSeek инструкции исполняет через
+    раз (см. app/agent/tool_forcing.py). Заказчик 2026-09-06: «диалог
+    упирается в тупик, хотя купола свободны».
+    """
+    provider = _BusyExceptZones({"dome_bags", "dome_chairs"})
+    ex = ToolExecutor(kb, "d1", booking_provider=provider,
+                      today_fn=lambda: date(2026, 9, 1))
+
+    result = await ex.run("check_availability", {
+        "zone_id": "bath_russian", "date": "2026-09-05",
+        "start_time": "18:00", "hours": 4,
+    })
+
+    assert result["status"] == "busy"
+    ids = [a["zone_id"] for a in result["alternatives"]]
+    assert ids, "занято — и ни одной альтернативы"
+    assert "dome_bags" in ids
+    assert "bath_russian" not in ids, "занятая зона не может быть альтернативой себе"
+    # Названия — в инструкции, чтобы модель их точно увидела.
+    assert "Купол" in result["instruction"]
+
+
+async def test_the_requested_zone_is_never_its_own_alternative(kb):
+    """Проверяем ПРЯМО helper, а не через check_availability.
+
+    Через инструмент эта строка недостижима: запрошенная зона уже в кеше
+    хода как занятая, и её отсеет проверка статуса. Но полагаться на кеш
+    здесь нельзя — стоит будущей правке позвать подбор с другими часами, и
+    клиент получит «занято, зато предлагаю ту же самую зону». Мутационный
+    разбор 2026-09-06 показал, что без этого теста строку можно удалить, и
+    ни один тест не покраснеет.
+    """
+    provider = _BusyExceptZones({z.id for z in kb.catalog.zones})  # свободны ВСЕ
+    ex = ToolExecutor(kb, "d1", booking_provider=provider,
+                      today_fn=lambda: date(2026, 9, 1))
+
+    found = await ex._free_neighbours(
+        "bath_russian", date(2026, 9, 5), None, None, None
+    )
+
+    assert found, "все зоны свободны — альтернативы обязаны найтись"
+    assert "bath_russian" not in [a["zone_id"] for a in found]
+
+
+async def test_alternatives_respect_capacity(kb):
+    """Предлагать зону, куда компания не влезет, — хуже, чем не предлагать."""
+    # Свободны все, КРОМЕ запрошенной: иначе статус был бы "free" и
+    # альтернативы не понадобились бы вовсе.
+    provider = _BusyExceptZones({z.id for z in kb.catalog.zones} - {"yurt"})
+    ex = ToolExecutor(kb, "d1", booking_provider=provider,
+                      today_fn=lambda: date(2026, 9, 1))
+
+    result = await ex.run("check_availability", {
+        "zone_id": "yurt", "date": "2026-09-05", "start_time": "18:00",
+        "hours": 4, "guests": 20,
+    })
+
+    for alt in result["alternatives"]:
+        zone = next(z for z in kb.catalog.zones if z.id == alt["zone_id"])
+        if zone.capacity.is_resolved():
+            assert zone.capacity.value >= 20, alt
+
+
+async def test_alternatives_are_capped(kb):
+    """Каждая альтернатива — обращение к YCLIENTS. Десять зон = десять
+    запросов на один ход клиента; и список длиннее трёх читается как
+    отписка, а не как помощь."""
+    provider = _BusyExceptZones({z.id for z in kb.catalog.zones} - {"bath_russian"})
+    ex = ToolExecutor(kb, "d1", booking_provider=provider,
+                      today_fn=lambda: date(2026, 9, 1))
+
+    result = await ex.run("check_availability", {
+        "zone_id": "bath_russian", "date": "2026-09-05", "start_time": "18:00",
+    })
+
+    assert len(result["alternatives"]) <= ToolExecutor.MAX_ALTERNATIVES
+
+
+async def test_no_alternatives_without_a_booking_provider(kb):
+    """Без календаря «свободных соседей» знать неоткуда — и выдумывать их
+    нельзя ровно так же, как занятость."""
+    ex = ToolExecutor(kb, "d1", today_fn=lambda: date(2026, 9, 1))
+    result = await ex.run("check_availability", {
+        "zone_id": "bath_russian", "date": "2026-09-05",
+    })
+    assert result["status"] == "unknown"
 
 
 async def test_resolve_date_tool_returns_iso_date(kb):
@@ -1899,6 +2010,62 @@ def test_real_windows_are_not_a_calendar_claim():
                  "окна выходят на пруд",
                  "Юрта без окон, свет только от гирлянды"):
         assert availability_claim(text) is False, text
+
+
+def test_a_promise_to_come_back_is_caught():
+    """Агент первым не пишет — значит «вернусь с ответом» он исполнить не
+    может. «Менеджер свяжется» заказчик 2026-09-06 запретил отдельно: клиент
+    садится ждать звонка, которого может не быть, и уходит.
+    """
+    for text in ("Уточню и вернусь с ответом",
+                 "Менеджер свяжется с вами",
+                 "Мы свяжемся с вами завтра",
+                 "Перезвоню вам после 18:00",
+                 "Я напишу вам, как только узнаю",
+                 "Дам знать, как освободится"):
+        assert PROMISE_TO_RETURN.search(text), text
+
+
+def test_asking_the_client_to_write_is_not_a_promise():
+    """Обратная сторона: повелительное наклонение в адрес клиента — это как
+    раз то, чем такие фразы заменяются. Глушить его нельзя."""
+    for text in ("Напишите, если нужно что-то ещё",
+                 "Перезвоните нам, если удобно",
+                 "Свяжитесь с нами по телефону",
+                 "Хотите вернуться к этому вопросу позже?"):
+        assert not PROMISE_TO_RETURN.search(text), text
+
+
+def test_no_canned_reply_promises_anything():
+    """Свойство ВСЕХ заготовленных текстов разом. Поштучно их легко
+    поправить и один забыть — а забытый уедет клиенту."""
+    for text in list(AVAILABILITY_GUARD_REPLIES) + [
+        AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK, HANDED_TO_MANAGER,
+    ]:
+        assert not PROMISE_TO_RETURN.search(text), text
+        assert availability_claim(text) is False, text
+
+
+async def test_a_promise_never_reaches_the_client(kb):
+    """Сквозь весь ход: обещание задерживается, вместо него — подстановка."""
+    promise = "Уточню у менеджера и вернусь с ответом."
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(promise)])])
+    result = await agent.run_turn("chat-1", [], "вопрос без принуждения")
+
+    assert "вернусь" not in result.text
+    assert result.llm_meta["guard_rail"] == PROMISE_GUARD_VIOLATION
+    assert result.llm_meta["withheld_text"] == promise
+
+
+async def test_the_human_request_reply_does_not_promise_a_call(kb):
+    """«Позовите человека» — самый частый путь к менеджеру, и раньше ответ
+    на него обещал звонок дословно."""
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("неважно")])], label="human")
+    result = await agent.run_turn("chat-1", [], "позовите человека")
+
+    assert result.text == HANDED_TO_MANAGER
+    assert not PROMISE_TO_RETURN.search(result.text)
+    assert result.escalated is True
 
 
 def test_a_condition_is_not_a_claim():

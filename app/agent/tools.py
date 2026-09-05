@@ -188,8 +188,10 @@ TOOLS: list[dict[str, Any]] = [
             "Проверить занятость зоны на дату и время. Дата — строго YYYY-MM-DD; "
             "если клиент назвал её словами, сначала вызови resolve_date и передай "
             "сюда его результат, а не свои вычисления. Если вернулся status "
-            "\"unknown\" — свободно или нет, мы не знаем: скажи «уточню у менеджера» "
-            "и вызови escalate_to_human. Не выдумывай, что свободно."
+            "\"unknown\" — свободно или нет, мы не знаем: скажи, что вопрос передан "
+            "менеджеру, и вызови escalate_to_human. Не выдумывай, что свободно. "
+            "При status \"busy\" в ответе уже лежит СПИСОК СВОБОДНЫХ СОСЕДНИХ ЗОН "
+            "(поле alternatives) — назови их клиенту, искать самому ничего не надо."
         ),
         "input_schema": {
             "type": "object",
@@ -198,6 +200,11 @@ TOOLS: list[dict[str, Any]] = [
                 "date": {"type": "string"},
                 "start_time": {"type": "string"},
                 "hours": {"type": "integer"},
+                "guests": {
+                    "type": "integer",
+                    "description": "Сколько гостей — по нему подбираются "
+                                   "альтернативы, если запрошенная зона занята",
+                },
             },
             "required": ["zone_id", "date"],
         },
@@ -215,7 +222,7 @@ TOOLS: list[dict[str, Any]] = [
             "клиенту ровно то, что написано в instruction, и не выдавай это за "
             "подтверждённую бронь. Отдельный случай "
             "status=\"handed_off_to_operator\": данные ушли менеджеру, он "
-            "свяжется с клиентом и поставит бронь сам — это нормальный исход, "
+            "поставит бронь сам — это нормальный исход, "
             "а не сбой."
         ),
         "input_schema": {
@@ -341,7 +348,7 @@ def quote_to_dict(q: PriceQuote) -> dict:
         payload["blocked_reason"] = q.blocked_reason
         payload["blocking_question_ids"] = list(q.blocking_question_ids)
         payload["instruction"] = (
-            "Цену НЕ называй. Скажи, что уточнишь у менеджера, и вызови escalate_to_human."
+            "Цену НЕ называй. Скажи, что вопрос передан менеджеру, и вызови escalate_to_human."
         )
     elif q.status == "needs_input":
         payload["missing_fields"] = list(q.missing_fields)
@@ -510,7 +517,9 @@ class ToolExecutor:
             logger.exception("tool failed", extra={"tool": name})
             return {
                 "error": f"{type(exc).__name__}: {exc}",
-                "instruction": "Не сообщай клиенту об ошибке. Скажи, что уточнишь у менеджера.",
+                "instruction": ("Не сообщай клиенту об ошибке. Скажи, что вопрос передан "
+                                "менеджеру, и предложи написать, если нужно что-то ещё. "
+                                "Не обещай вернуться и не обещай звонок."),
             }
 
     # -- зоны ---------------------------------------------------------------
@@ -793,7 +802,7 @@ class ToolExecutor:
         unknown = {
             "status": "unknown",
             "instruction": (
-                "Занятость неизвестна. Скажи, что уточнишь у менеджера, "
+                "Занятость неизвестна. Скажи, что вопрос передан менеджеру, "
                 "и вызови escalate_to_human. Не утверждай, что свободно."
             ),
         }
@@ -838,18 +847,83 @@ class ToolExecutor:
         if not availability.is_known:
             return {**unknown, "reason": availability.reason}
         if availability.status.value == "busy":
-            return {
+            alternatives = await self._free_neighbours(
+                args.get("zone_id", ""), booking_date,
+                _parse_time(args.get("start_time")), args.get("hours"),
+                args.get("guests"),
+            )
+            payload = {
                 "status": "busy",
                 "free_slots": list(availability.free_slots),
-                "instruction": (
-                    "Это время занято. Если free_slots не пусто — предложи время "
-                    "из него на эту же дату. Если клиент не привязан жёстко к этой "
-                    "дате (или free_slots пусто) — вызови find_next_available и "
-                    "предложи 2-3 ближайшие свободные даты, или соседнюю подходящую "
-                    "зону на то же время — не заканчивай разговор отказом."
-                ),
+                "alternatives": alternatives,
             }
+            if alternatives:
+                names = ", ".join(a["name"] for a in alternatives)
+                payload["instruction"] = (
+                    f"Это время занято, НО на него свободны другие зоны: {names}. "
+                    "Назови их клиенту с ценой (calculate_price по выбранной) — "
+                    "разговор отказом не заканчивай. Если клиент держится за "
+                    "исходную зону, предложи время из free_slots или вызови "
+                    "find_next_available."
+                )
+            else:
+                payload["instruction"] = (
+                    "Это время занято, и соседние зоны на него тоже. Если "
+                    "free_slots не пусто — предложи время из него на эту же дату. "
+                    "Иначе вызови find_next_available и предложи 2-3 ближайшие "
+                    "свободные даты — не заканчивай разговор отказом."
+                )
+            return payload
         return {"status": "free", "free_slots": list(availability.free_slots)}
+
+    # Сколько соседних зон опрашиваем при занятости. Каждая — обращение к
+    # YCLIENTS, и на десяти зонах один ход клиента превратился бы в десять
+    # сетевых запросов. Трёх названий в ответе клиенту достаточно: список
+    # длиннее читается как отписка, а не как помощь.
+    MAX_ALTERNATIVES = 3
+
+    async def _free_neighbours(
+        self, busy_zone_id: str, date_value: DateType,
+        start_time: Optional[TimeType], hours: Optional[int],
+        guests: Optional[int],
+    ) -> list[dict]:
+        """Соседние зоны, свободные на ТО ЖЕ время, — готовым списком.
+
+        ЗАЧЕМ ДАННЫМИ, А НЕ ИНСТРУКЦИЕЙ. Прежняя редакция возвращала на busy
+        текст «предложи соседнюю подходящую зону», и всё. Это инструкция
+        модели, а DeepSeek инструкции исполняет через раз — тот же корневой
+        дефект, ради которого в проекте появилось принуждение инструмента
+        (см. app/agent/tool_forcing.py). Заказчик 2026-09-06: «диалог
+        упирается в тупик, хотя купола свободны». Теперь зоны опрашиваются
+        здесь, и модели остаётся их назвать.
+
+        Вместимость учитывается, только если клиент назвал число гостей: без
+        него отбирать не по чему, а молча сузить выбор хуже, чем предложить
+        всё свободное.
+        """
+        if self.booking_provider is None:
+            return []
+        found: list[dict] = []
+        for zone in self.kb.catalog.zones:
+            if len(found) >= self.MAX_ALTERNATIVES:
+                break
+            if zone.id == busy_zone_id:
+                continue
+            if guests and zone.capacity.is_resolved() and zone.capacity.value < guests:
+                continue
+            availability = await self._availability_for(
+                zone.id, date_value, start_time, hours
+            )
+            if availability is None or not availability.is_known:
+                continue
+            if availability.status.value != "free":
+                continue
+            found.append({
+                "zone_id": zone.id,
+                "name": zone.name,
+                "capacity": zone.capacity.value if zone.capacity.is_resolved() else None,
+            })
+        return found
 
     async def _tool_find_next_available(self, args: dict) -> dict:
         """Идёт по датам вперёд не дальше FIND_NEXT_AVAILABLE_HORIZON_DAYS —
@@ -870,7 +944,7 @@ class ToolExecutor:
             return {
                 "dates": [],
                 "instruction": (
-                    "Занятость неизвестна. Скажи, что уточнишь у менеджера, "
+                    "Занятость неизвестна. Скажи, что вопрос передан менеджеру, "
                     "и вызови escalate_to_human."
                 ),
             }
@@ -983,7 +1057,7 @@ class ToolExecutor:
                 return {
                     "booked": False,
                     "instruction": (
-                        "Система бронирования недоступна. Скажи, что уточнишь у "
+                        "Система бронирования недоступна. Скажи, что вопрос передан "
                         "менеджера, и вызови escalate_to_human."
                     ),
                 }
@@ -1050,7 +1124,7 @@ class ToolExecutor:
                 "status": "unknown",
                 "instruction": (
                     "Занятость сейчас не подтверждается — бронь НЕ поставлена. "
-                    "Скажи, что уточнишь у менеджера, и вызови escalate_to_human."
+                    "Скажи, что вопрос передан менеджеру, и вызови escalate_to_human."
                 ),
             }
 
@@ -1092,8 +1166,9 @@ class ToolExecutor:
                 "booked": False,
                 "error": result.error,
                 "instruction": (
-                    "Бронь не поставилась. Скажи, что уточнишь у менеджера и "
-                    "вернёшься, и вызови escalate_to_human."
+                    "Бронь не поставилась. Скажи, что вопрос передан менеджеру, "
+                    "предложи написать, если нужно что-то ещё, и вызови "
+                    "escalate_to_human. НЕ обещай вернуться и НЕ обещай звонок."
                 ),
             }
 
@@ -1137,7 +1212,7 @@ class ToolExecutor:
             "occupied_hours": int(occupied_hours),
             "instruction": (
                 "Время придержано. Скажи клиенту, что придержала время и менеджер "
-                "свяжется для подтверждения. Слова «забронировал», «бронь "
+                "подтвердит бронь. Слова «забронировал», «бронь "
                 "подтверждена», «место за вами» по-прежнему запрещены."
             ),
         }
@@ -1223,7 +1298,7 @@ class ToolExecutor:
             "instruction": (
                 "Бронь НЕ поставлена и агентом не ставится: этап оплаты ведёт "
                 "менеджер, он же ставит бронь в календаре. Скажи клиенту, что "
-                "передала данные менеджеру и он свяжется, чтобы подтвердить "
+                "передала данные менеджеру, он подтвердит "
                 "время и прислать оплату. Сумму предоплаты назвать можно, "
                 "ссылку на оплату и реквизиты — нельзя. Слова «забронировала», "
                 "«бронь подтверждена», «место за вами» запрещены."
@@ -1279,7 +1354,8 @@ class ToolExecutor:
         return {
             "escalated": True,
             "instruction": (
-                "Менеджер уведомлён. Скажи клиенту, что уточнишь и вернёшься с ответом. "
+                "Менеджер уведомлён. Скажи клиенту, что вопрос у менеджера, и предложи "
+                "написать, если нужно что-то ещё. НЕ обещай вернуться и НЕ обещай звонок. "
                 "Больше ничего не обещай и цену не называй."
             ),
         }
@@ -1316,7 +1392,7 @@ class ToolExecutor:
                 "found": False,
                 "confidence": "unknown",
                 "instruction": (
-                    "Ответа в базе нет. Не придумывай — скажи, что уточнишь у менеджера, "
+                    "Ответа в базе нет. Не придумывай — скажи, что вопрос передан менеджеру, "
                     "и вызови escalate_to_human."
                 ),
             }
