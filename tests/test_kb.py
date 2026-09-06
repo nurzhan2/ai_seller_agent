@@ -385,3 +385,37 @@ def test_question_3_3_and_3_4_are_separate_findings(raw_docs):
         # 3.3 закрыт ответом заказчика: вместимости подтверждены и разные.
         assert zone["capacity"].get("disputed") is None
         assert zone["capacity"]["value"] in (7, 10)
+
+
+def test_the_address_sounds_the_same_everywhere():
+    """Адрес обязан звучать ОДИНАКОВО во всех местах, откуда он попадает
+    клиенту.
+
+    До 2026-09-06 их было три и все разные: у venue «1, стр. 2», в ответе
+    базы знаний «1, строение 2», в системном промте — вообще без номера
+    строения. Клиент, спросивший адрес дважды, получал два разных текста; на
+    фоне чужих адресов на карточках Авито (docs/analysis/listing_addresses.md)
+    это читается как путаница у нас, а не как сокращение.
+    """
+    from app.agent.prompts import build_system_prompt
+    from app.clock import moscow_now
+    from app.kb.loader import load_catalog
+
+    address = "д. Тупиково, территория базы отдыха «Чайка», 1, стр. 2"
+    kb = load_catalog()
+
+    assert {v.address for v in kb.catalog.venues} == {address}
+
+    answers = [e.answer for e in kb.catalog.knowledge
+               if e.answer and "Тупиково" in e.answer]
+    assert answers, "ответа про адрес в базе знаний нет вовсе"
+    for answer in answers:
+        assert answer.startswith(address), answer
+
+    prompt = build_system_prompt(kb, moscow_now())
+    text = prompt if isinstance(prompt, str) else str(prompt)
+    assert text.count("Тупиково") >= 2, "адрес пропал из промта"
+    # Ни одного упоминания деревни в ЛЮБОЙ другой форме.
+    for line in text.splitlines():
+        if "Тупиково" in line:
+            assert address in line or line.strip().endswith("Тупиково,"), line
