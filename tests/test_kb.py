@@ -419,3 +419,38 @@ def test_the_address_sounds_the_same_everywhere():
     for line in text.splitlines():
         if "Тупиково" in line:
             assert address in line or line.strip().endswith("Тупиково,"), line
+
+
+def test_the_website_is_in_the_knowledge_base():
+    """Сайт есть, и агент обязан знать это от базы, а не гадать.
+
+    Прод 2026-09-07: на прямой вопрос «а у вас нет сайта?» модель не
+    эскалировала, а СОЧИНИЛА отрицание — «сайта у нас пока нет». Пустое место
+    в базе знаний модель заполняет утверждением, а не молчанием, и уверенное
+    «нет» звучит для клиента так же убедительно, как выдуманная цена.
+    """
+    from app.kb.loader import load_catalog
+
+    kb = load_catalog()
+    answers = [e.answer for e in kb.catalog.knowledge
+               if "сайт" in e.question_topic.lower()]
+    assert answers, "записи про сайт в базе знаний нет"
+    assert any("чайка.москва" in a for a in answers), answers
+
+
+def test_every_escalation_topic_has_words_to_match_on():
+    """`escalation_topics` перестал быть текстом для человека: по полю
+    `match` эскалацию ставит код (app/agent/loop.py:escalation_topic_in).
+    Тема без `match` снова стала бы правилом, которое исполняет только
+    модель — то есть через раз."""
+    import re
+
+    from app.kb.loader import load_catalog
+
+    kb = load_catalog()
+    topics = [t for z in kb.catalog.zones for t in (z.escalation_topics or [])]
+    assert topics, "темы эскалации пропали из базы знаний"
+    for topic in topics:
+        pattern = topic.get("match")
+        assert pattern, f"у темы {topic.get('id')} нет match"
+        re.compile(pattern)   # кривой шаблон должен падать здесь, а не в проде

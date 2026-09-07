@@ -35,6 +35,10 @@ from app.agent.loop import (
     PROMISE_GUARD_VIOLATION,
     PROMISE_TO_RETURN,
     GUARD_RAIL_VIOLATION,
+    SELF_DISCLOSURE,
+    SELF_DISCLOSURE_VIOLATION,
+    PROMISE_TO_RETURN,
+    escalation_topic_in,
     guard_repeats,
     guard_substitution,
     not_a_verbatim_repeat,
@@ -1913,6 +1917,106 @@ async def test_the_amounts_are_exposed_on_the_path_where_the_text_reaches_the_cl
 
     assert result.text == "Шампуры есть — набор за 500 ₽."
     assert "500" in result.tool_amounts, result.tool_amounts
+
+
+# --- самораскрытие ---------------------------------------------------------
+
+def test_the_agent_never_explains_how_it_works():
+    """Дословный ответ из прода 2026-09-07.
+
+    Клиент спросил про собак, а получил кусок нашего служебного правила:
+    «он ответит лично, я первой не пишу». Источник нашёлся в системном
+    промте — правило №6 объясняло модели ПРИЧИНУ запрета обещаний, и модель
+    пересказала объяснение клиенту. Объяснение убрано, но рубеж нужен всё
+    равно: сочинить такую фразу модель может и без подсказки.
+    """
+    leaked = ("Про собак уже передала вопрос менеджеру — он ответит лично, "
+              "я первой не пишу.")
+    assert SELF_DISCLOSURE.search(leaked)
+
+    for text in ("Я бот, поэтому не могу назвать цену",
+                 "мне не разрешено давать скидку",
+                 "передам в систему и вернусь",
+                 "система не позволяет забронировать",
+                 "по инструкции я не могу это сказать"):
+        assert SELF_DISCLOSURE.search(text), text
+
+
+def test_ordinary_replies_are_not_self_disclosure():
+    """Обратная сторона: рубеж не должен глушить обычную речь администратора.
+    «Я подскажу», «я передала» — это работа, а не устройство агента."""
+    for text in ("Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+                 "Я подскажу по ценам и свободным датам",
+                 "Баня «Русский стиль» свободна, записать?",
+                 "Я не нашла свободных дат на эту неделю"):
+        assert not SELF_DISCLOSURE.search(text), text
+
+
+async def test_self_disclosure_never_reaches_the_client(kb):
+    """Через весь ход: текст задерживается, в llm_meta остаётся исходник."""
+    leaked = "Передала менеджеру — он ответит лично, я первой не пишу."
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(leaked)])])
+    result = await agent.run_turn("chat-1", [], "а когда ответите?")
+
+    assert "не пишу" not in result.text
+    assert result.llm_meta["guard_rail"] == SELF_DISCLOSURE_VIOLATION
+    assert result.llm_meta["withheld_text"] == leaked
+
+
+def test_a_manager_answering_is_a_promise_too():
+    """«Он ответит лично» — то же обещание другими словами. Прежний набор
+    ловил «свяжется», но не «ответит», и живой ответ прошёл мимо."""
+    for text in ("он ответит лично", "менеджер ответит вам", "они ответят позже",
+                 # Этот случай ловит ТОЛЬКО ветка про менеджера: «по документам»
+                 # не входит в набор «вам / лично / позже». Без него мутация
+                 # «убрать ветку» оставалась зелёной.
+                 "менеджер ответит по документам"):
+        assert PROMISE_TO_RETURN.search(text), text
+
+
+# --- темы, которые решает заказчик лично -----------------------------------
+
+def test_escalation_topics_are_recognised_from_the_knowledge_base(kb):
+    """Слова берутся из самой базы знаний (поле `match`), а не из кода."""
+    # Не одна форма на тему: словарь в базе знаний легко обеднеть незаметно,
+    # и «с собакой» осталось бы работать, пока «с котом» уже нет.
+    for text in ("можно приехать с 4 собаками?", "а с котом можно?",
+                 "у нас щенок, пустите?", "приедем с кошкой",
+                 "можно с животными?"):
+        assert escalation_topic_in(text, kb), text
+    assert escalation_topic_in("нужен стол для гостей юрты", kb)
+    assert escalation_topic_in("поставим свою палатку рядом", kb)
+    assert escalation_topic_in("сколько стоит баня на 4 часа?", kb) is None
+
+
+async def test_a_pet_question_escalates_even_when_the_model_forgets(kb):
+    """ГЛАВНОЕ ПО ЭТОЙ ТЕМЕ. Прод 2026-09-07: клиент спросил про четырёх
+    собак, модель ответила про вместимость и цену, `escalate_to_human` не
+    вызвала ни разу — а следующим сообщением написала «уже передала вопрос
+    менеджеру». Карточка оператору не уходила, клиент ждал ответа, которого
+    никто не готовил.
+
+    Теперь эскалация ставится кодом по словам из базы знаний, что бы модель
+    ни решила.
+    """
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock(
+        "Гриль-домик вмещает до 12 человек. Подскажите дату?")])])
+    result = await agent.run_turn(
+        "chat-1", [], "сколько стоит на 12 человек и 4 собаки 3 октября?")
+
+    assert result.escalated is True
+    assert "животн" in (result.escalation_reason or "")
+    # Текст модели при этом не трогаем: он нормальный, не хватало карточки.
+    assert "Гриль-домик" in result.text
+
+
+async def test_an_ordinary_question_does_not_escalate(kb):
+    """Обратная сторона: эскалация на каждый ход превратила бы оператора в
+    диспетчера."""
+    agent = loop_at(kb, [FakeResponse(content=[TextBlock("Подскажите дату?")])])
+    result = await agent.run_turn("chat-1", [], "сколько стоит баня на 4 часа?")
+
+    assert result.escalated is False
 
 
 # --- утверждение против обещания ------------------------------------------
