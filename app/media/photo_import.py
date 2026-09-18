@@ -348,33 +348,57 @@ async def import_root(
 
     import tempfile
 
-    with tempfile.TemporaryDirectory() as tmp:
-        working_tmp = tmp_dir or Path(tmp)
-
-        for folder in sorted(p for p in root.iterdir() if p.is_dir()):
-            try:
-                resolved = resolve_folder(folder.name, folder_map)
-            except UnknownFolderError as exc:
-                unmapped.append(str(exc))
-                logger.error("unmapped photo folder", extra={"folder": folder.name})
-                continue
-
-            result = await import_folder(
-                folder, resolved,
-                dry_run=dry_run, avito_client=avito_client,
-                manifest=manifest, tmp_dir=working_tmp,
+    # МАНИФЕСТ СОХРАНЯЕТСЯ И ПРИ ОБРЫВЕ. Раньше он писался одной строкой
+    # после цикла: сетевая ошибка на сороковом файле теряла записи о
+    # тридцати девяти уже загруженных, и повторный запуск заливал их в Авито
+    # дублями — ровно то, от чего манифест и существует. Словарь пополняется
+    # после каждого файла (import_folder), поэтому `finally` сохраняет всё,
+    # что успело уехать.
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            await _import_all_folders(
+                root, tmp_dir or Path(tmp), results, unmapped,
+                dry_run=dry_run, avito_client=avito_client, folder_map=folder_map,
+                manifest=manifest, catalog_path=catalog_path,
             )
-            results.append(result)
-
-            if not dry_run:
-                catalog_text = catalog_path.read_text(encoding="utf-8")
-                if resolved.kind == "zone":
-                    catalog_text = patch_zone_photos(catalog_text, resolved.key, result.image_ids)
-                else:
-                    catalog_text = patch_site_photos(catalog_text, resolved.key, result.image_ids)
-                catalog_path.write_text(catalog_text, encoding="utf-8")
-
-    if not dry_run:
-        save_manifest(manifest, manifest_path)
+    finally:
+        if not dry_run:
+            save_manifest(manifest, manifest_path)
 
     return ImportRun(results=results, unmapped_folders=unmapped)
+
+
+async def _import_all_folders(
+    root: Path,
+    working_tmp: Path,
+    results: list[ZoneImportResult],
+    unmapped: list[str],
+    *,
+    dry_run: bool,
+    avito_client: Any,
+    folder_map: FolderMap,
+    manifest: dict[str, Any],
+    catalog_path: Path,
+) -> None:
+    for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+        try:
+            resolved = resolve_folder(folder.name, folder_map)
+        except UnknownFolderError as exc:
+            unmapped.append(str(exc))
+            logger.error("unmapped photo folder", extra={"folder": folder.name})
+            continue
+
+        result = await import_folder(
+            folder, resolved,
+            dry_run=dry_run, avito_client=avito_client,
+            manifest=manifest, tmp_dir=working_tmp,
+        )
+        results.append(result)
+
+        if not dry_run:
+            catalog_text = catalog_path.read_text(encoding="utf-8")
+            if resolved.kind == "zone":
+                catalog_text = patch_zone_photos(catalog_text, resolved.key, result.image_ids)
+            else:
+                catalog_text = patch_site_photos(catalog_text, resolved.key, result.image_ids)
+            catalog_path.write_text(catalog_text, encoding="utf-8")

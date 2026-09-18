@@ -229,3 +229,32 @@ def test_text_extraction_tolerates_envelope_shapes():
     assert pl.extract_text({"payload": {"value": {"content": {"text": "привет"}}}}) == "привет"
     assert pl.extract_text({"payload": {"value": {"text": "hi"}}}) == "hi"
     assert pl.extract_text({"junk": 1}) is None
+
+
+@respx.mock
+async def test_upload_sends_the_real_image_type(settings):
+    """PNG уходит как PNG: почти все фото комплекса — PNG, а прежде любой
+    файл помечался image/jpeg."""
+    _mock_token()
+    seen: dict = {}
+
+    def handler(request):
+        seen["body"] = request.content.decode("utf-8", errors="replace")
+        return httpx.Response(200, json={"img-1": {}})
+
+    respx.post(_url(ep.UPLOAD_IMAGES, user_id="777")).mock(side_effect=handler)
+
+    client = _client(settings)
+    await client.upload_image(b"pngbytes", "01.png")
+
+    assert "Content-Type: image/png" in seen["body"]
+    await client.aclose()
+
+
+def test_image_content_type_by_extension():
+    from app.channels.avito import image_content_type
+
+    assert image_content_type("01.png") == "image/png"
+    assert image_content_type("02.WEBP") == "image/webp"
+    assert image_content_type("03.jpeg") == "image/jpeg"
+    assert image_content_type("photo") == "image/jpeg"

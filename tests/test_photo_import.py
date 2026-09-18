@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -419,3 +420,36 @@ async def test_renamed_file_is_not_reuploaded(photo_root, sample_kb_dir):
         catalog_path=catalog_path, manifest_path=manifest_path,
     )
     assert len(client.uploaded) == 3        # без изменений — тот же контент
+
+
+class FlakyAvitoClient(FakeAvitoClient):
+    """Первая загрузка проходит, вторая рвётся — как сеть 2026-09-18."""
+
+    async def upload_image(self, data: bytes, filename: str = "photo.jpg") -> dict:
+        if self.uploaded:
+            raise ConnectionError("обрыв соединения")
+        return await super().upload_image(data, filename)
+
+
+async def test_the_manifest_survives_a_failure_mid_import(photo_root, sample_kb_dir):
+    """Обрыв на втором файле не должен терять запись о первом: иначе
+    повторный запуск зальёт его в Авито дублем."""
+    manifest_path = sample_kb_dir / ".manifest.json"
+
+    with pytest.raises(ConnectionError):
+        await import_root(
+            photo_root, dry_run=False, avito_client=FlakyAvitoClient(),
+            catalog_path=sample_kb_dir / "catalog.yaml", manifest_path=manifest_path,
+        )
+
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ids = [entry["image_id"] for zone in saved.values() for entry in zone.values()]
+    assert ids == ["fake-1"]
+
+    # Повторный запуск тот же кадр не грузит — только недостающие.
+    retry = FakeAvitoClient()
+    await import_root(
+        photo_root, dry_run=False, avito_client=retry,
+        catalog_path=sample_kb_dir / "catalog.yaml", manifest_path=manifest_path,
+    )
+    assert len(retry.uploaded) == 2          # из трёх файлов один уже в Авито

@@ -371,7 +371,7 @@ class AvitoClient:
         response = await self._request(
             spec,
             path,
-            files={ep.UPLOAD_IMAGES_FIELD: (filename, image_bytes, "image/jpeg")},
+            files={ep.UPLOAD_IMAGES_FIELD: (filename, image_bytes, image_content_type(filename))},
         )
         return response.json()
 
@@ -402,6 +402,25 @@ class AvitoClient:
         if image_id is None:
             raise ValueError(f"uploadImages вернул неожиданный ответ: {uploaded!r}")
         return await self.send_image(chat_id, image_id)
+
+
+_IMAGE_TYPES = {".png": "image/png", ".webp": "image/webp",
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+
+
+def image_content_type(filename: str) -> str:
+    """Тип файла по расширению — а не «image/jpeg» для всего подряд.
+
+    Раньше при загрузке любой файл уходил с типом image/jpeg. До первого
+    настоящего импорта (2026-09-18) это ни на что не влияло, но из 67 фото
+    комплекса почти все — PNG, есть WEBP: PNG с заголовком «это JPEG» —
+    ровно тот случай, когда площадка вправе отказать, и узнали бы мы об этом
+    посреди импорта. Неизвестное расширение — по-прежнему JPEG: так
+    пережатые копии (app/media/photo_import.py:ensure_within_limits, всегда
+    .jpg) и прежнее поведение совпадают.
+    """
+    suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _IMAGE_TYPES.get(suffix, "image/jpeg")
 
 
 def _extract_image_id(uploaded: dict) -> Optional[str]:
