@@ -43,7 +43,7 @@ ToolExecutor создаётся без booking_provider, поэтому check_av
 ответа, а не содержимое календаря.
 
 Стоимость: один ход — вызов классификатора плюс вызов диалоговой модели и
-по вызову на каждый виток инструментов. Прогон по умолчанию (8 случаев × 5
+по вызову на каждый виток инструментов. Прогон по умолчанию (9 случаев × 5
 повторов) обходится в десятки рублей.
 
 Отчёт: docs/quality/questions_probe.md (+ .json рядом).
@@ -55,6 +55,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -68,10 +69,15 @@ from app.agent.providers.deepseek_provider import BASE_URL as DEEPSEEK_BASE_URL
 from app.agent.providers.deepseek_provider import DeepSeekProvider
 from app.agent.providers.factory import default_models_for
 from app.agent.slots import asked_slots, extract_slots
+from app.agent.listing_context import ItemZoneRow
 from app.agent.tools import ToolExecutor
 from app.kb.loader import load_catalog
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Слова, за которыми в каталоге стоит несколько зон сразу: три бани, три
+# купола. Уточнить, какая именно, — не переспрос.
+CATEGORY_WORDS = re.compile(r"(?i)^(?:бан|купол|сфер)")
 REPORT_MD = ROOT / "docs" / "quality" / "questions_probe.md"
 REPORT_JSON = ROOT / "docs" / "quality" / "questions_probe.json"
 
@@ -85,7 +91,16 @@ class Case:
     why: str
     history: tuple[dict, ...] = ()
     # Ждём ли в ответе цифру про деньги. None — «неважно для этого случая».
+    #
+    # True СТАВИТСЯ ТОЛЬКО ТАМ, ГДЕ ЗАКАЗЧИК ЭТОГО ТРЕБУЕТ: известны зона и
+    # день («если известна зона и день недели — цену за час можно называть
+    # всегда»). Первый прогон 2026-09-18 ждал цифру и там, где зоны или дня
+    # нет, и честный ответ «какая зона вас интересует?» считался провалом —
+    # а назвать ставку там нечем: у бань и куполов она разная по будням и
+    # выходным, у разных зон — разная вообще.
     expect_money: Optional[bool] = None
+    # Зона объявления, с которого пришёл клиент (как `item_id` в проде).
+    listing_zone_id: Optional[str] = None
 
 
 # Случаи — из письма заказчика и из живых переписок. Каждый отвечает на
@@ -94,10 +109,17 @@ CASES: tuple[Case, ...] = (
     Case(
         id="complaint_verbatim",
         client_text="хочу арендовать 20 сентября, есть свободное время и сколько стоит?",
-        why="ДОСЛОВНО из жалобы заказчика 2026-09-18. Бот спрашивал по кругу "
-            "«на сколько часов, со скольки, 20 сентября или октября» вместо "
-            "ответа. Дата названа — переспрашивать её нельзя",
+        why="ДОСЛОВНО из жалобы заказчика 2026-09-18, но БЕЗ объявления — "
+            "как из профиля продавца. Зона неизвестна, значит ставку назвать "
+            "нечем; верный ответ — один вопрос про зону, не про дату",
+    ),
+    Case(
+        id="complaint_from_grill_listing",
+        client_text="хочу арендовать 20 сентября, есть свободное время и сколько стоит?",
+        why="Та же реплика с карточки гриль-домика — именно так она пришла "
+            "в проде. Зона и дата известны: обязана прозвучать ставка",
         expect_money=True,
+        listing_zone_id="grill_house",
     ),
     Case(
         id="date_and_guests_three_turns_back",
@@ -115,10 +137,9 @@ CASES: tuple[Case, ...] = (
     Case(
         id="price_of_a_bath_no_details",
         client_text="сколько стоит баня?",
-        why="Зона названа, даты нет. Заказчик отдельной поправкой: «если "
-            "известна зона и день недели — цену за час можно называть "
-            "всегда». Ответ без цифры здесь — провал",
-        expect_money=True,
+        why="Зона названа, дня нет. По правилу заказчика цифра обязательна, "
+            "когда известны зона И день; здесь дня нет, а будни и выходные "
+            "у бань стоят по-разному. Смотрим, что агент делает без него",
     ),
     Case(
         id="only_duration_missing",
@@ -153,12 +174,13 @@ CASES: tuple[Case, ...] = (
         id="everything_is_known",
         client_text="ну что, подойдёт?",
         why="Клиент назвал всё: зону, дату, время, длительность, гостей. "
-            "Любой уточняющий вопрос здесь — переспрос известного",
+            "Любой уточняющий вопрос здесь — переспрос известного. Цифру "
+            "не ждём: без YCLIENTS календарь отвечает unknown, и агент "
+            "честно передаёт вопрос о занятости человеку",
         history=(
             {"role": "user", "content": "баня Русский стиль, 20 сентября, с 13 до 17, нас шестеро"},
             {"role": "assistant", "content": "Здравствуйте! Секунду, посмотрю."},
         ),
-        expect_money=True,
     ),
     Case(
         id="bare_price_question",
@@ -186,20 +208,38 @@ class Attempt:
     names_money: bool = False
     tools: list[str] = field(default_factory=list)
     guard_rail: Optional[str] = None
+    # Что модель написала, когда рубеж подменил ответ. Без этого поля
+    # срабатывание рубежа в отчёте не разобрать: видна только подстановка.
+    withheld_text: Optional[str] = None
     question_guard: Optional[str] = None
     escalated: bool = False
     error: Optional[str] = None
     latency_ms: float = 0.0
 
 
+class _ListingStub:
+    """Объявление, с которого пришёл клиент, — без похода в базу."""
+
+    def __init__(self, zone_id: str):
+        self.zone_id = zone_id
+
+    async def get(self, item_id: str) -> ItemZoneRow:
+        return ItemZoneRow(zone_id=self.zone_id)
+
+
 async def run_attempt(agent: AgentLoop, kb: Any, case: Case) -> Attempt:
     executor = ToolExecutor(kb, f"probe-{case.id}")
     agent.executor_factory = lambda did, state, _ex=executor: _ex
 
+    listing: dict[str, Any] = {}
+    if case.listing_zone_id:
+        listing = {"item_id": f"probe-item-{case.listing_zone_id}",
+                   "item_lookup": _ListingStub(case.listing_zone_id)}
+
     started = time.monotonic()
     try:
         result = await agent.run_turn(
-            f"probe-{case.id}", list(case.history), case.client_text
+            f"probe-{case.id}", list(case.history), case.client_text, **listing
         )
     except Exception as exc:  # noqa: BLE001
         return Attempt(error=f"{type(exc).__name__}: {exc}",
@@ -213,7 +253,11 @@ async def run_attempt(agent: AgentLoop, kb: Any, case: Case) -> Attempt:
     # Слоты считаются ровно теми же функциями, что и в проде: замер, у
     # которого своё представление о «клиент уже назвал дату», мерил бы
     # собственную фантазию, а не поведение агента.
-    known = extract_slots(list(case.history), case.client_text)
+    listing_name = ""
+    if case.listing_zone_id:
+        zone = next((z for z in kb.catalog.zones if z.id == case.listing_zone_id), None)
+        listing_name = zone.name if zone is not None else ""
+    known = extract_slots(list(case.history), case.client_text, listing_zone=listing_name)
     previously_asked = set(asked_slots(list(case.history)))
     asked_now = set(asked_slots([{"role": "assistant", "content": untrimmed}]))
 
@@ -223,11 +267,20 @@ async def run_attempt(agent: AgentLoop, kb: Any, case: Case) -> Attempt:
         questions_before=count_questions(untrimmed),
         questions_after=count_questions(text),
         asked_in_reply=sorted(asked_now),
-        reasked_known=sorted(asked_now & set(known.known())),
+        reasked_known=sorted(
+            slot for slot in asked_now & set(known.known())
+            # «Какую баню — Русский стиль, Гараж или Рыцарскую?» после «хочу
+            # баню» — выбор внутри категории, а не переспрос: бань три, и
+            # промт прямо требует этот вопрос. Первый прогон считал его
+            # переспросом зоны.
+            if not (slot == "zone" and not known.zone_from_listing
+                    and CATEGORY_WORDS.match(known.zone))
+        ),
         repeated_own=sorted((asked_now & previously_asked) - set(known.known())),
         names_money=bool(PRICE_LIKE_WITHOUT_TOOL_CALL.search(text)),
         tools=list(result.tool_calls),
         guard_rail=result.llm_meta.get("guard_rail"),
+        withheld_text=result.llm_meta.get("withheld_text"),
         question_guard=result.llm_meta.get("question_guard"),
         escalated=result.escalated,
         latency_ms=(time.monotonic() - started) * 1000,
@@ -408,6 +461,11 @@ def render(report: dict) -> str:
                 continue
             mark = " ✂️" if attempt.get("question_guard") else ""
             lines.append(f"{i}.{mark} {(attempt['text'] or '—')[:300]}")
+            if attempt.get("guard_rail"):
+                lines.append(
+                    f"   - рубеж «{attempt['guard_rail'][:60]}», модель писала: "
+                    f"{(attempt.get('withheld_text') or '')[:300]}"
+                )
             if attempt.get("question_guard"):
                 lines.append(f"   - до рубежа: {attempt['untrimmed'][:300]}")
             if attempt["reasked_known"]:

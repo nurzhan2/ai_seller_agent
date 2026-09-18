@@ -26,7 +26,7 @@ from app.dialog_store import InMemoryDialogStore
 from app.kb.loader import load_catalog
 from app.ops.bot import OpsService
 from app.ops.state import InMemoryOpsStore, PendingReply
-from app.pipeline import MessagePipeline
+from app.pipeline import SYSTEM_MESSAGE_GREETING, MessagePipeline
 from app.pricing.concessions import ConcessionDecision, ConcessionEvent, DialogConcessionState
 from app.pricing.engine import PriceQuote
 
@@ -2262,3 +2262,198 @@ async def test_the_fallback_still_goes_to_a_fresh_chat():
 
     assert handled == ["chat-1"]
     assert avito.sent == [("chat-1", "Уточню детали и вернусь с ответом.")]
+
+
+# --------------------------------------------------------------------------
+# Системные сообщения Авито: приветствие, а не «передала менеджеру»
+# --------------------------------------------------------------------------
+#
+# Требование заказчика 2026-09-18. Форма конверта — живая, снята
+# `scripts/poll_once --chat` с двух боевых чатов: author_id=0, type="system".
+
+def _system_payload(
+    chat_id: str = "chat-1",
+    message_id: str = "msg-system-1",
+    item_id: str | None = "item-1",
+    created: int = NOW_TS,
+    author_id: str | int = 0,
+    msg_type: str | None = "system",
+    text: str = "[Системное сообщение] Пользователь создал чат, но пока ничего не написал",
+) -> dict:
+    value: dict = {
+        "id": message_id,
+        "chat_id": chat_id,
+        "author_id": author_id,
+        "content": {"text": text},
+        "created": created,
+    }
+    if msg_type is not None:
+        value["type"] = msg_type
+    if item_id is not None:
+        value["item_id"] = item_id
+    return {"payload": {"value": value}}
+
+
+async def test_a_system_message_gets_a_greeting_not_the_agent():
+    """Главный случай: клиент создал чат и молчит. Раньше текст системы
+    уходил агенту, и человек получал «передала вопрос менеджеру»."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_system_payload())
+    await _settle()
+
+    assert agent.calls == []
+    pending = await ops_service.store.get_pending("chat-1")
+    assert pending is not None
+    assert pending.text == SYSTEM_MESSAGE_GREETING
+
+
+async def test_the_system_text_is_not_saved_as_a_client_message():
+    """В истории его быть не должно: иначе модель отвечала бы на
+    «[Системное сообщение] …» как на вопрос клиента на каждом ходу."""
+    pipeline, store, agent, _ = _build()
+
+    await pipeline.handle_message(_system_payload())
+    await _settle()
+
+    incoming = [m for m in store.messages.get("chat-1", [])
+                if m["direction"] == Direction.incoming]
+    assert incoming == []
+
+
+async def test_recognised_by_the_sender_not_by_the_text():
+    """Требование заказчика: по признаку отправителя. Текст Авито может
+    поменять в любой день — ветка обязана сработать и без префикса."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_system_payload(text="Любой другой текст"))
+    await _settle()
+
+    assert agent.calls == []
+    assert (await ops_service.store.get_pending("chat-1")).text == SYSTEM_MESSAGE_GREETING
+
+
+@pytest.mark.parametrize("author_id, msg_type", [(0, None), ("0", None), ("buyer-9", "system")])
+async def test_either_sign_is_enough(author_id, msg_type):
+    """Оба признака наблюдались вместе; если Авито пришлёт один — всё равно
+    системное. Пропустить его в агента хуже, чем промолчать."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_system_payload(author_id=author_id, msg_type=msg_type))
+    await _settle()
+
+    assert agent.calls == []
+
+
+async def test_a_client_message_with_the_system_prefix_still_goes_to_the_agent():
+    """Обратная сторона: живой человек, написавший «[Системное сообщение]»,
+    — клиент. Текст не признак."""
+    pipeline, store, agent, _ = _build()
+
+    await pipeline.handle_message(_payload(text="[Системное сообщение] шучу, сколько стоит баня?"))
+    await _settle()
+
+    assert len(agent.calls) == 1
+
+
+async def test_two_system_messages_in_a_row_greet_once():
+    """Боевой чат вакансии: два системных сообщения с разницей в секунду."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_system_payload(message_id="s-1"))
+    await pipeline.handle_message(_system_payload(message_id="s-2"))
+    await _settle()
+
+    greetings = [m for m in store.messages.get("chat-1", [])
+                 if m["direction"] == Direction.outgoing and m["text"] == SYSTEM_MESSAGE_GREETING]
+    assert len(greetings) == 1
+
+
+async def test_two_system_messages_arriving_at_once_greet_once():
+    """То же, но конкурентно: между проверкой истории и записью приветствия
+    лежит пауза доставки, и без отметки «уже здороваюсь» оба прошли бы."""
+    pipeline, store, agent, ops_service = _build()
+
+    await asyncio.gather(
+        pipeline.handle_message(_system_payload(message_id="s-1")),
+        pipeline.handle_message(_system_payload(message_id="s-2")),
+    )
+    await _settle()
+
+    greetings = [m for m in store.messages.get("chat-1", [])
+                 if m["direction"] == Direction.outgoing and m["text"] == SYSTEM_MESSAGE_GREETING]
+    assert len(greetings) == 1
+
+
+async def test_no_greeting_in_the_middle_of_a_conversation():
+    """«Посмотрел номер» после живой переписки — представляться посреди
+    беседы нелепо."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_payload(message_id="m-1", text="сколько стоит баня?"))
+    await _settle()
+
+    await pipeline.handle_message(_system_payload(message_id="s-1"))
+    await _settle()
+
+    texts = [m["text"] for m in store.messages.get("chat-1", [])]
+    assert SYSTEM_MESSAGE_GREETING not in texts
+
+
+async def test_the_greeting_respects_a_human_takeover():
+    store = InMemoryDialogStore()
+    pipeline, store, agent, ops_service = _build(store=store)
+    await store.get_or_create_chat("chat-1")
+    await _take_over(ops_service, store)
+
+    await pipeline.handle_message(_system_payload())
+    await _settle()
+
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_an_old_system_message_gets_no_greeting():
+    """Тот же порог AGENT_MIN_INBOUND_TS, что и у всего остального."""
+    pipeline, store, agent, ops_service = _build()
+
+    await pipeline.handle_message(_system_payload(created=NOW_TS - 7200))
+    await _settle()
+
+    assert await ops_service.store.get_pending("chat-1") is None
+
+
+async def test_a_system_message_on_a_blocked_listing_gets_nothing():
+    """Отклики на вакансию — тоже системные сообщения. Их останавливает
+    фильтр объявлений: соискателю не отвечает администратор бани."""
+    settings = _settings(avito_blocked_items=["item-vacancy"])
+    pipeline, store, agent, ops_service = _build(settings=settings)
+
+    await pipeline.handle_message(_system_payload(item_id="item-vacancy"))
+    await _settle()
+
+    assert await ops_service.store.get_pending("chat-1") is None
+    assert "chat-1" not in store.chats
+
+
+async def test_the_greeting_goes_out_for_real_when_live():
+    """Живой режим: приветствие уходит в Авито тем же путём, что и ответ."""
+    avito = _FakeAvito()
+    pipeline, store, agent, ops_service = _build(
+        settings=_settings(dry_run=False, moderation_mode="off"), avito=avito,
+    )
+
+    await pipeline.handle_message(_system_payload())
+    await _settle()
+
+    assert avito.sent == [("chat-1", SYSTEM_MESSAGE_GREETING)]
+
+
+def test_the_greeting_follows_the_same_rules_as_the_agent():
+    """Один вопрос, без обещаний вернуться, без рассказа о себе как о боте."""
+    from app.agent.loop import PROMISE_TO_RETURN, SELF_DISCLOSURE
+    from app.agent.one_question import count_questions
+
+    assert count_questions(SYSTEM_MESSAGE_GREETING) == 1
+    assert not PROMISE_TO_RETURN.search(SYSTEM_MESSAGE_GREETING)
+    assert not SELF_DISCLOSURE.search(SYSTEM_MESSAGE_GREETING)
+    assert "Иришка" in SYSTEM_MESSAGE_GREETING

@@ -114,6 +114,8 @@ class DialogStore(Protocol):
 
     async def last_incoming_at(self, chat_id: str) -> Optional[datetime]: ...
 
+    async def has_any_messages(self, chat_id: str) -> bool: ...
+
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None: ...
@@ -289,6 +291,9 @@ class InMemoryDialogStore:
             if m["direction"] == Direction.outgoing and m["author"] == Author.agent
         ][-ECHO_LOOKBACK:]
         return any((m["text"] or "").strip() == normalized for m in recent)
+
+    async def has_any_messages(self, chat_id: str) -> bool:
+        return bool(self.messages.get(chat_id))
 
     async def last_incoming_at(self, chat_id: str) -> Optional[datetime]:
         stamps = [
@@ -612,6 +617,27 @@ class SqlAlchemyDialogStore:
             ).scalars().all()
 
         return any((row or "").strip() == normalized for row in rows)
+
+    async def has_any_messages(self, chat_id: str) -> bool:
+        """Есть ли в этом чате хоть одно сообщение — чьё угодно.
+
+        Нужен приветствию на системное сообщение Авито (см. app/pipeline.py:
+        `_handle_system_message`): здороваться можно только в чате, где
+        разговора ещё не было. Системных сообщений в `messages` нет — они не
+        пишутся в историю намеренно, — поэтому два системных подряд («создал
+        чат», потом «посмотрел номер») второй раз не поздороваются: после
+        первого приветствия здесь уже лежит наше исходящее.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Message
+
+        async with self._session_factory() as session:
+            return (
+                await session.execute(
+                    select(Message.id).where(Message.chat_id == chat_id).limit(1)
+                )
+            ).scalar_one_or_none() is not None
 
     async def last_incoming_at(self, chat_id: str) -> Optional[datetime]:
         """Когда клиент писал в этот чат в последний раз.

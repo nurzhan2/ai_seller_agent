@@ -86,6 +86,7 @@ TAKEOVER = "перехват"
 ONE_QUESTION = "один-вопрос"
 SLOTS = "слоты"
 RATE_HINT = "тариф-без-итога"
+SYSTEM_MSG = "системные-сообщения"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -423,6 +424,28 @@ MUTATIONS: tuple[Mutation, ...] = (
              "    for field_name in list(fields) + list(_ASK_ORDER):\n        if field_name in fields and False:",
              "tests/test_pricing.py",
              "движок снова не спрашивает ничего внятного"),
+
+    # -- системные сообщения Авито ------------------------------------------
+    Mutation(SYSTEM_MSG, "app/pipeline.py",
+             "        if is_system_message(payload):",
+             "        if False and is_system_message(payload):",
+             "tests/test_pipeline.py",
+             "системное сообщение снова уходит агенту как реплика клиента"),
+    Mutation(SYSTEM_MSG, "app/channels/avito_payloads.py",
+             "    if extract_author_id(payload) == SYSTEM_AUTHOR_ID:\n        return True",
+             "    pass",
+             "tests/test_pipeline.py",
+             "системный отправитель без type=system больше не опознаётся"),
+    Mutation(SYSTEM_MSG, "app/pipeline.py",
+             "            if talked_before:",
+             "            if False:",
+             "tests/test_pipeline.py",
+             "приветствие посреди живого разговора"),
+    Mutation(SYSTEM_MSG, "app/pipeline.py",
+             "        if chat_id in self._greeting_in_flight:\n            return",
+             "        if False:\n            return",
+             "tests/test_pipeline.py",
+             "два системных одновременно — два приветствия"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

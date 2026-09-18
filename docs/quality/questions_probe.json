@@ -1,0 +1,860 @@
+{
+  "provider": "deepseek",
+  "model": "deepseek-v4-pro",
+  "repeats": 5,
+  "cases": [
+    {
+      "id": "complaint_verbatim",
+      "client_text": "хочу арендовать 20 сентября, есть свободное время и сколько стоит?",
+      "why": "ДОСЛОВНО из жалобы заказчика 2026-09-18. Бот спрашивал по кругу «на сколько часов, со скольки, 20 сентября или октября» вместо ответа. Дата названа — переспрашивать её нельзя",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 22125.0
+        },
+        {
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 28952.99999999952
+        },
+        {
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "resolve_date"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 20313.000000000102
+        },
+        {
+          "text": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "resolve_date"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 21092.999999999847
+        },
+        {
+          "text": "Здравствуйте! Вопрос по свободному времени на 20 сентября у менеджера — он уточнит занятость. Напишите, если нужно что-то ещё!",
+          "untrimmed": "Здравствуйте! Вопрос по свободному времени на 20 сентября у менеджера — он уточнит занятость. Напишите, если нужно что-то ещё!",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 22641.00000000053
+        }
+      ]
+    },
+    {
+      "id": "date_and_guests_three_turns_back",
+      "client_text": "а цена какая?",
+      "why": "Главная форма жалобы: дата и число гостей названы тремя репликами раньше. Ни то, ни другое спрашивать заново нельзя",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "",
+          "untrimmed": "",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": "APITimeoutError: Request timed out or interrupted. This could be due to a network timeout, dropped connection, or request cancellation. See https://docs.anthropic.com/en/api/errors#long-requests for more details.",
+          "latency_ms": 16186.999999999898
+        },
+        {
+          "text": "В выходные пакет «весь день» не действует — бронируем почасово. Тариф на 20 сентября: 2000 ₽/час, минимум 3 часа. На сколько часов вам удобно?",
+          "untrimmed": "В выходные пакет «весь день» не действует — бронируем почасово. Тариф на 20 сентября: 2000 ₽/час, минимум 3 часа. На сколько часов вам удобно?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [
+            "hours"
+          ],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6094.000000000051
+        },
+        {
+          "text": "20 сентября — воскресенье, поэтому пакет «весь день» не действует, бронь идёт почасово: выходной тариф 2000 ₽/час, минимум 3 часа. На сколько часов вас ждать?",
+          "untrimmed": "20 сентября — воскресенье, поэтому пакет «весь день» не действует, бронь идёт почасово: выходной тариф 2000 ₽/час, минимум 3 часа. На сколько часов вас ждать?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [
+            "hours"
+          ],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 8344.000000000051
+        },
+        {
+          "text": "20 сентября — воскресенье, в этот день действует тариф 2000 ₽/час, минимум 3 часа. Во сколько вас ждать, и на сколько часов?",
+          "untrimmed": "20 сентября — воскресенье, в этот день действует тариф 2000 ₽/час, минимум 3 часа. Во сколько вас ждать, и на сколько часов?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "guests",
+            "hours",
+            "start_time"
+          ],
+          "reasked_known": [
+            "guests"
+          ],
+          "repeated_own": [
+            "hours"
+          ],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5250.0
+        },
+        {
+          "text": "20 сентября — воскресенье, выходной тариф у гриль-домика 2000 ₽/час, минимум 3 часа. Во сколько планируете начать?",
+          "untrimmed": "20 сентября — воскресенье, выходной тариф у гриль-домика 2000 ₽/час, минимум 3 часа. Во сколько планируете начать?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "start_time"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5905.999999999949
+        }
+      ]
+    },
+    {
+      "id": "price_of_a_bath_no_details",
+      "client_text": "сколько стоит баня?",
+      "why": "Зона названа, даты нет. Заказчик отдельной поправкой: «если известна зона и день недели — цену за час можно называть всегда». Ответ без цифры здесь — провал",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "Здравствуйте! Меня зовут Иришка. У нас три бани: «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6, уютнее для 4–6 гостей). Все с купелью, мангалом и кухней. Какая вам больше по душе?",
+          "untrimmed": "Здравствуйте! Меня зовут Иришка. У нас три бани: «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6, уютнее для 4–6 гостей). Все с купелью, мангалом и кухней. Какая вам больше по душе?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 7827.99999999952
+        },
+        {
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». У нас три бани: «Русский стиль» (до 12 чел.), «Гараж» (до 10 чел.) и камерная «Рыцарская» (до 6 чел.). Какая вас интересует?",
+          "untrimmed": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». У нас три бани: «Русский стиль» (до 12 чел.), «Гараж» (до 10 чел.) и камерная «Рыцарская» (до 6 чел.). Какая вас интересует?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6125.0
+        },
+        {
+          "text": "Здравствуйте! У нас три бани — «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6). Тариф выходного дня 3500 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "untrimmed": "Здравствуйте! У нас три бани — «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6). Тариф выходного дня 3500 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6282.000000000153
+        },
+        {
+          "text": "Здравствуйте! У нас три бани: «Русский стиль» и «Гараж» — до 10–12 человек, и камерная «Рыцарская» — комфортно на 4–6 гостей. Какая вас интересует?",
+          "untrimmed": "Здравствуйте! У нас три бани: «Русский стиль» и «Гараж» — до 10–12 человек, и камерная «Рыцарская» — комфортно на 4–6 гостей. Какая вас интересует?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 4625.0
+        },
+        {
+          "text": "Здравствуйте! У нас три бани: «Русский стиль» и «Гараж» (до 10–12 человек) и камерная «Рыцарская» (до 6 гостей) — во всех входят дрова, купель и мангал.\n\nНа какую дату планируете и на сколько человек? По ней подскажу точную цену.",
+          "untrimmed": "Здравствуйте! У нас три бани: «Русский стиль» и «Гараж» (до 10–12 человек) и камерная «Рыцарская» (до 6 гостей) — во всех входят дрова, купель и мангал.\n\nНа какую дату планируете и на сколько человек? По ней подскажу точную цену.",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "date",
+            "guests"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "get_zones"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6561.999999999898
+        }
+      ]
+    },
+    {
+      "id": "only_duration_missing",
+      "client_text": "а сколько это будет стоить?",
+      "why": "Не хватает ровно длительности. Требование дословно: «назови цену за час и минимум, а не молчи про деньги»",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "20 сентября — выходной тариф: 3500 ₽/час, минимум 3 часа. Это действует для всех трёх бань: «Русский стиль» и «Гараж» до 10 человек, «Рыцарская» до 6.\n\nКомпанией из шестерых вам подойдёт любая. На сколько часов планируете?",
+          "untrimmed": "20 сентября — выходной тариф: 3500 ₽/час, минимум 3 часа. Это действует для всех трёх бань: «Русский стиль» и «Гараж» до 10 человек, «Рыцарская» до 6.\n\nКомпанией из шестерых вам подойдёт любая. На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "resolve_date",
+            "calculate_price",
+            "calculate_price",
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 10516.000000000531
+        },
+        {
+          "text": "Все три бани в выходной (20 сентября — воскресенье) идут по 3500 ₽/час, минимум 3 часа. Подскажите, пожалуйста, на сколько часов планируете?",
+          "untrimmed": "Все три бани в выходной (20 сентября — воскресенье) идут по 3500 ₽/час, минимум 3 часа. Подскажите, пожалуйста, на сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "get_zones",
+            "calculate_price",
+            "calculate_price",
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 9139.999999999418
+        },
+        {
+          "text": "20 сентября — выходной день, тариф у всех бань 3500 ₽/час, минимум 3 часа.\n\nНа сколько часов планируете?",
+          "untrimmed": "20 сентября — выходной день, тариф у всех бань 3500 ₽/час, минимум 3 часа.\n\nНа сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "resolve_date",
+            "get_zones",
+            "calculate_price",
+            "calculate_price",
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 13110.000000000582
+        },
+        {
+          "text": "Мне нужно уточнить, какая баня вас интересует — «Русский стиль», «Гараж» или «Рыцарская»? От этого зависит цена.",
+          "untrimmed": "Мне нужно уточнить, какая баня вас интересует — «Русский стиль», «Гараж» или «Рыцарская»? От этого зависит цена.",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3046.9999999995707
+        },
+        {
+          "text": "Выходной тариф 3500 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "untrimmed": "Выходной тариф 3500 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "resolve_date",
+            "get_zones",
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 10546.000000000276
+        }
+      ]
+    },
+    {
+      "id": "grill_house_on_a_weekend",
+      "client_text": "гриль-домик в субботу сколько будет стоить?",
+      "why": "Расчёт возвращает invalid (пакет «весь день» только пн-чт). До правки клиент не получал НИ ОДНОЙ цифры — только объяснение про пакет",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "Здравствуйте! Гриль-домик в субботу — пакет «весь день» по будням не действует, поэтому выходной тариф: 2000 ₽/час, минимально 3 часа. На сколько часов планируете аренду?",
+          "untrimmed": "Здравствуйте! Гриль-домик в субботу — пакет «весь день» по будням не действует, поэтому выходной тариф: 2000 ₽/час, минимально 3 часа. На сколько часов планируете аренду?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6578.9999999997235
+        },
+        {
+          "text": "Подскажите, пожалуйста, на какое число планируете отдых?",
+          "untrimmed": "Подскажите, пожалуйста, на какое число планируете отдых?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "date"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": "занятость без вызова check_availability/find_next_available (последний рубеж)",
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5155.999999999949
+        },
+        {
+          "text": "Здравствуйте! В субботу гриль-домик арендуется почасово: тариф 2000 ₽/час, минимум 3 часа (пакет «весь день» действует только в будни). На сколько часов планируете?",
+          "untrimmed": "Здравствуйте! В субботу гриль-домик арендуется почасово: тариф 2000 ₽/час, минимум 3 часа (пакет «весь день» действует только в будни). На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5530.999999999949
+        },
+        {
+          "text": "Здравствуйте! В субботу гриль-домик бронируем по часам: выходной тариф 2000 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "untrimmed": "Здравствуйте! В субботу гриль-домик бронируем по часам: выходной тариф 2000 ₽/час, минимум 3 часа. На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5859.000000000378
+        },
+        {
+          "text": "Здравствуйте! В субботу гриль-домик — это выходной тариф 2000 ₽/час, минимальное бронирование 3 часа. На сколько часов планируете?",
+          "untrimmed": "Здравствуйте! В субботу гриль-домик — это выходной тариф 2000 ₽/час, минимальное бронирование 3 часа. На сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": true,
+          "tools": [
+            "calculate_price"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5390.999999999622
+        }
+      ]
+    },
+    {
+      "id": "client_ignored_the_question",
+      "client_text": "а у вас есть где детям поиграть?",
+      "why": "Клиент не ответил на вопрос про гостей и спросил своё. Повторять тот же вопрос нельзя — надо ответить на его",
+      "expect_money": null,
+      "attempts": [
+        {
+          "text": "Подскажите, пожалуйста, на сколько часов планируете?",
+          "untrimmed": "Подскажите, пожалуйста, на сколько часов планируете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "hours"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "answer_from_kb"
+          ],
+          "guard_rail": "занятость без вызова check_availability/find_next_available (последний рубеж)",
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 6141.000000000531
+        },
+        {
+          "text": "Да, на территории есть детская площадка — деткам будет где поиграть. ☀️\n\nНа какую баню рассчитываете — «Русский стиль», «Гараж» или «Рыцарскую»?",
+          "untrimmed": "Да, на территории есть детская площадка — деткам будет где поиграть. ☀️\n\nНа какую баню рассчитываете — «Русский стиль», «Гараж» или «Рыцарскую»?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [
+            "zone"
+          ],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "answer_from_kb"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5671.999999999571
+        },
+        {
+          "text": "Да, на территории есть детская площадка — дети смогут поиграть, пока вы отдыхаете.\n\nУ нас три бани: «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6). Все с купелью, дровами и мангалом. Какая из них вам больше по душе?",
+          "untrimmed": "Да, на территории есть детская площадка — дети смогут поиграть, пока вы отдыхаете.\n\nУ нас три бани: «Русский стиль» и «Гараж» (до 10 человек) и «Рыцарская» (до 6). Все с купелью, дровами и мангалом. Какая из них вам больше по душе?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3625.0
+        },
+        {
+          "text": "У нас есть детская площадка на территории — детям будет где побегать! ☀️ А на какое количество гостей рассчитываете?",
+          "untrimmed": "У нас есть детская площадка на территории — детям будет где побегать! ☀️ А на какое количество гостей рассчитываете?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "guests"
+          ],
+          "reasked_known": [],
+          "repeated_own": [
+            "guests"
+          ],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3265.9999999996217
+        },
+        {
+          "text": "Да, на территории есть детская площадка — детям будет где побегать, пока баня топится. ☀️\n\nПо баням у нас три на выбор: «Русский стиль» и «Гараж» — до 10–12 человек, «Рыцарская» — камерная, до 6. Что вам ближе по размеру компании?",
+          "untrimmed": "Да, на территории есть детская площадка — детям будет где побегать, пока баня топится. ☀️\n\nПо баням у нас три на выбор: «Русский стиль» и «Гараж» — до 10–12 человек, «Рыцарская» — камерная, до 6. Что вам ближе по размеру компании?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "answer_from_kb"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 5797.00000000048
+        }
+      ]
+    },
+    {
+      "id": "everything_is_known",
+      "client_text": "ну что, подойдёт?",
+      "why": "Клиент назвал всё: зону, дату, время, длительность, гостей. Любой уточняющий вопрос здесь — переспрос известного",
+      "expect_money": true,
+      "attempts": [
+        {
+          "text": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "untrimmed": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 858.9999999994689
+        },
+        {
+          "text": "Баня «Русский стиль» на 20 сентября с 13:00 до 17:00 — этот вопрос уточняет менеджер, я передала ему информацию. Напишите, если нужно что-то ещё.",
+          "untrimmed": "Баня «Русский стиль» на 20 сентября с 13:00 до 17:00 — этот вопрос уточняет менеджер, я передала ему информацию. Напишите, если нужно что-то ещё.",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "resolve_date",
+            "get_zones",
+            "check_availability",
+            "calculate_price",
+            "escalate_to_human"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 11655.999999999949
+        },
+        {
+          "text": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "untrimmed": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 953.0000000004293
+        },
+        {
+          "text": "Сейчас не могу точно подтвердить свободное время на 20 сентября — передала этот вопрос менеджеру. Напишите, если нужно что-то ещё! 🌸",
+          "untrimmed": "Сейчас не могу точно подтвердить свободное время на 20 сентября — передала этот вопрос менеджеру. Напишите, если нужно что-то ещё! 🌸",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [
+            "check_availability",
+            "escalate_to_human"
+          ],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 7828.9999999997235
+        },
+        {
+          "text": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "untrimmed": "Передала вопрос менеджеру — напишите, если нужно что-то ещё.",
+          "questions_before": 0,
+          "questions_after": 0,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": true,
+          "error": null,
+          "latency_ms": 655.9999999999491
+        }
+      ]
+    },
+    {
+      "id": "bare_price_question",
+      "client_text": "а цена какая?",
+      "why": "Ни зоны, ни даты — тот самый случай, который в замере 2026-09-02 дал 18% анкетных ответов при принуждении инструмента. Один вопрос, не три",
+      "expect_money": null,
+      "attempts": [
+        {
+          "text": "Здравствуйте! Я Иришка, администратор «ПарМангала». Подскажите, что вас интересует — баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Я Иришка, администратор «ПарМангала». Подскажите, что вас интересует — баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2969.000000000051
+        },
+        {
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2765.0000000003274
+        },
+        {
+          "text": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, на что смотрите — баню, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Меня зовут Иришка, администратор «ПарМангала». Подскажите, на что смотрите — баню, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3530.999999999949
+        },
+        {
+          "text": "Здравствуйте! У нас есть бани, купола, гриль-домик, шатёр и домик для отдыха. Что вас интересует?",
+          "untrimmed": "Здравствуйте! У нас есть бани, купола, гриль-домик, шатёр и домик для отдыха. Что вас интересует?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 3203.9999999997235
+        },
+        {
+          "text": "Здравствуйте! Меня зовут Иришка, администратор комплекса «ПарМангал». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "untrimmed": "Здравствуйте! Меня зовут Иришка, администратор комплекса «ПарМангал». Подскажите, что вас интересует: баня, купол, гриль-домик или шатёр?",
+          "questions_before": 1,
+          "questions_after": 1,
+          "asked_in_reply": [
+            "zone"
+          ],
+          "reasked_known": [],
+          "repeated_own": [],
+          "names_money": false,
+          "tools": [],
+          "guard_rail": null,
+          "question_guard": null,
+          "escalated": false,
+          "error": null,
+          "latency_ms": 2436.999999999898
+        }
+      ]
+    }
+  ]
+}

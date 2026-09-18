@@ -126,6 +126,7 @@ from app.channels.avito_payloads import (
     extract_text,
     is_image_message,
     is_outgoing_echo,
+    is_system_message,
 )
 from app.channels import inbound_dedup as dedup
 from app.channels.outbound_gate import is_listing_allowed
@@ -153,6 +154,26 @@ logger = logging.getLogger("parmangal.pipeline")
 IMAGE_WITHOUT_TEXT_REPLY = (
     "Вижу фото, но пока не могу его посмотреть — опишите, пожалуйста, "
     "что вас интересует, и я отвечу."
+)
+
+# Ответ на системное сообщение Авито («пользователь создал чат, но пока
+# ничего не написал», «посмотрел номер из объявления»). Требование заказчика
+# 2026-09-18: поздороваться, представиться, предложить помощь, спросить, что
+# интересует. До этого текст системы уходил в агента как реплика клиента, и
+# клиент, не написавший ни слова, получал «передала вопрос менеджеру».
+#
+# ШАБЛОН, А НЕ ХОД МОДЕЛИ, и один на все виды системных сообщений. Различить
+# «создал чат» и «посмотрел номер» можно только по тексту, а текст Авито —
+# оформление, на которое опираться нельзя (см. is_system_message). Модели же
+# здесь нечего отвечать: клиент ничего не спросил.
+#
+# Один вопрос, без обещаний вернуться и без «я бот» — те же правила, что у
+# ответа модели; держится тестами в tests/test_one_question.py и
+# tests/test_pipeline.py.
+SYSTEM_MESSAGE_GREETING = (
+    "Здравствуйте! Меня зовут Иришка, я администратор загородного комплекса "
+    "«ПарМангал». С радостью помогу подобрать баню или зону для отдыха — "
+    "подскажите, что вас интересует?"
 )
 
 
@@ -214,6 +235,9 @@ class MessagePipeline:
             else settings.debounce_window_seconds
         )
         self.debouncer = Debouncer(window_seconds=window, handler=self._on_debounce_flush)
+        # Чаты, приветствие в которые сейчас отправляется. См.
+        # `_handle_system_message` — защита от двух системных сообщений подряд.
+        self._greeting_in_flight: set[str] = set()
 
     # -- шаг 1-6: приём входящего ------------------------------------------
 
@@ -365,6 +389,21 @@ class MessagePipeline:
             # Ничего не сохраняем и не создаём: диалога по чужому объявлению
             # у нас быть не должно вообще — ни в базе, ни в карточках
             # оператора. Возврат ДО get_or_create_chat именно поэтому.
+            return
+
+        if is_system_message(payload):
+            # ДО сохранения в историю и до агента. Системное сообщение — не
+            # реплика клиента: записанное в `messages` как входящее, оно
+            # уходило бы модели историей на каждом следующем ходу, и та
+            # отвечала бы на «[Системное сообщение] Пользователь посмотрел
+            # номер» как на вопрос. Ровно так и получалось «передала вопрос
+            # менеджеру» человеку, который не написал ни слова.
+            #
+            # Фильтр объявлений выше уже отработал: отклики на вакансию —
+            # тоже системные сообщения, и приветствовать соискателя от лица
+            # администратора бани нельзя. Их останавливает deny, а не эта
+            # ветка.
+            await self._handle_system_message(chat_id, item_id, too_old=too_old)
             return
 
         text = (extract_text(payload) or "").strip()
@@ -678,6 +717,79 @@ class MessagePipeline:
             return
         result = TurnResult(text=IMAGE_WITHOUT_TEXT_REPLY)
         await self._deliver(chat, result, client_text="[фото]", gate=None, fallback_text=None)
+
+    async def _handle_system_message(
+        self, chat_id: str, item_id: Optional[str], *, too_old: bool
+    ) -> None:
+        """Приветствие на системное сообщение Авито — один раз на чат.
+
+        Здороваемся ТОЛЬКО в чате без единого сообщения в нашей базе. Это
+        закрывает сразу три случая:
+          * два системных подряд (в боевом чате вакансии их пришло два с
+            разницей в секунду) — второе видит наше приветствие и молчит;
+          * системное в живом разговоре («посмотрел номер» после десяти
+            реплик) — представляться посреди беседы нелепо;
+          * повторная доставка того же события поллером или вебхуком.
+
+        Чат, начатый до запуска бота, нашей базе неизвестен и получит
+        приветствие, как новый. Это сознательно: системное сообщение само
+        свежее (порог возраста его пропустил), то есть человек активен
+        сейчас, а живой менеджер, если он в чате, остановит нас правилом
+        перехвата в `should_agent_reply`.
+        """
+        if too_old:
+            logger.info(
+                "pipeline: системное сообщение старше AGENT_MIN_INBOUND_TS — "
+                "без приветствия",
+                extra={"chat_id": chat_id},
+            )
+            return
+
+        # Отметка ДО первого await. Между проверкой «сообщений ещё нет» и
+        # записью приветствия в базу лежит человеческая пауза `_deliver`, и
+        # второе системное сообщение того же чата проскочило бы проверку.
+        # В asyncio проверка и добавление без await между ними атомарны.
+        if chat_id in self._greeting_in_flight:
+            return
+        self._greeting_in_flight.add(chat_id)
+        try:
+            try:
+                talked_before = await self.store.has_any_messages(chat_id)
+            except Exception:
+                # Не знаем, был ли разговор, — молчим. Лишнее «Здравствуйте,
+                # меня зовут Иришка» посреди беседы хуже пропущенного.
+                logger.exception(
+                    "pipeline: не удалось проверить историю чата для приветствия",
+                    extra={"chat_id": chat_id},
+                )
+                return
+            if talked_before:
+                logger.info(
+                    "pipeline: системное сообщение в чате с историей — без приветствия",
+                    extra={"chat_id": chat_id},
+                )
+                return
+
+            allowed, reason = await self.ops_service.should_agent_reply(chat_id)
+            if not allowed:
+                logger.info(
+                    "pipeline: agent stays silent on system message",
+                    extra={"chat_id": chat_id, "reason": reason},
+                )
+                return
+
+            logger.info(
+                "pipeline: системное сообщение Авито — приветствие",
+                extra={"chat_id": chat_id},
+            )
+            chat = await self.store.get_or_create_chat(chat_id, item_id=item_id)
+            await self._deliver(
+                chat, TurnResult(text=SYSTEM_MESSAGE_GREETING),
+                client_text="[системное сообщение Авито]",
+                gate=None, fallback_text=None,
+            )
+        finally:
+            self._greeting_in_flight.discard(chat_id)
 
     # -- шаг 7-10: ход агента ----------------------------------------------
 

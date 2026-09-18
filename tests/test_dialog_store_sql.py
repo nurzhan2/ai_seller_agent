@@ -372,3 +372,20 @@ async def test_item_zone_lookup_returns_row_or_none(store):
     assert await store.get("item-1") == ItemZoneRow(zone_id="tent", category=None)
     assert await store.get("item-2") == ItemZoneRow(zone_id=None, category="bath")
     assert await store.get("item-unknown") is None
+
+
+async def test_has_any_messages_sees_both_directions_and_only_this_chat(store):
+    """Приветствие на системное сообщение Авито опирается на этот ответ:
+    здороваться можно только в чате без единого сообщения (app/pipeline.py:
+    _handle_system_message)."""
+    await store.get_or_create_chat("c-empty")
+    await store.get_or_create_chat("c-in")
+    await store.get_or_create_chat("c-out")
+
+    await store.save_incoming("c-in", "здравствуйте", avito_message_id="m-1")
+    await store.save_outgoing("c-out", "Здравствуйте!", SendStatus.sent)
+
+    assert await store.has_any_messages("c-empty") is False
+    assert await store.has_any_messages("c-in") is True
+    assert await store.has_any_messages("c-out") is True
+    assert await store.has_any_messages("c-unknown") is False
