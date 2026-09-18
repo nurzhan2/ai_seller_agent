@@ -491,7 +491,9 @@ def render(report: dict) -> str:
                 lines.append(f"{i}. ⚠️ {attempt['error']}")
                 continue
             mark = " ✂️" if attempt.get("question_guard") else ""
-            lines.append(f"{i}.{mark} {(attempt['text'] or '—')[:300]}")
+            # Переносы строк — в « / »: иначе ответ из двух абзацев рвёт
+            # нумерованный список, и в отчёте виден только первый абзац.
+            lines.append(f"{i}.{mark} {(attempt['text'] or '—')[:400].replace(chr(10), ' / ')}")
             if attempt.get("guard_rail"):
                 lines.append(
                     f"   - рубеж «{attempt['guard_rail'][:60]}», модель писала: "

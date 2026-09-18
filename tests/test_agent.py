@@ -2946,6 +2946,8 @@ async def test_a_real_tool_with_string_arguments_still_runs(kb):
     "Да, на территории есть детская площадка — детям будет чем заняться, "
     "пока взрослые парятся.",
     "Для детей много занятий на территории.",
+    # Третий прогон замера: инфинитив совершенного вида.
+    "Да, на территории есть детская площадка — будет чем занять ребят!",
 ])
 def test_occupying_yourself_is_not_a_calendar_claim(text):
     assert availability_claim(text) is False
