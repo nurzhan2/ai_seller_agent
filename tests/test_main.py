@@ -393,14 +393,24 @@ def test_startup_warns_that_auto_booking_is_disabled(monkeypatch):
     assert "проверка оплаты" in text
 
 
-def test_startup_warns_that_auto_booking_is_enabled(monkeypatch):
-    """Включённое автобронирование — не «всё в порядке», а состояние, в
-    котором бронь ставится без проверки оплаты. Тоже WARNING, не info."""
+def test_startup_says_a_switched_on_flag_is_blocked_and_why(monkeypatch):
+    """Флаг включён, но переключатель заблокирован (app/booking/readiness.py):
+    лог обязан сказать, что брони НЕ ставятся, и назвать причины. Прежде
+    здесь было «ставит брони БЕЗ проверки оплаты» — и так оно и работало."""
     _without_payment_handoff(monkeypatch)
     text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "true"})
 
     assert "AUTO_BOOKING_ENABLED=true" in text
-    assert "БЕЗ проверки оплаты" in text
+    assert "НЕ ГОТОВО" in text
+    assert "предоплата" in text
+
+
+def test_startup_says_booking_is_on_only_when_everything_is_ready(monkeypatch):
+    _without_payment_handoff(monkeypatch)
+    monkeypatch.setattr("app.main.auto_booking_blockers", lambda kb: [])
+    text = _startup_log(monkeypatch, {"AUTO_BOOKING_ENABLED": "true"})
+
+    assert "агент ставит брони в YCLIENTS САМ" in text
 
 
 # --------------------------------------------------------------------------

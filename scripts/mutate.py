@@ -305,8 +305,8 @@ MUTATIONS: tuple[Mutation, ...] = (
 
     # -- рубеж суммы --------------------------------------------------------
     Mutation(AMOUNT, "app/agent/loop.py",
-             "        if final_text and tool_calls:\n            invented = invented_amounts(final_text, allowed_amounts)",
-             "        if False:\n            invented = invented_amounts(final_text, allowed_amounts)",
+             "        if final_text and tool_calls:\n            invented = invented_amounts(final_text, allowed_amounts | repeatable)",
+             "        if False:\n            invented = invented_amounts(final_text, allowed_amounts | repeatable)",
              "tests/test_agent.py",
              "рубеж суммы выключен целиком"),
     Mutation(AMOUNT, "app/agent/loop.py",
