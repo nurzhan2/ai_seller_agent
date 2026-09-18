@@ -87,6 +87,8 @@ ONE_QUESTION = "один-вопрос"
 SLOTS = "слоты"
 RATE_HINT = "тариф-без-итога"
 SYSTEM_MSG = "системные-сообщения"
+CLASSIFIER = "классификатор"
+WEEKDAY = "день-недели"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -446,6 +448,40 @@ MUTATIONS: tuple[Mutation, ...] = (
              "        if False:\n            return",
              "tests/test_pipeline.py",
              "два системных одновременно — два приветствия"),
+
+    # -- подтверждение клиента — не просьба о человеке -----------------------
+    Mutation(CLASSIFIER, "app/agent/loop.py",
+             "        if classification == \"human\" and not asks_for_a_human(user_text):",
+             "        if False:",
+             "tests/test_agent.py",
+             "«ок» с меткой human снова уводит готового клиента к оператору"),
+    Mutation(CLASSIFIER, "app/agent/loop.py",
+             "        classification = await self.classify(user_text, previous_agent_text)",
+             "        classification = await self.classify(user_text)",
+             "tests/test_agent.py",
+             "классификатор снова не видит, на что отвечает клиент"),
+    Mutation(CLASSIFIER, "app/agent/loop.py",
+             "    r\"\\bс\\s+(?:живым\\s+|реальным\\s+|нормальным\\s+)?человеком\\b|\"",
+             "    r\"\\bчеловек\\w*|\"",
+             "tests/test_agent.py",
+             "«нас 6 человек» снова считается просьбой позвать человека"),
+
+    # -- день недели ---------------------------------------------------------
+    Mutation(WEEKDAY, "app/agent/loop.py",
+             "                    or weekday_contradicts_date(final_text, now)",
+             "                    or None",
+             "tests/test_agent.py",
+             "«20 сентября — суббота» снова уходит клиенту"),
+    Mutation(WEEKDAY, "app/agent/loop.py",
+             "    for pos, anchor in anchors:\n        near = [(abs(w_pos - pos), word, said) for w_pos, word, said in weekdays",
+             "    for pos, anchor in anchors:\n        near = [(0, word, said) for w_pos, word, said in weekdays",
+             "tests/test_agent.py",
+             "перечисление «пятницу, субботу и воскресенье» снова рубит честный ответ"),
+    Mutation(WEEKDAY, "app/agent/prompts.py",
+             "        + _upcoming_days(moment)",
+             "        + \"\"",
+             "tests/test_agent.py",
+             "календарь дней недели пропал из блока «Сейчас:»"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

@@ -1,0 +1,283 @@
+{
+  "model": "deepseek-v4-pro",
+  "classifier": "deepseek-v4-flash",
+  "repeats": 5,
+  "phrases": [
+    {
+      "phrase": "ну что, подойдёт?",
+      "attempts": [
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price",
+            "check_availability"
+          ],
+          "text": "Да, всё в силе! «Русский стиль» 20 сентября с 13:00 до 17:00 свободна, на шестерых как раз просторно.\n\nИтого: 4 часа × 3500 ₽ = 14 000 ₽, предоплата 3500 ₽. Оставляйте имя и телефон — придержу это время, менеджер подтвердит бронь. ☀️"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price",
+            "check_availability"
+          ],
+          "text": "Да, время свободно! Баня «Русский стиль» 20 сентября с 13:00 до 17:00 — 14 000 ₽ за 4 часа. Бронируем?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "check_availability",
+            "calculate_price"
+          ],
+          "text": "Да, «Русский стиль» 20 сентября с 13:00 до 17:00 свободна!\n\n4 часа × 3500 ₽ = 14 000 ₽, предоплата 3500 ₽. Бронь начинается с оплаты — по ней вам ответит менеджер. Оставляйте имя и телефон?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Подойдёт, конечно! Напомню детали: «Русский стиль», 20 сентября, 13:00–17:00, на шестерых. Подтверждаете — зафиксирую время и передам менеджеру?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": true,
+          "escalation_reason": "цена в тексте без вызова инструмента (последний рубеж)",
+          "tools": [],
+          "text": "Это уточняет менеджер — я передала ему вопрос. Напишите, если нужно что-то ещё."
+        }
+      ]
+    },
+    {
+      "phrase": "ок",
+      "attempts": [
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Договорились! 🌸 Остались контактные данные — как вас зовут и какой номер телефона оставить для брони?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Чтобы зафиксировать бронь, мне нужны ваши имя и телефон — оставьте, пожалуйста, и я передам время менеджеру."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price"
+          ],
+          "text": "Отлично! Итог: 4 часа × 3500 ₽ = 14 000 ₽, предоплата 3500 ₽.\n\nДля брони нужны ваше имя и телефон — как вас записать?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price"
+          ],
+          "text": "Отлично! Тогда зафиксирую бронь: «Русский стиль», 20 сентября, 13:00–17:00, на 6 человек, итого 14 000 ₽.\n\nОставьте, пожалуйста, ваше имя и номер телефона — передам менеджеру, он подтвердит время."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Осталось зафиксировать бронь — подскажите, пожалуйста, ваше имя и номер телефона, и я передам всё менеджеру на подтверждение."
+        }
+      ]
+    },
+    {
+      "phrase": "да, берём",
+      "attempts": [
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price",
+            "check_availability"
+          ],
+          "text": "Отлично! Баня «Русский стиль», 20 сентября, с 13:00 до 17:00 — 14 000 ₽ (предоплата 3500 ₽). Чтобы придержать время, оставьте, пожалуйста, ваше имя и телефон."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Чтобы передать бронь менеджеру, мне нужны ваши имя и телефон."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Для брони мне нужны ваши имя и номер телефона."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "create_booking",
+            "calculate_price"
+          ],
+          "text": "Отлично! Придержу для вас «Русский стиль» 20 сентября с 13:00 до 17:00. Предоплата 3500 ₽, остальное на месте.\n\nЧтобы подтвердить бронь, оставьте, пожалуйста, ваше имя и номер телефона."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "check_availability",
+            "calculate_price"
+          ],
+          "text": "Прекрасно! Придержу «Русский стиль» на 20 сентября с 13:00 до 17:00. Итог — 14 000 ₽ за 4 часа (3500 ₽/час, выходной тариф). Мне нужны ваши имя и телефон, чтобы передать бронь менеджеру для подтверждения. Как вас записать?"
+        }
+      ]
+    },
+    {
+      "phrase": "годится",
+      "attempts": [
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Чтобы придержать время, оставьте, пожалуйста, ваше имя и номер телефона."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "calculate_price"
+          ],
+          "text": "Стоимость подтверждаю: 4 часа × 3500 ₽ = 14 000 ₽, предоплата 3500 ₽. Оставьте, пожалуйста, имя и телефон — придержу время за вами."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! 🌞 Для брони мне нужны ваши имя и телефон — оформлю заявку и передам менеджеру на подтверждение."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Чтобы придержать время, мне нужны ваше имя и номер телефона. Как вас записать?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Записываю предварительно: баня «Русский стиль», 20 сентября, 13:00–17:00, шестеро гостей.\n\nОставьте, пожалуйста, ваше имя и телефон — менеджер подтвердит бронь 😊"
+        }
+      ]
+    },
+    {
+      "phrase": "давайте",
+      "attempts": [
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Осталось имя и телефон — по ним передам бронь менеджеру, он подтвердит время.\n\nНа какое имя записать и какой номер оставить?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Чудесно! Для брони мне нужны ваше имя и телефон — запишу и передам менеджеру, он придержит время и подтвердит бронь."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Для брони понадобятся ваши имя и телефон — оставьте, пожалуйста?"
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [
+            "get_photos"
+          ],
+          "text": "Напишите, пожалуйста, ваше имя и номер телефона — и я передам бронь менеджеру, он подтвердит время."
+        },
+        {
+          "raw_label": "confirm",
+          "final_label": "confirm",
+          "human_path": false,
+          "escalated": false,
+          "escalation_reason": null,
+          "tools": [],
+          "text": "Отлично! Чтобы я передала бронь менеджеру, напишите, пожалуйста, ваше имя и номер телефона."
+        }
+      ]
+    }
+  ]
+}

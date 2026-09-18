@@ -39,6 +39,8 @@ from app.agent.loop import (
     GUARD_RAIL_VIOLATION,
     SELF_DISCLOSURE,
     SELF_DISCLOSURE_VIOLATION,
+    asks_for_a_human,
+    weekday_contradicts_date,
     PROMISE_TO_RETURN,
     escalation_topic_in,
     guard_repeats,
@@ -49,7 +51,7 @@ from app.agent.loop import (
     sanitized_assistant_content,
     summarize_history,
 )
-from app.agent.prompts import build_system_prompt
+from app.agent.prompts import build_now_block, build_system_prompt
 from app.agent.slots import Slots
 from app.agent.tools import TOOLS, ToolExecutor, quote_to_dict
 from app.kb.loader import load_catalog
@@ -2962,3 +2964,135 @@ def test_occupying_yourself_is_not_a_calendar_claim(text):
 def test_real_occupancy_words_are_still_caught(text):
     """Обратная сторона правки: исключены только «заняться» и «занятие»."""
     assert availability_claim(text) is True
+
+
+# --- подтверждение клиента — не просьба позвать человека --------------------
+#
+# Замер 2026-09-18 на живом классификаторе (deepseek-v4-flash, 5 повторов):
+# «ок» -> human 4/5, «давайте» -> 4/5, «годится» -> 2/5, «ну что, подойдёт?»
+# -> 2/5. Метка human уводила готового бронировать клиента к оператору мимо
+# основной модели.
+
+CONFIRMATIONS = ["ну что, подойдёт?", "ок", "да, берём", "годится", "давайте"]
+
+
+@pytest.mark.parametrize("text", CONFIRMATIONS)
+async def test_a_confirmation_labelled_human_is_not_handed_to_the_operator(kb, text):
+    """Классификатор ошибся точно так же, как в замере, — а клиент всё равно
+    получает обычный ход, не «передала вопрос менеджеру»."""
+    agent, client = loop_for(
+        kb, [FakeResponse(content=[TextBlock("Отлично! На сколько часов планируете?")])],
+        label="human",
+    )
+    result = await agent.run_turn("chat-1", [], text)
+
+    assert result.text != HANDED_TO_MANAGER
+    assert result.escalated is False
+    assert result.classification == "question"
+    # И ход реально дошёл до основной модели.
+    assert any(c["model"] == "claude-sonnet-5" for c in client.messages.calls)
+
+
+@pytest.mark.parametrize("text", [
+    "позовите менеджера", "хочу поговорить с человеком", "буду жаловаться",
+    "вы бот? дайте живого человека", "верните предоплату",
+])
+async def test_a_real_request_for_a_human_still_goes_to_the_operator(kb, text):
+    agent, _ = loop_for(kb, [], label="human")
+    result = await agent.run_turn("chat-1", [], text)
+
+    assert result.escalated is True
+    assert result.text == HANDED_TO_MANAGER
+
+
+@pytest.mark.parametrize("text", [
+    "нас 6 человек", "детям старше 5 лет можно?", "есть хамам?",
+    "как разводить мангал?", "на 10 человек подойдёт?", "Ок, давайте на 4 часа",
+])
+def test_ordinary_words_are_not_a_request_for_a_human(text):
+    """Словарь вето обязан молчать на обычных репликах — иначе оно не вето."""
+    assert asks_for_a_human(text) is False
+
+
+async def test_the_classifier_sees_what_the_client_is_answering(kb):
+    """«ок» без контекста не значит ничего — классификатор получает
+    последнюю реплику администратора."""
+    history = [
+        {"role": "user", "content": "баня на субботу"},
+        {"role": "assistant", "content": "Свободно с 13:00, тариф 3500 ₽/час. Бронируем?"},
+    ]
+    agent, client = loop_for(kb, [FakeResponse(content=[TextBlock("Отлично!")])])
+    await agent.run_turn("chat-1", history, "ок")
+
+    clf_call = next(c for c in client.messages.calls if c["model"].startswith("claude-haiku"))
+    sent = clf_call["messages"][-1]["content"]
+    assert "Бронируем?" in sent and "Клиент: ок" in sent
+
+
+def test_the_classifier_prompt_has_a_label_for_agreement():
+    from app.agent.prompts import CLASSIFIER_PROMPT
+
+    assert "confirm" in CLASSIFIER_PROMPT
+    assert "ЯВНО" in CLASSIFIER_PROMPT
+
+
+# --- день недели сверяется с датой -------------------------------------------
+#
+# Замер 2026-09-18: модель назвала 20 сентября субботой, это воскресенье.
+
+FRIDAY_18_SEPT = datetime(2026, 9, 18, 12, 0, tzinfo=_MSK)
+
+
+@pytest.mark.parametrize("text", [
+    "20 сентября — суббота, выходной тариф 2000 ₽/час",   # дословно из замера
+    "В субботу, 20 сентября, свободно с 13:00.",
+    "20.09 — суббота.",
+    "Завтра, в воскресенье, всё свободно.",               # завтра — суббота
+    "1 января — четверг.",                                # 2027-01-01 — пятница
+])
+def test_a_wrong_weekday_is_caught(text):
+    assert weekday_contradicts_date(text, FRIDAY_18_SEPT) is not None
+
+
+@pytest.mark.parametrize("text", [
+    "20 сентября — воскресенье, выходной тариф 2000 ₽/час.",
+    "20 сентября (воскресенье) гриль-домик свободен с 13:00.",
+    "Завтра, в субботу, свободно.",
+    "В субботу удобно?",                                  # даты нет — сверять не с чем
+    "1 января — пятница.",
+    # Перечисление правила рядом с датой — самый частый наш текст. Первая
+    # редакция сверки рубила его на слове «пятницу».
+    "Тариф выходного дня действует в пятницу, субботу и воскресенье — "
+    "20 сентября как раз воскресенье.",
+    "С пятницы по воскресенье, 18–20 сентября, действует выходной тариф.",
+    "В субботу, 19 сентября, и в воскресенье, 20 сентября, свободно.",
+    "Средняя загрузка 20 сентября небольшая.",            # «сред-» — не среда
+])
+def test_a_right_or_unrelated_weekday_passes(text):
+    assert weekday_contradicts_date(text, FRIDAY_18_SEPT) is None
+
+
+async def test_a_wrong_weekday_never_reaches_the_client(kb):
+    """Тот же рубеж и та же лестница, что у неверной даты."""
+    wrong = "Добрый день! 20 сентября — суббота, всё свободно с 13:00."
+    agent = loop_at(
+        kb,
+        [FakeResponse(content=[ToolUseBlock(name="check_availability",
+                                            input={"date": "2026-09-20"})]),
+         FakeResponse(content=[TextBlock(wrong)])],
+        now=FRIDAY_18_SEPT,
+    )
+    result = await agent.run_turn("chat-1", [], "есть время 20 сентября?")
+
+    assert "суббота" not in result.text
+    assert DATE_GUARD_VIOLATION in result.llm_meta["guard_rail"]
+    assert result.llm_meta["withheld_text"] == wrong
+
+
+def test_the_now_block_gives_weekdays_for_two_weeks():
+    """Предотвращение, а не только поимка: день недели модель берёт готовым."""
+    block = build_now_block(FRIDAY_18_SEPT)
+
+    assert "20.09 — воскресенье" in block
+    assert "19.09 — суббота" in block
+    assert "01.10 — четверг" in block      # последний, четырнадцатый день

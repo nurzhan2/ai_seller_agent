@@ -22,6 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import date as date_cls
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Optional, Sequence
@@ -666,6 +667,78 @@ def date_contradicts_now(text: str, now: datetime) -> Optional[str]:
     return None
 
 
+# День недели в тексте ответа -> его номер (пн=0). Формы — те, что реально
+# пишет модель: «суббота», «в субботу», «субботы», «(воскресенье)».
+_WEEKDAY_FORMS = {
+    "понедельник": 0, "вторник": 1, "сред": 2, "четверг": 3,
+    "пятниц": 4, "суббот": 5, "воскресень": 6,
+}
+_WEEKDAY_RE = re.compile(
+    r"\b(понедельник|вторник|сред(?=[аыуе]\b)|четверг|пятниц|суббот|воскресень)\w*",
+    re.IGNORECASE,
+)
+_WEEKDAY_NAMES = ("понедельник", "вторник", "среда", "четверг", "пятница",
+                  "суббота", "воскресенье")
+
+
+def weekday_contradicts_date(text: str, now: datetime) -> Optional[str]:
+    """«20 сентября — суббота», когда 20 сентября 2026 — воскресенье.
+
+    Прод-замер 2026-09-18: модель назвала 20 сентября субботой. День недели
+    она считала сама — блок «Сейчас:» даёт только сегодня и завтра, — и
+    ошиблась ровно так, как ошибалась с датами до блока. Для выходных у нас
+    это не мелочь: суббота и воскресенье стоят одинаково, но «20-е — суббота»
+    при реальном воскресенье — это клиент, который приедет не в тот день.
+
+    Каждое название дня сверяется с БЛИЖАЙШЕЙ к нему датой в окне
+    _PAIRING_WINDOW — календарной («20 сентября», «20.09») или относительной
+    («завтра»). Год у календарной даты — ближайший будущий, как у
+    app/agent/dates.py: «1 января», сказанное в сентябре, — это январь
+    следующего года. Название дня без даты рядом («в субботу удобно?») не
+    проверяется: сверять не с чем.
+    """
+    today = now.date()
+    anchors: list[tuple[int, date_cls]] = []
+    for pos, day, month in _dates_in(text):
+        try:
+            candidate = date_cls(today.year, month, day)
+        except ValueError:
+            continue
+        if candidate < today:
+            try:
+                candidate = candidate.replace(year=today.year + 1)
+            except ValueError:
+                continue
+        anchors.append((pos, candidate))
+    for m in _RELATIVE_RE.finditer(text):
+        anchors.append((m.start(), today + timedelta(days=_RELATIVE_DAYS[m.group(1).lower()])))
+    if not anchors:
+        return None
+
+    # СВЕРКА ОТ ДАТЫ К ДНЮ, А НЕ ОТ ДНЯ К ДАТЕ. Первая редакция искала для
+    # каждого названия дня ближайшую дату и рубила ровно тот текст, который
+    # модель пишет у нас чаще всего: «тариф выходного дня действует в
+    # пятницу, субботу и воскресенье — 20 сентября как раз воскресенье».
+    # «Пятницу» там от даты ближе всех прочих дат, но к ней не относится —
+    # это перечисление правила. То же с диапазоном «с пятницы по
+    # воскресенье, 18–20 сентября». У даты же день недели один, и он — самый
+    # близкий к ней.
+    weekdays = [(m.start(), m.group(0), _WEEKDAY_FORMS[m.group(1).lower()])
+                for m in _WEEKDAY_RE.finditer(text)]
+    for pos, anchor in anchors:
+        near = [(abs(w_pos - pos), word, said) for w_pos, word, said in weekdays
+                if abs(w_pos - pos) <= _PAIRING_WINDOW]
+        if not near:
+            continue
+        _, word, said = min(near, key=lambda item: item[0])
+        if anchor.weekday() != said:
+            return (
+                f"«{word}» рядом с {anchor.strftime('%d.%m')}, "
+                f"а это {_WEEKDAY_NAMES[anchor.weekday()]}"
+            )
+    return None
+
+
 QUESTION_GUARD_VIOLATION = (
     "больше одного вопроса в ответе (последний рубеж) — лишние обрезаны"
 )
@@ -773,6 +846,40 @@ _GUARD_TEXTS = (
     frozenset(text for ladder in AVAILABILITY_GUARD_LADDER.values() for text in ladder)
     | {AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK, HANDED_TO_MANAGER}
 )
+
+
+# ЯВНАЯ ПРОСЬБА О ЧЕЛОВЕКЕ ИЛИ ЖАЛОБА — единственное, что даёт метке human
+# классификатора право увести клиента к оператору мимо основной модели. См.
+# вето в `AgentLoop.run_turn`.
+#
+# Словарь намеренно про СМЫСЛ «позовите человека / я недоволен», а не про
+# грубость вообще: мат и хамство без этих слов основная модель увидит сама и
+# передаст оператору инструментом. Задача словаря — не пропустить
+# «соедините с менеджером», а не опознать всё плохое на свете.
+#
+# «ЧЕЛОВЕК» — ТОЛЬКО В СВЯЗКЕ. Голое слово встречается в каждом втором
+# сообщении («нас 6 человек»), и такой словарь не вето, а решето. То же с
+# «хам» (есть «хамам»), «развод» (есть «разводить мангал»), «старший» (есть
+# «детям старше пяти»): формы перечислены точно, а не по основе.
+HUMAN_REQUEST = re.compile(
+    r"\bменеджер\w*|\bоператор\w*|"
+    r"\bс\s+(?:живым\s+|реальным\s+|нормальным\s+)?человеком\b|"
+    r"\bживо(?:й|го|м)\s+человек\w*|\bвы\s+(?:живой|живая|робот|бот)\b|"
+    r"\bруководител\w*|\bдиректор\w*|\bвладел\w*|\bхозя\w*|\bначальств\w*|"
+    r"\bпозов\w*|\bпозвать\b|\bсоедин\w*|\bпередайте\b|\bсвяжите\b|"
+    r"\bпозвонит\w*\s+мне|\bперезвоните\b|"
+    r"\bжалоб\w*|\bжалова\w*|\bжалуюсь\b|\bпожалу[юе]\w*|\bпретензи\w*|\bобман\w*|"
+    r"\bразвод\b|\bразводилов\w*|\bразводят\b|"
+    r"\bбезобрази\w*|\bхамство\b|\bхамите\b|\bхамят\b|"
+    r"\bвозврат\w*|\bверните\b|\bроспотреб\w*|"
+    r"\bсуд\b|\bсудом\b|\bполици\w*|\bотвратительн\w*",
+    re.IGNORECASE,
+)
+HUMAN_LABEL_VETO = "метка human без явной просьбы о человеке — снята кодом"
+
+
+def asks_for_a_human(client_text: str) -> bool:
+    return bool(HUMAN_REQUEST.search(client_text or ""))
 
 
 def escalation_topic_in(client_text: str, kb: Any) -> Optional[str]:
@@ -1022,12 +1129,24 @@ class AgentLoop:
 
     # -- классификация -----------------------------------------------------
 
-    async def classify(self, text: str) -> str:
+    async def classify(self, text: str, previous_agent_text: str = "") -> str:
+        """Метка сообщения клиента — с последней репликой администратора.
+
+        Контекст — одна реплика, а не история: классификатору нужен ровно
+        ответ на вопрос «на что клиент сейчас отвечает», и лишние токены на
+        самом дешёвом вызове хода тут ничего не добавляют.
+        """
+        content = text
+        if previous_agent_text:
+            content = (
+                f"Администратор: {previous_agent_text[:500]}\n"
+                f"Клиент: {text}"
+            )
         response = await self.provider.complete(
             model=self.classifier_model,
             max_tokens=8,
             system=CLASSIFIER_PROMPT,
-            messages=[{"role": "user", "content": text}],
+            messages=[{"role": "user", "content": content}],
         )
         label = _text_from_blocks(response.content).strip().lower().split()
         return label[0] if label else "question"
@@ -1044,7 +1163,29 @@ class AgentLoop:
         item_lookup: Optional[ItemZoneLookup] = None,
         concessions_blocked: bool = False,
     ) -> TurnResult:
-        classification = await self.classify(user_text)
+        previous_agent_text = next(
+            (m.get("content") or "" for m in reversed(history or [])
+             if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
+            "",
+        )
+        classification = await self.classify(user_text, previous_agent_text)
+
+        if classification == "human" and not asks_for_a_human(user_text):
+            # ВЕТО КОДОМ. Метка human уводит клиента к оператору СРАЗУ, мимо
+            # основной модели, — и замер 2026-09-18 показал, что дешёвый
+            # классификатор ставит её на «ок» (4 из 5), «давайте» (4 из 5),
+            # «годится», «ну что, подойдёт?». Это ровно тот момент, когда
+            # клиент готов бронировать. Без явной просьбы о человеке или
+            # жалобы ход идёт обычным путём; настоящую жалобу без этих слов
+            # основная модель передаст сама через escalate_to_human, так что
+            # ошибка в эту сторону стоит одного хода, а в обратную — клиента.
+            guard_rails_total.labels(rule=HUMAN_LABEL_VETO).inc()
+            logger.warning(
+                "классификатор сказал human без явной просьбы о человеке — "
+                "ход идёт обычным путём",
+                extra={"dialog_id": dialog_id, "client_text": user_text[:200]},
+            )
+            classification = "question"
 
         if classification == "human":
             # Просьба позвать человека не обсуждается и не «отрабатывается».
@@ -1395,7 +1536,13 @@ class AgentLoop:
             ):
                 guard_reason = AVAILABILITY_GUARD_VIOLATION
             else:
-                mismatch = date_contradicts_now(final_text, now)
+                # День недели — тем же рубежом и с той же лестницей, что и
+                # неверная дата: для клиента это одна и та же ошибка («приеду
+                # не в тот день»), и разводить их на два поведения незачем.
+                mismatch = (
+                    date_contradicts_now(final_text, now)
+                    or weekday_contradicts_date(final_text, now)
+                )
                 if mismatch:
                     guard_reason = f"{DATE_GUARD_VIOLATION}: {mismatch}"
 
