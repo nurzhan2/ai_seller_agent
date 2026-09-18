@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any, Callable, Optional
 
 from app.agent.dates import resolve_relative_date
+from app.booking.readiness import auto_booking_blockers, describe_blockers
 from app.clock import moscow_today
 from app.config import get_settings
 from app.kb.loader import KnowledgeBase
@@ -1094,6 +1095,25 @@ class ToolExecutor:
             # нельзя, — и отвечать на него отказом «уточню у менеджера»
             # вместо готовой карточки оператору было бы хуже для всех.
             if not get_settings().auto_booking_enabled:
+                return {
+                    "booked": False,
+                    "instruction": (
+                        "Автобронирование выключено. Скажи, что придержишь время и "
+                        "менеджер подтвердит, и вызови escalate_to_human."
+                    ),
+                }
+            # БЛОКИРОВКА ПЕРЕКЛЮЧАТЕЛЯ. Флаг включён, но условия, без которых
+            # его включать нельзя, не выполнены (app/booking/readiness.py) —
+            # прежде всего нет проверки оплаты. Без этой ветки включённый флаг
+            # ставил бы в YCLIENTS настоящие брони, за которые никто не
+            # заплатил. Для клиента ответ тот же, что при выключенном флаге.
+            blockers = auto_booking_blockers(self.kb)
+            if blockers:
+                logger.error(
+                    "AUTO_BOOKING_ENABLED=true, но автобронирование не готово — "
+                    "бронь не ставится: %s", describe_blockers(blockers),
+                    extra={"chat_id": self.dialog_id},
+                )
                 return {
                     "booked": False,
                     "instruction": (

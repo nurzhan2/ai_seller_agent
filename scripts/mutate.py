@@ -91,6 +91,7 @@ CLASSIFIER = "классификатор"
 WEEKDAY = "день-недели"
 PHOTOS = "фото"
 REPEAT = "повтор-суммы"
+AUTOBOOK = "автобронирование"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -548,6 +549,23 @@ MUTATIONS: tuple[Mutation, ...] = (
              "        if isinstance(content, str):",
              "tests/test_agent.py",
              "сумма, названная клиентом, считается нашей и повторяется"),
+
+    # -- переключатель автобронирования с блокировкой -------------------------
+    Mutation(AUTOBOOK, "app/agent/tools.py",
+             "            blockers = auto_booking_blockers(self.kb)\n            if blockers:",
+             "            blockers = auto_booking_blockers(self.kb)\n            if False:",
+             "tests/test_booking_readiness.py",
+             "включённый флаг снова ставит брони без оплаты"),
+    Mutation(AUTOBOOK, "app/booking/readiness.py",
+             "PAYMENT_GATE_IMPLEMENTED = False",
+             "PAYMENT_GATE_IMPLEMENTED = True",
+             "tests/test_booking_readiness.py",
+             "проверка оплаты объявлена готовой, хотя её нет"),
+    Mutation(AUTOBOOK, "app/booking/readiness.py",
+             "    if not payment.link_type.is_resolved():",
+             "    if False:",
+             "tests/test_booking_readiness.py",
+             "нерешённый тип ссылки на оплату не мешает автобронированию"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

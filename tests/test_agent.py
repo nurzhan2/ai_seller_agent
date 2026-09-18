@@ -1291,6 +1291,18 @@ def kb_agent_books(kb):
     return other
 
 
+@pytest.fixture
+def booking_ready(monkeypatch):
+    """Автобронирование ГОТОВО: блокеров нет (app/booking/readiness.py).
+
+    Боевое состояние обратное — нет ни ссылки на оплату, ни проверки
+    предоплаты, и переключатель заблокирован; это проверяют тесты
+    блокировки ниже. Тесты механики брони подставляют готовность явно:
+    механика должна быть проверена к тому дню, когда пункты закроют.
+    """
+    monkeypatch.setattr("app.agent.tools.auto_booking_blockers", lambda kb: [])
+
+
 async def _executor_with_quote(kb, provider, hours=3, **kw):
     """Котировка обязательна до брони — из неё берутся часы занятости."""
     ex = ToolExecutor(kb, "d1", booking_provider=provider,
@@ -1300,7 +1312,7 @@ async def _executor_with_quote(kb, provider, hours=3, **kw):
     return ex
 
 
-async def test_booking_is_created_and_rechecked_first(kb_agent_books, monkeypatch):
+async def test_booking_is_created_and_rechecked_first(kb_agent_books, monkeypatch, booking_ready):
     """Перед постановкой занятость спрашивается ЗАНОВО: между «свободно»
     пять реплик назад и этой секундой слот мог уйти."""
     from app.config import Settings
@@ -1319,7 +1331,7 @@ async def test_booking_is_created_and_rechecked_first(kb_agent_books, monkeypatc
     assert len(provider.bookings) == 1
 
 
-async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb_agent_books, monkeypatch):
+async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb_agent_books, monkeypatch, booking_ready):
     """Первый ответ FREE, второй BUSY — ровно гонка, ради которой
     перепроверка и существует. Бронь ставиться не должна."""
     from app.booking.base import AvailabilityStatus
@@ -1341,7 +1353,7 @@ async def test_booking_is_refused_when_the_slot_was_taken_meanwhile(kb_agent_boo
     assert "Не эскалируй" in result["instruction"]
 
 
-async def test_booking_blocks_occupied_hours_not_paid_ones(kb_agent_books, monkeypatch):
+async def test_booking_blocks_occupied_hours_not_paid_ones(kb_agent_books, monkeypatch, booking_ready):
     """Акция «6-й час в подарок»: гость занимает 6 часов, платит за 5.
     Заблокировать 5 значит отдать шестой час другому клиенту."""
     from app.config import Settings
@@ -1357,7 +1369,7 @@ async def test_booking_blocks_occupied_hours_not_paid_ones(kb_agent_books, monke
     assert result["occupied_hours"] == 6
 
 
-async def test_booking_is_written_to_our_db_with_both_hour_counts(kb_agent_books, monkeypatch):
+async def test_booking_is_written_to_our_db_with_both_hour_counts(kb_agent_books, monkeypatch, booking_ready):
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
@@ -1374,7 +1386,7 @@ async def test_booking_is_written_to_our_db_with_both_hour_counts(kb_agent_books
     assert saved["applied_promo"] == "sixth_hour_free"
 
 
-async def test_booking_notifies_the_operator(kb_agent_books, monkeypatch):
+async def test_booking_notifies_the_operator(kb_agent_books, monkeypatch, booking_ready):
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
     provider = _BookingProvider()
@@ -1391,7 +1403,7 @@ async def test_booking_notifies_the_operator(kb_agent_books, monkeypatch):
     assert notices[0]["zone_id"] == "bath_russian"
 
 
-async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb_agent_books, monkeypatch):
+async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb_agent_books, monkeypatch, booking_ready):
     """Бронь уже в YCLIENTS. Уронить ход из-за нашей таблицы — оставить
     клиента без подтверждения при существующей броне."""
     from app.config import Settings
@@ -1409,7 +1421,7 @@ async def test_a_failed_db_write_does_not_lose_an_existing_booking(kb_agent_book
     assert result["booked"] is True
 
 
-async def test_booking_requires_a_price_quote_first(kb_agent_books, monkeypatch):
+async def test_booking_requires_a_price_quote_first(kb_agent_books, monkeypatch, booking_ready):
     """Без котировки неизвестны часы занятости — гадать их нельзя."""
     from app.config import Settings
     monkeypatch.setattr("app.agent.tools.get_settings", lambda: Settings(auto_booking_enabled=True))
@@ -1423,7 +1435,7 @@ async def test_booking_requires_a_price_quote_first(kb_agent_books, monkeypatch)
     assert "calculate_price" in result["instruction"]
 
 
-async def test_booking_is_refused_when_the_switch_is_off(kb_agent_books, monkeypatch):
+async def test_booking_is_refused_when_the_switch_is_off(kb_agent_books, monkeypatch, booking_ready):
     from app.config import Settings, get_settings
 
     provider = _BookingProvider()
@@ -1439,7 +1451,7 @@ async def test_booking_is_refused_when_the_switch_is_off(kb_agent_books, monkeyp
     assert provider.bookings == []
 
 
-async def test_booking_is_refused_when_availability_is_unknown(kb_agent_books, monkeypatch):
+async def test_booking_is_refused_when_availability_is_unknown(kb_agent_books, monkeypatch, booking_ready):
     """Дыра, найденная мутацией: правило «занятость не подтвердилась — не
     бронируем» не было закреплено ни одним тестом. Провайдер отвечает
     UNKNOWN (нет маппинга зоны, сбой сети, неразобранный ответ) — записи в
@@ -1460,7 +1472,7 @@ async def test_booking_is_refused_when_availability_is_unknown(kb_agent_books, m
     assert "escalate_to_human" in result["instruction"]
 
 
-async def test_booking_without_a_provider_refuses_before_touching_anything(kb_agent_books, monkeypatch):
+async def test_booking_without_a_provider_refuses_before_touching_anything(kb_agent_books, monkeypatch, booking_ready):
     """Вторая дыра: ветка «системы бронирования нет вообще». Без неё
     инструмент дошёл бы до `None.create_booking` и отдал бы модели голую
     ошибку вместо готовой формулировки для клиента."""
@@ -1487,7 +1499,7 @@ async def test_booking_without_a_provider_refuses_before_touching_anything(kb_ag
     assert "escalate_to_human" in result["instruction"]
 
 
-async def test_booking_failure_is_never_reported_as_success(kb_agent_books, monkeypatch):
+async def test_booking_failure_is_never_reported_as_success(kb_agent_books, monkeypatch, booking_ready):
     """Рубильник включён намеренно: иначе тест зеленеет на отказе
     «автобронирование выключено» и до сбоя провайдера не доходит вовсе."""
     from app.config import Settings

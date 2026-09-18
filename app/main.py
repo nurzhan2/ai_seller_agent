@@ -16,6 +16,7 @@ from sqlalchemy import text
 from app import webhooks
 from app.admin import routes as admin_routes
 from app.agent.debounce import human_delay
+from app.booking.readiness import auto_booking_blockers, describe_blockers
 from app.channels import avito_endpoints as ep
 from app.config import Settings, get_settings
 from app.db.session import get_engine, get_sessionmaker
@@ -770,11 +771,17 @@ async def lifespan(app: FastAPI):
             "=%s при этом ни на что не влияет",
             settings.auto_booking_enabled,
         )
+    elif settings.auto_booking_enabled and auto_booking_blockers(app.state.kb):
+        # Флаг включён, но переключатель заблокирован (app/booking/
+        # readiness.py): брони не ставятся, и в логе — ровно почему.
+        logger.error(
+            "AUTO_BOOKING_ENABLED=true, но автобронирование НЕ ГОТОВО и не "
+            "работает: %s", describe_blockers(auto_booking_blockers(app.state.kb)),
+        )
     elif settings.auto_booking_enabled:
         logger.warning(
-            "AUTO_BOOKING_ENABLED=true — агент ставит брони в YCLIENTS САМ, "
-            "БЕЗ проверки оплаты: её в коде нет, подтверждение платежа "
-            "остаётся целиком на операторе"
+            "AUTO_BOOKING_ENABLED=true — агент ставит брони в YCLIENTS САМ; "
+            "все условия готовности выполнены (app/booking/readiness.py)"
         )
     else:
         logger.warning(
