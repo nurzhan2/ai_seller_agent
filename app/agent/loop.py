@@ -273,7 +273,18 @@ def invented_amounts(text: str, allowed: set[str]) -> list[str]:
     «р.»), — тем же паттерном, что и первый рубеж. Число часов, число гостей
     и время сюда не попадают: они не про деньги, и сверять их не с чем.
     """
-    bad: list[str] = []
+    return [raw for raw, value in money_in_text(text) if value not in allowed]
+
+
+def money_in_text(text: str) -> list[tuple[str, str]]:
+    """(как написано, каноническое число) для каждой суммы в тексте.
+
+    Один разбор на все места, где суммы сверяются: ответ агента и его же
+    прошлые сообщения (amounts_sent_before) обязаны читаться одним и тем же
+    паттерном — иначе «14 тыс.» в истории и «14 000 ₽» в ответе оказались бы
+    разными суммами.
+    """
+    found: list[tuple[str, str]] = []
     for match in PRICE_LIKE_WITHOUT_TOOL_CALL.finditer(text or ""):
         digits = _NUMBER_IN_TEXT.search(match.group())
         if digits is None:
@@ -284,9 +295,39 @@ def invented_amounts(text: str, allowed: set[str]) -> list[str]:
                 value = _canonical_amount(str(Decimal(value) * 1000))
             except (InvalidOperation, ValueError):
                 pass
-        if value not in allowed:
-            bad.append(match.group().strip())
-    return bad
+        found.append((match.group().strip(), value))
+    return found
+
+
+def concession_given(state: Any) -> bool:
+    """Была ли в диалоге уступка — выданная ступень или достигнутый пол цены."""
+    return bool(getattr(state, "used_tiers", None)) or getattr(state, "floor_reached", None) is not None
+
+
+def amounts_sent_before(history: Optional[list[dict]], state: Any) -> set[str]:
+    """Суммы, которые агент уже отправлял в этом чате, — их можно повторить.
+
+    ЗАЧЕМ. Замер 2026-09-18 (scripts/probe_confirmations.py): клиент пишет
+    «ну что, подойдёт?», модель повторяет уже названные «14 000 ₽» без
+    нового расчёта — и ценовой рубеж уводил готового бронировать клиента к
+    оператору. Сумма из прошлого сообщения агента не выдумана: она прошла
+    те же рубежи, когда уходила в первый раз.
+
+    ТОЛЬКО ЕСЛИ УСТУПОК НЕ БЫЛО — решение заказчика 2026-09-18. После скидки
+    в истории лежат две цены, базовая и сниженная, и повтор старой базовой
+    нарушил бы главное правило проекта: цена в диалоге не растёт выше уже
+    обещанной (README, apply_dialog_floor). Какая из двух сейчас верна,
+    знает только расчёт, поэтому после уступки — как раньше, только новый
+    вызов calculate_price.
+    """
+    if concession_given(state):
+        return set()
+    found: set[str] = set()
+    for msg in history or []:
+        content = msg.get("content")
+        if msg.get("role") == "assistant" and isinstance(content, str):
+            found |= {value for _, value in money_in_text(content)}
+    return found
 
 
 # ЧЕТВЁРТЫЙ РУБЕЖ: ОБЕЩАНИЕ ВЕРНУТЬСЯ.
@@ -1436,10 +1477,21 @@ class AgentLoop:
                 # это видно в логе и в /admin/costs, а разговор продолжается.
                 logger.exception("cost guard failed", extra={"dialog_id": dialog_id})
 
+        # Суммы, которые агент уже называл в этом чате, — разрешены к повтору,
+        # если уступок не было. Состояние — ПОСЛЕ хода: уступка, выданная
+        # этим же ходом, уже закрывает повтор. См. amounts_sent_before.
+        repeatable = amounts_sent_before(history, getattr(executor, "state", state))
+
         # Последний рубеж: инструмент ни разу не вызывался за весь ход, а в
         # тексте всё равно всплыла цена. Не имеет значения, какой провайдер
-        # это написал и почему — ответ клиенту не уходит.
-        if not tool_calls and final_text and PRICE_LIKE_WITHOUT_TOOL_CALL.search(final_text):
+        # это написал и почему — ответ клиенту не уходит. Исключение —
+        # дословный повтор уже названной суммы (см. repeatable выше): тогда
+        # «цены без инструмента» нет, есть цена из прошлого ответа.
+        if (
+            not tool_calls and final_text
+            and PRICE_LIKE_WITHOUT_TOOL_CALL.search(final_text)
+            and invented_amounts(final_text, repeatable)
+        ):
             logger.error(
                 "guard rail: price-like text without a tool call",
                 extra={"dialog_id": dialog_id, "provider": self.provider.name},
@@ -1471,7 +1523,7 @@ class AgentLoop:
         # Тот же инвариант, второй вопрос к нему: вызов был, но сумма в
         # тексте не из его ответа. Разбор — у invented_amounts выше.
         if final_text and tool_calls:
-            invented = invented_amounts(final_text, allowed_amounts)
+            invented = invented_amounts(final_text, allowed_amounts | repeatable)
             if invented:
                 logger.error(
                     "guard rail: %s — %s",

@@ -90,6 +90,7 @@ SYSTEM_MSG = "системные-сообщения"
 CLASSIFIER = "классификатор"
 WEEKDAY = "день-недели"
 PHOTOS = "фото"
+REPEAT = "повтор-суммы"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -520,6 +521,33 @@ MUTATIONS: tuple[Mutation, ...] = (
              "    return \"[\" + \", \".join(str(i) for i in image_ids) + \"]\" if image_ids else \"[]\"",
              "tests/test_photo_import.py",
              "id без кавычек — числовой id роняет загрузку базы знаний"),
+
+    # -- повтор уже названной суммы -----------------------------------------
+    Mutation(REPEAT, "app/agent/loop.py",
+             "            and invented_amounts(final_text, repeatable)\n        ):",
+             "            and True\n        ):",
+             "tests/test_agent.py",
+             "повтор уже названной суммы снова уводит клиента к оператору"),
+    Mutation(REPEAT, "app/agent/loop.py",
+             "            invented = invented_amounts(final_text, allowed_amounts | repeatable)",
+             "            invented = invented_amounts(final_text, allowed_amounts)",
+             "tests/test_agent.py",
+             "второй ценовой рубеж не пускает повтор после вызова инструмента"),
+    Mutation(REPEAT, "app/agent/loop.py",
+             "    if concession_given(state):\n        return set()",
+             "    if False:\n        return set()",
+             "tests/test_agent.py",
+             "после скидки разрешён повтор старой цены"),
+    Mutation(REPEAT, "app/agent/loop.py",
+             "    return bool(getattr(state, \"used_tiers\", None)) or getattr(state, \"floor_reached\", None) is not None",
+             "    return bool(getattr(state, \"used_tiers\", None))",
+             "tests/test_agent.py",
+             "достигнутый пол цены не считается уступкой"),
+    Mutation(REPEAT, "app/agent/loop.py",
+             "        if msg.get(\"role\") == \"assistant\" and isinstance(content, str):",
+             "        if isinstance(content, str):",
+             "tests/test_agent.py",
+             "сумма, названная клиентом, считается нашей и повторяется"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

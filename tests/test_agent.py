@@ -29,6 +29,7 @@ from app.agent.loop import (
     AMOUNT_MISMATCH_VIOLATION,
     _canonical_amount,
     amounts_in_payload,
+    amounts_sent_before,
     availability_claim,
     date_contradicts_now,
     estimate_cost_rub,
@@ -3192,3 +3193,101 @@ def test_the_now_block_gives_weekdays_for_two_weeks():
     assert "20.09 — воскресенье" in block
     assert "19.09 — суббота" in block
     assert "01.10 — четверг" in block      # последний, четырнадцатый день
+
+
+# --- повтор уже названной суммы: без скидки можно, после скидки — нет -------
+#
+# Решение заказчика 2026-09-18. Замер подтверждений: «ну что, подойдёт?» ->
+# модель повторяет «14 000 ₽» без нового расчёта -> ценовой рубеж уводил
+# готового клиента к оператору.
+
+QUOTED_BEFORE = [
+    {"role": "user", "content": "баня Русский стиль, 20 сентября, с 13 до 17, нас шестеро"},
+    {"role": "assistant", "content": "Свободно! Выходной тариф 3500 ₽/час, за 4 часа — 14 000 ₽. Бронируем?"},
+]
+REPEAT = "Да, «Русский стиль» 20 сентября, 14 000 ₽ за 4 часа. Оставьте имя и телефон."
+FOREIGN = "Да, «Русский стиль» 20 сентября, 12 000 ₽ за 4 часа. Оставьте имя и телефон."
+
+
+async def test_an_amount_already_sent_may_be_repeated_without_a_new_quote(kb):
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(REPEAT)])])
+    result = await agent.run_turn("chat-1", list(QUOTED_BEFORE), "ну что, подойдёт?")
+
+    assert result.text == REPEAT
+    assert result.escalated is False
+    assert result.llm_meta.get("guard_rail") is None
+
+
+@pytest.mark.parametrize("state", [
+    DialogConcessionState(base_price_quoted=True, used_tiers=frozenset({1})),
+    DialogConcessionState(base_price_quoted=True, floor_reached=Decimal("12000")),
+])
+async def test_after_a_concession_a_repeat_needs_a_new_quote(kb, state):
+    """После скидки в истории две цены, и какая верна, знает только расчёт.
+    Повтор старой — ровно то, что запрещает главное правило проекта."""
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(REPEAT)])])
+    result = await agent.run_turn("chat-1", list(QUOTED_BEFORE), "ну что, подойдёт?",
+                                  state=state)
+
+    assert "14 000" not in result.text
+    assert result.llm_meta["guard_rail"] == GUARD_RAIL_VIOLATION
+
+
+@pytest.mark.parametrize("state", [
+    None,
+    DialogConcessionState(base_price_quoted=True, used_tiers=frozenset({1})),
+])
+async def test_an_amount_from_nowhere_is_blocked_always(kb, state):
+    """Сумма, которой не было ни в истории агента, ни в ответе инструмента, —
+    выдумка при любом состоянии диалога."""
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(FOREIGN)])])
+    result = await agent.run_turn("chat-1", list(QUOTED_BEFORE), "ну что, подойдёт?",
+                                  state=state)
+
+    assert "12 000" not in result.text
+    assert result.llm_meta["guard_rail"] == GUARD_RAIL_VIOLATION
+
+
+async def test_an_amount_from_nowhere_is_blocked_even_after_a_tool_call(kb):
+    """Второй ценовой рубеж: инструмент вызван, но сумма не из его ответа и
+    не из прошлых сообщений агента."""
+    agent, _ = loop_for(kb, [
+        FakeResponse(content=[ToolUseBlock(name="get_zones", input={})]),
+        FakeResponse(content=[TextBlock(FOREIGN)]),
+    ])
+    result = await agent.run_turn("chat-1", list(QUOTED_BEFORE), "ну что, подойдёт?")
+
+    assert result.llm_meta["guard_rail"] == AMOUNT_MISMATCH_VIOLATION
+
+
+async def test_a_repeat_passes_the_second_price_guard_too(kb):
+    """Инструмент вызван (не цена), сумма — повтор уже названной: проходит."""
+    agent, _ = loop_for(kb, [
+        FakeResponse(content=[ToolUseBlock(name="get_zones", input={})]),
+        FakeResponse(content=[TextBlock(REPEAT)]),
+    ])
+    result = await agent.run_turn("chat-1", list(QUOTED_BEFORE), "ну что, подойдёт?")
+
+    assert result.text == REPEAT
+
+
+async def test_an_amount_the_client_named_is_not_a_repeat(kb):
+    """Повторять можно только СВОЁ: сумму назвал клиент — это не цена
+    комплекса, и без расчёта её называть нельзя."""
+    history = [
+        {"role": "user", "content": "нам сказали, что будет 12 000 ₽, это так?"},
+        {"role": "assistant", "content": "Здравствуйте! На какое число планируете?"},
+    ]
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(FOREIGN)])])
+    result = await agent.run_turn("chat-1", history, "на 20 сентября")
+
+    assert result.llm_meta["guard_rail"] == GUARD_RAIL_VIOLATION
+
+
+def test_amounts_sent_before_reads_thousands_the_same_way():
+    """«14 тыс.» в истории и «14 000 ₽» в ответе — одна сумма."""
+    history = [{"role": "assistant", "content": "Выйдет 14 тыс. за 4 часа."}]
+    assert "14000" in amounts_sent_before(history, None)
+    assert amounts_sent_before(
+        history, DialogConcessionState(used_tiers=frozenset({1}))
+    ) == set()
