@@ -2371,8 +2371,27 @@ async def test_two_system_messages_in_a_row_greet_once():
 
 async def test_two_system_messages_arriving_at_once_greet_once():
     """То же, но конкурентно: между проверкой истории и записью приветствия
-    лежит пауза доставки, и без отметки «уже здороваюсь» оба прошли бы."""
-    pipeline, store, agent, ops_service = _build()
+    лежит пауза доставки, и без отметки «уже здороваюсь» оба прошли бы.
+
+    Пауза здесь НАСТОЯЩАЯ, как в проде (`delay_fn` перед отправкой в живом
+    режиме). Без неё хранилище в памяти не отдаёт управление ни разу, первый
+    обработчик успевает всё до старта второго, и тест зеленел бы и без
+    защиты — мутационный стенд это поймал.
+    """
+    settings = _settings(dry_run=False, moderation_mode="off")
+    store = InMemoryDialogStore()
+    avito = _FakeAvito()
+
+    async def human_pause():
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    pipeline = MessagePipeline(
+        store=store, agent_loop=_FakeAgentLoop(),
+        ops_service=OpsService(store=InMemoryOpsStore(), settings=settings),
+        settings=settings, avito_client=avito, debounce_window_seconds=0,
+        now_fn=lambda: NOW, delay_fn=human_pause,
+    )
 
     await asyncio.gather(
         pipeline.handle_message(_system_payload(message_id="s-1")),
@@ -2380,9 +2399,7 @@ async def test_two_system_messages_arriving_at_once_greet_once():
     )
     await _settle()
 
-    greetings = [m for m in store.messages.get("chat-1", [])
-                 if m["direction"] == Direction.outgoing and m["text"] == SYSTEM_MESSAGE_GREETING]
-    assert len(greetings) == 1
+    assert avito.sent == [("chat-1", SYSTEM_MESSAGE_GREETING)]
 
 
 async def test_no_greeting_in_the_middle_of_a_conversation():
