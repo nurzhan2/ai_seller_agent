@@ -83,6 +83,9 @@ MORPH = "морфология"
 PROMISE = "обещания"
 ALTERNATIVES = "альтернативы"
 TAKEOVER = "перехват"
+ONE_QUESTION = "один-вопрос"
+SLOTS = "слоты"
+RATE_HINT = "тариф-без-итога"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -323,13 +326,13 @@ MUTATIONS: tuple[Mutation, ...] = (
 
     # -- лестница безопасного ответа ----------------------------------------
     Mutation(LADDER, "app/agent/loop.py",
-             "    if repeats == len(AVAILABILITY_GUARD_REPLIES):\n        return AVAILABILITY_GUARD_HANDOFF, True\n    return \"\", True",
+             "    if repeats == len(ladder):\n        return AVAILABILITY_GUARD_HANDOFF, True\n    return \"\", True",
              "    return AVAILABILITY_GUARD_HANDOFF, True",
              "tests/test_agent.py",
              "после карточки она же дословно, а не молчание"),
     Mutation(LADDER, "app/agent/loop.py",
-             "        return AVAILABILITY_GUARD_REPLIES[repeats], False",
-             "        return AVAILABILITY_GUARD_REPLIES[0], False",
+             "        return ladder[repeats], False",
+             "        return ladder[0], False",
              "tests/test_agent.py",
              "второй ответ дословно повторяет первый"),
     Mutation(LADDER, "app/agent/loop.py",
@@ -352,6 +355,74 @@ MUTATIONS: tuple[Mutation, ...] = (
              "            if False:\n                await self._notify_operator(chat, result, merged_text)",
              "tests/test_pipeline.py",
              "молчаливая эскалация не доходит до оператора"),
+
+    # -- лестница спрашивает недостающее ------------------------------------
+    Mutation(LADDER, "app/agent/loop.py",
+             "    missing = next_missing_slot(slots) if slots is not None else \"date\"",
+             "    missing = \"date\"",
+             "tests/test_agent.py",
+             "лестница снова требует дату, которую клиент уже назвал"),
+    Mutation(LADDER, "app/agent/loop.py",
+             "    if missing is None:\n        return (AVAILABILITY_GUARD_HANDOFF, True) if repeats == 0 else (\"\", True)",
+             "    if missing is None:\n        missing = \"date\"",
+             "tests/test_agent.py",
+             "клиент назвал всё, а его всё равно переспрашивают"),
+
+    # -- один вопрос в сообщении --------------------------------------------
+    Mutation(ONE_QUESTION, "app/agent/loop.py",
+             "            final_text = trimmed",
+             "            final_text = final_text",
+             "tests/test_agent.py",
+             "анкета из двух вопросов снова уходит клиенту"),
+    Mutation(ONE_QUESTION, "app/agent/one_question.py",
+             "        trimmed = normalized[:offset].rstrip()",
+             "        trimmed = (normalized[:offset] + normalized[offset + len(sentence):]).rstrip()",
+             "tests/test_one_question.py",
+             "вырезан только вопрос — пояснение к нему осталось висеть"),
+    Mutation(ONE_QUESTION, "app/agent/one_question.py",
+             "    return _REPEATED_MARKS.sub(\"?\", text or \"\")",
+             "    return text or \"\"",
+             "tests/test_one_question.py",
+             "«Правда???» считается за три вопроса и режет честный ответ"),
+    Mutation(ONE_QUESTION, "app/quality/asserts.py",
+             "    questions = count_questions(text)",
+             "    questions = 0",
+             "tests/test_quality.py",
+             "харнесс перестал замечать анкетные ответы"),
+
+    # -- что клиент уже сказал ----------------------------------------
+    Mutation(SLOTS, "app/agent/loop.py",
+             "        if context_hint:",
+             "        if False and context_hint:",
+             "tests/test_agent.py",
+             "разбор переписки до модели не доезжает"),
+    Mutation(SLOTS, "app/agent/slots.py",
+             "    messages.append(user_text or \"\")",
+             "    messages = [user_text or \"\"]",
+             "tests/test_slots.py",
+             "слоты читаются только из последнего сообщения, как раньше"),
+    Mutation(SLOTS, "app/agent/slots.py",
+             "    repeated = [slot for slot in asked if slot not in slots.known()]",
+             "    repeated = []",
+             "tests/test_slots.py",
+             "повторно заданный вопрос больше не помечается"),
+
+    # -- цифра вместо молчания про деньги -----------------------------
+    Mutation(RATE_HINT, "app/pricing/engine.py",
+             "            hint = rate_hint_for(kb, zone, req.date, req.guests)",
+             "            hint = None",
+             "tests/test_pricing.py",
+             "расчёт без итога снова молчит про деньги"),
+    Mutation(RATE_HINT, "app/pricing/engine.py",
+             "    if result.status in (\"needs_input\", \"invalid\") and result.rate_hint is None:",
+             "    if result.status in (\"needs_input\", \"invalid\", \"blocked\") and result.rate_hint is None:",
+             "tests/test_pricing.py",
+             "цифра просачивается в заблокированный расчёт"),
+    Mutation(RATE_HINT, "app/pricing/engine.py",
+             "    for field_name in _ASK_ORDER:\n        if field_name in fields:",
+             "    for field_name in list(fields) + list(_ASK_ORDER):\n        if field_name in fields and False:",
+             "tests/test_pricing.py",
+             "движок снова не спрашивает ничего внятного"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

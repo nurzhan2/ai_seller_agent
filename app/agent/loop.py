@@ -32,15 +32,23 @@ from app.agent.listing_context import (
     no_listing_hint,
     resolve_listing,
 )
+from app.agent.one_question import count_questions, trim_to_one_question
 from app.agent.prompts import CLASSIFIER_PROMPT, build_system_prompt
 from app.agent.providers.anthropic_provider import PRICE_PER_MTOK_RUB as _ANTHROPIC_RATES
 from app.agent.providers.anthropic_provider import AnthropicProvider
 from app.agent.providers.base import LLMProvider
 from app.agent.providers.deepseek_provider import PRICE_PER_MTOK_RUB as _DEEPSEEK_RATES
+from app.agent.slots import (
+    asked_slots,
+    build_context_hint,
+    extract_slots,
+    next_missing_slot,
+)
 from app.agent.tool_forcing import forced_tool_for
 from app.agent.tools import TOOLS, ToolExecutor, tool_result_block
 from app.clock import moscow_now
 from app.kb.loader import KnowledgeBase
+from app.metrics import guard_rails_total
 
 logger = logging.getLogger("parmangal.loop")
 
@@ -645,6 +653,9 @@ def date_contradicts_now(text: str, now: datetime) -> Optional[str]:
     return None
 
 
+QUESTION_GUARD_VIOLATION = (
+    "больше одного вопроса в ответе (последний рубеж) — лишние обрезаны"
+)
 AVAILABILITY_GUARD_VIOLATION = (
     "занятость без вызова check_availability/find_next_available (последний рубеж)"
 )
@@ -665,12 +676,47 @@ DATE_GUARD_VIOLATION = "дата в тексте противоречит бло
 # И ни один не попадает под собственные правила рубежа — иначе подстановка
 # сама выглядела бы как утверждение о календаре. Держится тестом
 # test_the_guard_replies_do_not_trip_the_guard_itself.
-AVAILABILITY_GUARD_REPLIES = (
-    "Подскажите, пожалуйста, на какое число и на сколько гостей вы "
-    "рассчитываете?",
-    "Чтобы посмотреть по календарю, мне нужны точная дата и количество "
-    "гостей — напишите их, пожалуйста.",
-)
+# ЛЕСТНИЦА СПРАШИВАЕТ РОВНО ОДНУ ВЕЩЬ, И ИМЕННО ТУ, КОТОРОЙ НЕ ХВАТАЕТ.
+#
+# Прежняя редакция была одна на все случаи: «на какое число И на сколько
+# гостей вы рассчитываете?» — то есть два вопроса в одном предложении (мимо
+# счётчика вопросительных знаков — знак-то один), да ещё и с риском
+# переспросить то, что клиент уже назвал. Заказчик после двух недель в
+# проде назвал ровно это главной причиной потери клиентов.
+#
+# Ключ — слот из app/agent/slots.py, значение — две ступени: вопрос и он же
+# другими словами. Третья ступень (карточка оператору) общая, четвёртая —
+# молчание, см. guard_substitution.
+AVAILABILITY_GUARD_LADDER: dict[str, tuple[str, str]] = {
+    "date": (
+        "Подскажите, пожалуйста, на какое число планируете отдых?",
+        "Чтобы посмотреть по календарю, мне нужно точное число — напишите "
+        "его, пожалуйста.",
+    ),
+    "zone": (
+        "Подскажите, пожалуйста, какая зона вас интересует?",
+        "Чтобы посмотреть по календарю, мне нужно знать зону — напишите, "
+        "пожалуйста, какая интересует.",
+    ),
+    "hours": (
+        "Подскажите, пожалуйста, на сколько часов планируете?",
+        "Чтобы посмотреть по календарю, мне нужна длительность — напишите, "
+        "пожалуйста, на сколько часов.",
+    ),
+    "start_time": (
+        "Подскажите, пожалуйста, со скольки планируете начать?",
+        "Чтобы посмотреть по календарю, мне нужно время начала — напишите "
+        "его, пожалуйста.",
+    ),
+    "guests": (
+        "Подскажите, пожалуйста, сколько вас будет?",
+        "Чтобы посмотреть по календарю, мне нужно количество гостей — "
+        "напишите, пожалуйста.",
+    ),
+}
+# Лестница по умолчанию — когда слоты не переданы (вызов без разбора
+# переписки). Дата нужна раньше всего остального, поэтому именно она.
+AVAILABILITY_GUARD_REPLIES = AVAILABILITY_GUARD_LADDER["date"]
 # Третье срабатывание подряд: разговор не двигается, зовём человека.
 AVAILABILITY_GUARD_HANDOFF = (
     # Без слов «занятость» и «свободно»: подстановка рубежа не должна сама
@@ -702,8 +748,16 @@ GUARD_RAIL_FALLBACK = (
 # мелочь: без неё серия рвалась. Последовательность «вопрос -> ценовой рубеж
 # -> рубеж занятости» давала клиенту ПЕРВЫЙ вопрос второй раз, потому что
 # счётчик обнулялся на ценовой отбивке, которую он в этот счёт не брал.
+#
+# ВСЯ ЛЕСТНИЦА ЦЕЛИКОМ, А НЕ ОДНА ЕЁ ВЕТКА. Тексты теперь зависят от того,
+# какого слота не хватало в тот ход, и посчитать подряд идущие подстановки
+# по одной ветке нельзя: клиент между ходами называет дату, следующая
+# подстановка приходит уже из ветки «часы», и счётчик обнулялся бы на ровном
+# месте — то есть лестница начиналась бы заново, а клиент получал бы первый
+# вопрос второй раз. Ровно та ошибка, что уже была с отбивкой ценового
+# рубежа (см. комментарий выше).
 _GUARD_TEXTS = (
-    frozenset(AVAILABILITY_GUARD_REPLIES)
+    frozenset(text for ladder in AVAILABILITY_GUARD_LADDER.values() for text in ladder)
     | {AVAILABILITY_GUARD_HANDOFF, GUARD_RAIL_FALLBACK, HANDED_TO_MANAGER}
 )
 
@@ -744,13 +798,24 @@ def escalation_topic_in(client_text: str, kb: Any) -> Optional[str]:
     return None
 
 
-def guard_substitution(repeats: int) -> tuple[str, bool]:
+def guard_substitution(repeats: int, slots: Any = None) -> tuple[str, bool]:
     """Что подставить на `repeats`-е срабатывание подряд и звать ли человека.
 
-        0 -> вопрос
+        0 -> вопрос про то, чего не хватает
         1 -> он же другими словами
         2 -> карточка оператору
         3 и дальше -> МОЛЧАНИЕ
+
+    `slots` (app/agent/slots.py:Slots) — что клиент уже сказал за весь
+    диалог. Спрашиваем ровно недостающее: без этого подстановка требовала у
+    клиента дату, которую он назвал тремя репликами раньше, — главная
+    жалоба заказчика 2026-09-18.
+
+    КОГДА СПРАШИВАТЬ НЕЧЕГО — клиент назвал всё, а модель всё равно сочинила
+    календарь — вопросов больше не задаём вовсе: любой из них был бы
+    повтором. Сразу карточка оператору, а дальше молчание. Это осознанно
+    строже прежнего поведения (там первые две ступени всегда спрашивали): в
+    этой ситуации вопрос клиенту — не работа агента, а имитация работы.
 
     ПОЧЕМУ ПОСЛЕ КАРТОЧКИ МОЛЧАНИЕ, А НЕ ЧЕТВЁРТЫЙ ТЕКСТ. Прежняя редакция
     считала `repeats >= len(REPLIES)` и на четвёртом, пятом, шестом
@@ -764,9 +829,14 @@ def guard_substitution(repeats: int) -> tuple[str, bool]:
     Возвращает (текст, эскалировать). Пустой текст — штатный исход: тот же
     путь, что у спама, конвейер его понимает.
     """
-    if repeats < len(AVAILABILITY_GUARD_REPLIES):
-        return AVAILABILITY_GUARD_REPLIES[repeats], False
-    if repeats == len(AVAILABILITY_GUARD_REPLIES):
+    missing = next_missing_slot(slots) if slots is not None else "date"
+    if missing is None:
+        return (AVAILABILITY_GUARD_HANDOFF, True) if repeats == 0 else ("", True)
+
+    ladder = AVAILABILITY_GUARD_LADDER.get(missing, AVAILABILITY_GUARD_REPLIES)
+    if repeats < len(ladder):
+        return ladder[repeats], False
+    if repeats == len(ladder):
         return AVAILABILITY_GUARD_HANDOFF, True
     return "", True
 
@@ -1014,6 +1084,22 @@ class AgentLoop:
             # клиент уже ответил, чего он хочет, и переспрашивать
             # направление в каждом сообщении незачем.
             turn_content = f"{user_text}\n\n{no_listing_hint()}"
+
+        # ЧТО КЛИЕНТ УЖЕ СКАЗАЛ ЗА ВЕСЬ ДИАЛОГ — разобранное кодом, а не
+        # памятью модели (app/agent/slots.py). Жалоба заказчика 2026-09-18:
+        # клиент называет дату и число гостей, а агент спрашивает их по
+        # кругу, пока клиент не уходит звонить.
+        #
+        # Слоты считаются по ВСЕЙ переданной истории, а не по окну запроса:
+        # окно режет то, что уедет модели, но «клиент назвал дату» —
+        # утверждение про диалог целиком.
+        slots = extract_slots(
+            history, user_text, listing_zone=listing_zone, today=now.date()
+        )
+        already_asked = asked_slots(history)
+        context_hint = build_context_hint(slots, already_asked)
+        if context_hint:
+            turn_content = f"{turn_content}\n\n{context_hint}"
 
         messages = list(history[-HISTORY_WINDOW:])
         messages.append({"role": "user", "content": turn_content})
@@ -1302,7 +1388,12 @@ class AgentLoop:
 
         if guard_reason:
             repeats = guard_repeats(history)
-            reply, escalate = guard_substitution(repeats)
+            reply, escalate = guard_substitution(repeats, slots)
+            # В метрику идёт ВИД нарушения без хвоста с подробностями:
+            # DATE_GUARD_VIOLATION дописывает к себе конкретное расхождение
+            # («сказано 1 сентября, сегодня 2 сентября»), и без отсечки у
+            # счётчика заводилась бы новая серия на каждую несовпавшую дату.
+            guard_rails_total.labels(rule=guard_reason.split(":")[0]).inc()
             logger.error(
                 "guard rail: %s (подряд %d)%s",
                 guard_reason, repeats + 1,
@@ -1338,6 +1429,39 @@ class AgentLoop:
                 concession_state=getattr(executor, "state", None),
                 concession_events=getattr(executor, "concession_events", []),
             )
+
+        # РУБЕЖ ОДНОГО ВОПРОСА — последним, уже над тем текстом, который
+        # уйдёт клиенту, и после всех остальных рубежей: их подстановки
+        # спрашивают ровно одну вещь по построению, резать там нечего.
+        #
+        # ЭТО НЕ ЭСКАЛАЦИЯ. Лишний вопрос — не ложь клиенту (в отличие от
+        # выдуманной цены или сочинённого календаря), а плохая форма
+        # ответа. Форму чиним молча, разговор продолжается; звать человека
+        # на каждый второй вопросительный знак значит превратить оператора
+        # в диспетчера — тот же довод, что и у рубежа занятости.
+        #
+        # Исходный текст сохраняется в llm_meta целиком: без него по логу
+        # не отличить «модель написала два вопроса, мы обрезали» от
+        # «модель написала один» — а это и есть измеряемая величина в
+        # замере (scripts/probe_questions.py).
+        if count_questions(final_text) > 1:
+            trimmed = trim_to_one_question(final_text)
+            guard_rails_total.labels(rule=QUESTION_GUARD_VIOLATION).inc()
+            logger.error(
+                "guard rail: %s — в ответе было %d вопросов",
+                QUESTION_GUARD_VIOLATION, count_questions(final_text),
+                extra={
+                    "dialog_id": dialog_id,
+                    "provider": self.provider.name,
+                    "withheld_text": final_text[:TOOL_TRACE_LIMIT],
+                },
+            )
+            llm_meta = {
+                **llm_meta,
+                "question_guard": QUESTION_GUARD_VIOLATION,
+                "untrimmed_text": final_text,
+            }
+            final_text = trimmed
 
         return TurnResult(
             text=final_text,

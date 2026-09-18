@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -19,8 +19,10 @@ from app.agent.debounce import Debouncer
 from app.agent.loop import (
     AVAILABILITY_GUARD_HANDOFF,
     AVAILABILITY_GUARD_HANDOFF_REASON,
+    AVAILABILITY_GUARD_LADDER,
     AVAILABILITY_GUARD_REPLIES,
     AVAILABILITY_GUARD_VIOLATION,
+    QUESTION_GUARD_VIOLATION,
     DATE_GUARD_VIOLATION,
     AgentLoop,
     TurnResult,
@@ -48,6 +50,7 @@ from app.agent.loop import (
     summarize_history,
 )
 from app.agent.prompts import build_system_prompt
+from app.agent.slots import Slots
 from app.agent.tools import TOOLS, ToolExecutor, quote_to_dict
 from app.kb.loader import load_catalog
 from app.pricing.concessions import DialogConcessionState
@@ -1025,7 +1028,14 @@ async def test_later_turns_without_item_id_do_not_repeat_the_direction_question(
     await agent.run_turn("d1", history, "русскую")
 
     main_call = next(c for c in client.messages.calls if c["model"] == "claude-sonnet-5")
-    assert main_call["messages"][-1]["content"] == "русскую"
+    sent_text = main_call["messages"][-1]["content"]
+    assert sent_text.startswith("русскую")
+    # Именно подсказки о направлении быть не должно. Сравнение с голым
+    # текстом клиента здесь больше не годится: к ходу теперь добавляется
+    # служебная подсказка со слотами (app/agent/slots.py), и она обязана
+    # ехать как раз на таких ходах — клиент в этой истории уже сказал
+    # «баню», и переспрашивать зону нельзя.
+    assert "баня, купол, гриль-домик или шатёр" not in sent_text
 
 
 def test_system_prompt_describes_one_question_disambiguation(kb):
@@ -2486,10 +2496,119 @@ def test_no_guard_reply_promises_the_agent_will_come_back():
 
 
 def test_the_guard_replies_do_not_trip_the_guard_itself():
-    """Самосогласованность всех трёх подстановок."""
-    for text in list(AVAILABILITY_GUARD_REPLIES) + [AVAILABILITY_GUARD_HANDOFF]:
+    """Самосогласованность ВСЕХ подстановок лестницы, а не одной её ветки."""
+    ladder = [text for branch in AVAILABILITY_GUARD_LADDER.values() for text in branch]
+    for text in ladder + [AVAILABILITY_GUARD_HANDOFF]:
         assert availability_claim(text) is False, text
         assert date_contradicts_now(text, INCIDENT_NOW) is None, text
+
+
+# --- лестница спрашивает то, чего не хватает --------------------------------
+
+def test_the_ladder_asks_about_the_missing_parameter():
+    """Жалоба заказчика: подстановка требовала дату, которую клиент назвал
+    тремя репликами раньше. Теперь спрашивается первый недостающий слот."""
+    known_date = Slots(date=date(2026, 9, 20), zone="гриль")
+
+    assert guard_substitution(0, known_date) == (AVAILABILITY_GUARD_LADDER["hours"][0], False)
+    assert guard_substitution(1, known_date) == (AVAILABILITY_GUARD_LADDER["hours"][1], False)
+    assert guard_substitution(2, known_date) == (AVAILABILITY_GUARD_HANDOFF, True)
+
+
+def test_without_slots_the_ladder_asks_for_the_date():
+    """Совместимость: вызов без разбора переписки ведёт себя как раньше."""
+    assert guard_substitution(0) == (AVAILABILITY_GUARD_LADDER["date"][0], False)
+    assert guard_substitution(0) == (AVAILABILITY_GUARD_REPLIES[0], False)
+
+
+def test_when_the_client_told_everything_the_guard_goes_straight_to_the_operator():
+    """Спрашивать нечего — любой вопрос был бы повтором. Карточка человеку
+    сразу, дальше молчание: повторять карточку слово в слово запрещено."""
+    everything = Slots(
+        date=date(2026, 9, 20), guests=6, hours=4,
+        start_time=time(13, 0), zone="гриль",
+    )
+
+    assert guard_substitution(0, everything) == (AVAILABILITY_GUARD_HANDOFF, True)
+    assert guard_substitution(1, everything) == ("", True)
+
+
+async def test_a_two_question_reply_never_reaches_the_client(kb):
+    """Рубеж одного вопроса в живом ходу.
+
+    Текст нарочно безобидный для остальных рубежей: ни сумм, ни утверждений
+    о календаре — проверяется именно форма ответа.
+    """
+    anketa = (
+        "Рада помочь! На сколько часов планируете? И сколько вас будет?"
+    )
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(anketa)])])
+    result = await agent.run_turn("chat-1", [], "хочу баню")
+
+    assert result.text == "Рада помочь! На сколько часов планируете?"
+    assert result.text.count("?") == 1
+    # Ход продолжается как обычный: лишний вопрос — плохая форма, а не ложь.
+    assert result.escalated is False
+    # Исходный текст сохранён целиком — без него замер не отличит
+    # «модель написала два вопроса» от «модель написала один».
+    assert result.llm_meta["untrimmed_text"] == anketa
+    assert result.llm_meta["question_guard"] == QUESTION_GUARD_VIOLATION
+
+
+async def test_a_reply_with_one_question_is_not_touched(kb):
+    """Форма ответа из требования заказчика — проходит нетронутой."""
+    good = "Гриль-домик у нас уютный. На сколько часов планируете?"
+    agent, _ = loop_for(kb, [FakeResponse(content=[TextBlock(good)])])
+    result = await agent.run_turn("chat-1", [], "расскажите про гриль-домик")
+
+    assert result.text == good
+    assert "question_guard" not in result.llm_meta
+
+
+async def test_what_the_client_already_said_is_handed_to_the_model(kb):
+    """Слоты из всей переписки уезжают в ход подсказкой, а не надеждой на
+    память модели."""
+    history = [
+        {"role": "user", "content": "интересует гриль-домик на 20 сентября"},
+        {"role": "assistant", "content": "Здравствуйте! Сколько вас будет?"},
+        {"role": "user", "content": "нас 6теро"},
+    ]
+    agent, client = loop_for(kb, [FakeResponse(content=[TextBlock("Хорошо!")])])
+    await agent.run_turn("chat-1", history, "а цена какая?")
+
+    main_call = next(c for c in client.messages.calls if c["model"] == "claude-sonnet-5")
+    sent = main_call["messages"][-1]["content"]
+
+    assert "ИЗ ПЕРЕПИСКИ УЖЕ ИЗВЕСТНО" in sent
+    assert "20 сентября" in sent and "2026-09-20" in sent
+    assert "гостей — 6" in sent
+
+
+async def test_a_question_left_unanswered_is_flagged_to_the_model(kb):
+    history = [
+        {"role": "user", "content": "хочу баню"},
+        {"role": "assistant", "content": "На сколько часов планируете?"},
+    ]
+    agent, client = loop_for(kb, [FakeResponse(content=[TextBlock("Хорошо!")])])
+    await agent.run_turn("chat-1", history, "а что у вас есть вообще?")
+
+    main_call = next(c for c in client.messages.calls if c["model"] == "claude-sonnet-5")
+    sent = main_call["messages"][-1]["content"]
+
+    assert "ТЫ УЖЕ СПРАШИВАЛА ЭТО" in sent
+    assert "длительность" in sent
+
+
+def test_the_ladder_counter_survives_a_switch_between_branches():
+    """Клиент между ходами назвал дату — следующая подстановка приходит уже
+    из другой ветки лестницы. Счётчик обязан это пережить, иначе клиент
+    получает первый вопрос второй раз (та же ошибка, что была с отбивкой)."""
+    history = [
+        {"role": "assistant", "content": AVAILABILITY_GUARD_LADDER["date"][0]},
+        {"role": "user", "content": "20 сентября"},
+        {"role": "assistant", "content": AVAILABILITY_GUARD_LADDER["hours"][0]},
+    ]
+    assert guard_repeats(history) == 2
 
 
 # --- инструменты дают право говорить ---------------------------------------

@@ -353,12 +353,48 @@ def quote_to_dict(q: PriceQuote) -> dict:
     elif q.status == "needs_input":
         payload["missing_fields"] = list(q.missing_fields)
         payload["instruction"] = (
-            "Задай клиенту вопрос про недостающее. Это НЕ повод эскалировать."
+            "Задай клиенту ОДИН вопрос про недостающее — тот, что в "
+            "suggested_question. Это НЕ повод эскалировать."
         )
+        payload["suggested_question"] = q.human_readable
     elif q.status == "invalid":
         payload["reason"] = q.blocked_reason
         payload["suggested_alternatives"] = list(q.suggested_alternatives)
         payload["instruction"] = "Объясни причину и предложи альтернативу."
+
+    # СНАЧАЛА ЦИФРА, ПОТОМ ВОПРОС. Требование заказчика 2026-09-18: молчать
+    # про деньги, пока не собраны все поля, — способ потерять клиента,
+    # который спросил «сколько стоит».
+    #
+    # ОТДЕЛЬНОЙ ВЕТКОЙ ПОСЛЕ ВСЕХ СТАТУСОВ, А НЕ ВНУТРИ needs_input: та же
+    # цифра нужна и когда расчёт вернул `invalid` — «пакет «весь день»
+    # действует только пн-чт» без ставки за час оставляет клиента, который
+    # спросил цену на субботу, вообще без цены. Сам `rate_hint` при статусе
+    # `blocked` не выставляется (см. app/pricing/engine.py:quote), поэтому
+    # запрет на суммы в блокировке этой веткой не обходится.
+    #
+    # Числа отсюда попадают в набор разрешённых сумм автоматически
+    # (app/agent/loop.py:amounts_in_payload ходит по всему ответу
+    # инструмента), поэтому рубеж суммы их пропустит.
+    if q.rate_hint is not None:
+        hint: dict[str, Any] = {
+            "day_type": q.rate_hint.day_type,
+            "instruction": (
+                "Сначала назови тариф и минимум, потом задай ОДИН вопрос. "
+                "Это тариф, а не итог: слово «итого» и общую сумму не "
+                "говори, пока расчёт не вернул status=ok."
+            ),
+        }
+        if q.rate_hint.per_hour is not None:
+            hint["per_hour"] = _jsonable(q.rate_hint.per_hour)
+        if q.rate_hint.per_day is not None:
+            hint["per_day"] = _jsonable(q.rate_hint.per_day)
+        if q.rate_hint.min_hours is not None:
+            hint["min_hours"] = q.rate_hint.min_hours
+        if q.rate_hint.day_package is not None:
+            hint["day_package"] = _jsonable(q.rate_hint.day_package)
+        payload["rate_hint"] = hint
+
     return payload
 
 

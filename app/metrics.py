@@ -37,6 +37,14 @@ revenue_delta_rub = Counter(
     "parmangal_revenue_delta_rub", "Сумма недополученной выручки по уступкам"
 )
 llm_cost_rub = Counter("parmangal_llm_cost_rub", "Расход на модели, рубли", ["model"])
+# Срабатывания последних рубежей (app/agent/loop.py) по видам. До этого
+# счётчика рубежи оставляли след ТОЛЬКО в логах, и на вопрос «стало ли
+# меньше анкетных ответов после выкатки» приходилось отвечать грепом по
+# Railway — то есть за то окно, что там ещё хранится. Метрика отвечает на
+# него числом и на любом горизонте.
+guard_rails_total = Counter(
+    "parmangal_guard_rails_total", "Срабатывания рубежей", ["rule"]
+)
 turn_seconds = Histogram("parmangal_turn_seconds", "Время обработки хода")
 agent_paused = Gauge("parmangal_agent_paused", "1 если агент на паузе")
 dry_run_gauge = Gauge("parmangal_dry_run", "1 если включён режим модерации")

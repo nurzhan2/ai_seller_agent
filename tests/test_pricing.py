@@ -742,3 +742,106 @@ def test_status_coverage(kb):
         seen[quote(req, kb).status] = seen.get(quote(req, kb).status, 0) + 1
     for status in ("ok", "blocked", "invalid", "needs_input"):
         assert seen.get(status, 0) >= 3, f"{status}: {seen.get(status, 0)} cases"
+
+
+# ==========================================================================
+# 15. Тариф, который можно назвать до расчёта (RateHint)
+# ==========================================================================
+#
+# Требование заказчика 2026-09-18: «если не хватает только длительности,
+# назови цену за час и минимум, а не молчи про деньги» и, отдельной
+# поправкой, «если известна зона и день недели — цену за час можно называть
+# всегда, даже если не хватает двух параметров».
+
+def test_needs_input_carries_the_hourly_rate_and_the_minimum(kb):
+    """Клиент назвал зону и дату, но не сказал, на сколько часов."""
+    result = q(kb, zone_id="bath_russian", date=SAT)
+
+    assert result.status == "needs_input"
+    assert result.missing_fields == ("hours",)
+    assert result.rate_hint is not None
+    assert result.rate_hint.per_hour == money(3500)     # выходной тариф бани
+    assert result.rate_hint.min_hours == 3
+    assert result.rate_hint.day_type == "weekend"
+
+
+def test_the_weekday_rate_is_used_on_a_weekday(kb):
+    result = q(kb, zone_id="bath_russian", date=THU)
+
+    assert result.rate_hint.per_hour == money(2500)
+    assert result.rate_hint.day_type == "weekday"
+
+
+def test_an_invalid_quote_still_names_the_rate(kb):
+    """ГЛАВНЫЙ СЛУЧАЙ ПОПРАВКИ ЗАКАЗЧИКА. «Сколько стоит гриль-домик в
+    субботу?» упирается в пакет «весь день» (он только пн-чт) и возвращает
+    invalid — до этой правки без единой цифры, то есть клиент, спросивший
+    цену, не получал цены вообще.
+    """
+    result = q(kb, zone_id="grill_house", date=SAT)
+
+    assert result.status == "invalid"
+    assert result.rate_hint is not None
+    assert result.rate_hint.per_hour == money(2000)
+    assert result.rate_hint.min_hours == 3
+
+
+def test_a_blocked_quote_never_carries_a_rate(kb):
+    """Блокировка означает «величина не подтверждена, решает менеджер».
+    Любая цифра в таком ответе запрещена — и промтом, и правилом харнесса
+    amount_after_blocked."""
+    result = q(kb, zone_id="bath_russian", date=SAT, start_time=time(21, 0), hours=4, guests=6)
+
+    assert result.status == "blocked"
+    assert result.rate_hint is None
+
+
+def test_an_ok_quote_needs_no_hint(kb):
+    """При готовом расчёте есть сумма — подсказка про тариф лишняя и только
+    соблазняла бы модель показать производную ставку за час."""
+    result = q(kb, zone_id="bath_russian", date=SAT, start_time=NOON, hours=3, guests=6)
+
+    assert result.status == "ok"
+    assert result.rate_hint is None
+
+
+def test_the_tent_has_no_rate_until_the_party_size_is_known(kb):
+    """Единственная зона со ставкой по числу гостей: без него ставки не
+    существует, и «от 2500» было бы ценой, которой у этой компании может
+    не быть."""
+    # Оба хода не дошли до суммы: в первом не назван размер компании, во
+    # втором — время начала. Разница только в том, можно ли назвать ставку.
+    without_guests = q(kb, zone_id="tent", date=SAT, hours=3)
+    with_guests = q(kb, zone_id="tent", date=SAT, hours=3, guests=15)
+
+    assert without_guests.status == "needs_input"
+    assert without_guests.rate_hint is None
+
+    assert with_guests.status == "needs_input"
+    assert with_guests.missing_fields == ("start_time",)
+    assert with_guests.rate_hint is not None
+    assert with_guests.rate_hint.per_hour == money(2500)
+
+
+def test_the_day_package_is_only_hinted_on_the_days_it_works(kb):
+    """У гриль-домика пакет «весь день» действует пн-чт. Назвать 7000 за
+    субботу значит пообещать то, чего в этот день не существует."""
+    thursday = q(kb, zone_id="grill_house", date=THU, start_time=NOON, hours=2, guests=6)
+    saturday = q(kb, zone_id="grill_house", date=SAT, start_time=NOON, hours=2, guests=6)
+
+    assert thursday.rate_hint is None or thursday.rate_hint.day_package == money(7000)
+    assert saturday.rate_hint is None or saturday.rate_hint.day_package is None
+
+
+def test_a_missing_zone_gets_no_hint(kb):
+    assert q(kb, zone_id="no_such_zone", date=SAT).rate_hint is None
+
+
+def test_the_question_asks_for_one_thing_only(kb):
+    """«сколько будет гостей И со скольки планируете?» — два вопроса в одном
+    предложении, мимо счётчика вопросительных знаков. Так больше нельзя."""
+    result = q(kb, zone_id="tent", date=SAT, hours=3)
+
+    assert len(result.missing_fields) > 1          # не хватает нескольких полей
+    assert result.human_readable.count("?") == 1
+    assert " и " not in result.human_readable.lower()

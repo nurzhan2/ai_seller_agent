@@ -77,6 +77,37 @@ class PriceLine:
 
 
 @dataclass(frozen=True)
+class RateHint:
+    """Тариф зоны на эту дату — чтобы можно было назвать цифру ДО расчёта.
+
+    ЗАЧЕМ. Жалоба заказчика 2026-09-18: «если не хватает только
+    длительности, назови цену за час и минимум, а не молчи про деньги».
+    Дословная форма ответа, которую он хочет видеть:
+
+        «Гриль-домик на 20 сентября свободен с 13:00. По цене: выходной
+         тариф 2000 ₽/час, минимум 3 часа. На сколько часов планируете?»
+
+    До этого `needs_input` возвращал ОДИН только список недостающих полей,
+    без единой цифры, — и модели физически нечего было сказать про деньги,
+    кроме вопроса. Клиент, спросивший «сколько стоит», получал допрос.
+
+    ПОДСКАЗКА — НЕ РАСЧЁТ. Здесь нет ни акций, ни минимума как суммы, ни
+    предоплаты: это тариф из каталога, а не итог по конкретной броне. Итог
+    по-прежнему бывает только со `status="ok"`, и никакой другой путь к
+    сумме в этом проекте не открывается.
+    """
+
+    day_type: DayType
+    per_hour: Optional[Money] = None
+    min_hours: Optional[int] = None
+    # Пакет «весь день» — только если он вообще применим к этому дню недели
+    # (у гриль-домика он пн-чт): назвать «7000 за день» на субботу значит
+    # пообещать то, чего в этот день не существует.
+    day_package: Optional[Money] = None
+    per_day: Optional[Money] = None
+
+
+@dataclass(frozen=True)
 class PriceQuote:
     status: Status
     total: Optional[Money] = None
@@ -100,6 +131,9 @@ class PriceQuote:
     advisory_question_ids: tuple[str, ...] = ()
     # status="needs_input" only: what the client still has to tell us.
     missing_fields: tuple[str, ...] = ()
+    # status="needs_input" only: тариф, который УЖЕ можно назвать, хотя
+    # итоговой суммы ещё нет. См. RateHint.
+    rate_hint: Optional[RateHint] = None
     # status="invalid" only: zones that could host this party instead.
     suggested_alternatives: tuple[str, ...] = ()
     # Base hourly rate actually used, for the concession engine's ratchet.
@@ -200,6 +234,86 @@ def is_provisional_holiday(kb: KnowledgeBase, d: DateType) -> bool:
     return kb.catalog.constants.holidays.contains(d)
 
 
+def rate_hint_for(
+    kb: KnowledgeBase, zone: Zone, when: DateType, guests: Optional[int] = None
+) -> Optional[RateHint]:
+    """Тариф зоны на дату — или None, если назвать его честно нельзя.
+
+    НИЧЕГО НЕ БЛОКИРУЕТ И НЕ ПОРТИТ РАСЧЁТ. Функция работает на своём
+    одноразовом контексте и при любой неподтверждённой величине возвращает
+    None вместо того, чтобы поднять блокировку. Это подсказка: её
+    отсутствие возвращает поведение ровно к прежнему (`needs_input` без
+    цифр), а вот подсказка, превратившая уточняющий вопрос в «уточню у
+    менеджера», сломала бы диалог, который сейчас работает.
+
+    ТРЕБОВАНИЕ ЗАКАЗЧИКА 2026-09-18, дословно: «Если известна зона и день
+    недели — цену за час можно называть всегда, даже если не хватает двух
+    параметров. Клиент спрашивает „сколько стоит“ — он должен услышать
+    цифру». Поэтому здесь нет ни слова о том, сколько полей осталось
+    незаполненными: хватает зоны и даты.
+    """
+    day_type = resolve_day_type(kb, zone, when)
+    if isinstance(day_type, _Missing):
+        return None
+
+    scratch = _Ctx(blocking=[], advisory=[], warnings=[], lines=[])
+    pricing = zone.pricing or {}
+    mode = pricing.get("mode")
+
+    per_hour: Optional[Money] = None
+    per_day: Optional[Money] = None
+
+    if mode == "hourly":
+        if pricing.get("rate_depends_on_guests"):
+            # Шатёр: без числа гостей ставки не существует — не одной, а
+            # никакой (ответ 5.1/5.2, тарифные ступени по вместимости).
+            # Назвать «от 2500» значит назвать цену, которой у этой
+            # компании может не быть.
+            if guests is None:
+                return None
+            rate = _tent_rate(
+                PriceRequest(zone_id=zone.id, date=when, guests=guests),
+                zone, day_type, scratch,
+            )
+            per_hour = rate if isinstance(rate, Decimal) else None
+        else:
+            key = "weekday_per_hour" if day_type == "weekday" else "weekend_per_hour"
+            got = _read(pricing.get(key), f"{zone.id}.pricing.{key}")
+            if not isinstance(got, _Missing) and got is not None:
+                per_hour = money(got)
+    elif mode == "daily":
+        for key in (
+            "weekday_per_day" if day_type == "weekday" else "weekend_per_day",
+            "per_day",
+        ):
+            got = _read(pricing.get(key), f"{zone.id}.pricing.{key}")
+            if not isinstance(got, _Missing) and got is not None:
+                per_day = money(got)
+                break
+
+    min_hours: Optional[int] = None
+    got_min = _read(pricing.get("min_hours"), f"{zone.id}.pricing.min_hours")
+    if isinstance(got_min, int):
+        min_hours = got_min
+
+    day_package: Optional[Money] = None
+    package = zone.day_package or {}
+    if package:
+        allowed_days = package.get("days")
+        applies = not allowed_days or _DOW_TOKENS[when.weekday()] in allowed_days
+        got_package = _read(package.get("price"), f"{zone.id}.day_package.price")
+        if applies and not isinstance(got_package, _Missing) and got_package is not None:
+            day_package = money(got_package)
+
+    if per_hour is None and per_day is None and day_package is None:
+        return None
+
+    return RateHint(
+        day_type=day_type, per_hour=per_hour, min_hours=min_hours,
+        day_package=day_package, per_day=per_day,
+    )
+
+
 # --------------------------------------------------------------------------
 # Extras
 # --------------------------------------------------------------------------
@@ -274,6 +388,36 @@ def _hhmm_to_minutes(value: str) -> int:
 
 
 def quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
+    """Расчёт плюс тариф, который можно назвать, даже когда расчёта нет.
+
+    ПОЧЕМУ ОБЁРТКА, А НЕ ПРАВКА В КАЖДОЙ ВЕТКЕ. Выходов без суммы у
+    расчёта много: не хватает полей (`needs_input`), пакет «весь день» не
+    действует в этот день недели, часов меньше минимума, компания не
+    помещается в зону (`invalid`). Заказчик требует цифру во ВСЕХ этих
+    случаях — «клиент спрашивает „сколько стоит“, он должен услышать
+    цифру», — а дописывать подсказку в каждую ветку значит гарантированно
+    забыть про следующую новую. Тот же приём, что и у гейта исходящих:
+    инвариант проверяется на границе, а не переписывается у каждого
+    вызывающего.
+
+    `blocked` СЮДА НЕ ВХОДИТ, и это не оплошность. Блокировка означает
+    «величина не подтверждена, решает менеджер», и любая цифра в таком
+    ответе — ровно то, что запрещено промтом и правилом харнесса
+    `amount_after_blocked`. Молчание про деньги здесь и есть верный ответ.
+    """
+    result = _compute_quote(req, kb)
+
+    if result.status in ("needs_input", "invalid") and result.rate_hint is None:
+        zone = next((z for z in kb.catalog.zones if z.id == req.zone_id), None)
+        if zone is not None:
+            hint = rate_hint_for(kb, zone, req.date, req.guests)
+            if hint is not None:
+                result = replace(result, rate_hint=hint)
+
+    return result
+
+
+def _compute_quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
     ctx = _Ctx(blocking=[], advisory=[], warnings=[], lines=[])
 
     # ---- zone lookup -----------------------------------------------------
@@ -314,11 +458,14 @@ def quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
     if mode == "hourly" and req.hours is None and not zone.day_package:
         missing_fields.append("hours")
     if missing_fields:
+        # Подсказка о тарифе идёт ВМЕСТЕ с вопросом, а не вместо него: цену
+        # за час назвать уже можно, а итог — ещё нет. См. RateHint.
         return PriceQuote(
             status="needs_input",
             zone_id=zone.id,
             missing_fields=tuple(missing_fields),
             human_readable=_ask_for(missing_fields),
+            rate_hint=rate_hint_for(kb, zone, req.date, req.guests),
         )
 
     # Праздники больше не блокируют расчёт: заказчик подтвердил, что они
@@ -814,14 +961,31 @@ def _alternatives_for(kb: KnowledgeBase, guests: int, exclude: str) -> tuple[str
     )
 
 
+# Порядок — в нём и спрашиваем, если не хватает нескольких полей. Сначала
+# длительность: без неё нет суммы вообще, а число гостей влияет на цену
+# только у шатра.
+_ASK_ORDER = ("hours", "start_time", "guests")
+_ASK_QUESTIONS = {
+    "guests": "сколько будет гостей",
+    "start_time": "со скольки планируете",
+    "hours": "на сколько часов планируете",
+}
+
+
 def _ask_for(fields: Sequence[str]) -> str:
-    questions = {
-        "guests": "сколько будет гостей",
-        "start_time": "со скольки планируете",
-        "hours": "на сколько часов",
-    }
-    parts = [questions[f] for f in fields if f in questions]
-    return "Подскажите, пожалуйста, " + " и ".join(parts) + "?"
+    """ОДИН вопрос, а не перечисление через «и».
+
+    Раньше здесь склеивалось «сколько будет гостей и со скольки
+    планируете?» — два вопроса в одном предложении, причём мимо счётчика
+    вопросительных знаков (знак-то один). Заказчик после двух недель в
+    проде: «максимум один вопрос в сообщении, не анкета». Остальные
+    недостающие поля никуда не деваются — они в `missing_fields`, и агент
+    спросит их следующим ходом, когда клиент ответит на этот.
+    """
+    for field_name in _ASK_ORDER:
+        if field_name in fields:
+            return "Подскажите, пожалуйста, " + _ASK_QUESTIONS[field_name] + "?"
+    return "Подскажите, пожалуйста, недостающие детали?"
 
 
 def _render(lines: Sequence[PriceLine], total: Money, occupied: Optional[int],

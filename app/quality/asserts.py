@@ -16,6 +16,7 @@ from typing import Iterable, Optional, Sequence
 
 from app.agent.loop import PRICE_LIKE_WITHOUT_TOOL_CALL as _MONEY
 from app.agent.loop import invented_amounts
+from app.agent.one_question import count_questions
 
 MAX_REPLY_LENGTH = 700
 MAX_QUESTION_MARKS = 1
@@ -133,9 +134,15 @@ def check_turn(turn: TurnUnderTest) -> list[Violation]:
         violations.append(Violation("too_long", f"{len(text)} символов, лимит {MAX_REPLY_LENGTH}"))
 
     # 9. Не больше одного вопроса за сообщение.
-    if text.count("?") > MAX_QUESTION_MARKS:
+    #
+    # Считает ТА ЖЕ функция, что и рубеж в рантайме (app/agent/one_question.py),
+    # а не своя копия правила: «Правда???» — один вопрос, а не три, и две
+    # разные арифметики для одного инварианта разошлись бы молча. Ровно та
+    # же причина, по которой отсюда же импортируется денежный паттерн.
+    questions = count_questions(text)
+    if questions > MAX_QUESTION_MARKS:
         violations.append(
-            Violation("too_many_questions", f"{text.count('?')} вопросов — получается анкета")
+            Violation("too_many_questions", f"{questions} вопросов — получается анкета")
         )
 
     # 10. Только зоны из каталога.
