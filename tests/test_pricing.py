@@ -845,3 +845,8 @@ def test_the_question_asks_for_one_thing_only(kb):
     assert len(result.missing_fields) > 1          # не хватает нескольких полей
     assert result.human_readable.count("?") == 1
     assert " и " not in result.human_readable.lower()
+    # И это вопрос про КОНКРЕТНОЕ поле — первое по приоритету из
+    # недостающих (время начала раньше гостей), а не общее «уточните
+    # детали», на которое клиенту нечего ответить.
+    assert set(result.missing_fields) == {"guests", "start_time"}
+    assert "со скольки" in result.human_readable.lower()
