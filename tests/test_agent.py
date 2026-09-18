@@ -2933,3 +2933,30 @@ async def test_a_real_tool_with_string_arguments_still_runs(kb):
 
     assert result.tool_calls == ["resolve_date"]
     assert result.tool_call_errors == 0
+
+
+# --- «заняться» — не «занято» ---------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    # Дословно из замера 2026-09-18 (scripts/probe_questions.py): честные
+    # ответы на вопрос клиента про детскую площадку, срезанные рубежом.
+    "На территории есть детская площадка, так что детям будет чем заняться! "
+    "Бань у нас три: «Русский стиль» и «Гараж» — до 10-12 человек, "
+    "«Рыцарская» — камерная, до 6. Какая ближе по духу?",
+    "Да, на территории есть детская площадка — детям будет чем заняться, "
+    "пока взрослые парятся.",
+    "Для детей много занятий на территории.",
+])
+def test_occupying_yourself_is_not_a_calendar_claim(text):
+    assert availability_claim(text) is False
+
+
+@pytest.mark.parametrize("text", [
+    "Гриль-домик на субботу занят.",
+    "Суббота уже занята.",
+    "Все бани заняты до 18:00.",
+    "Занятость на 20-е высокая.",
+])
+def test_real_occupancy_words_are_still_caught(text):
+    """Обратная сторона правки: исключены только «заняться» и «занятие»."""
+    assert availability_claim(text) is True

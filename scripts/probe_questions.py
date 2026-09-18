@@ -37,10 +37,16 @@ pytest — один провал из пяти повторов красил б�
 неурезанному тексту, который ход сохраняет в llm_meta целиком.
 
 ЧТО НАСТОЯЩЕЕ. Модель, системный промт, объявления инструментов, петля
-run_turn и все рубежи — как в проде. Не настоящий только YCLIENTS:
-ToolExecutor создаётся без booking_provider, поэтому check_availability
-отдаёт status "unknown". Для этого замера это неважно — считается форма
-ответа, а не содержимое календаря.
+run_turn и все рубежи — как в проде. Не настоящий только YCLIENTS: вместо
+него календарь-заглушка, у которой всё свободно с 13:00 (_FreeCalendar).
+
+ПОЧЕМУ ЗАГЛУШКА, А НЕ «БЕЗ КАЛЕНДАРЯ». Первые два прогона шли без
+booking_provider, и check_availability отвечал "unknown" — на что агент по
+правилам честно передаёт вопрос о занятости человеку. Главный случай жалобы
+(«есть свободное время и сколько стоит?» с карточки гриль-домика) из-за
+этого в трёх ответах из пяти уходил к менеджеру и вообще не мерил то, ради
+чего заведён. В проде календарь подключён, и «unknown» там — сбой, а не
+норма. Боевой YCLIENTS ради статистики не дёргаем.
 
 Стоимость: один ход — вызов классификатора плюс вызов диалоговой модели и
 по вызову на каждый виток инструментов. Прогон по умолчанию (9 случаев × 5
@@ -71,6 +77,7 @@ from app.agent.providers.factory import default_models_for
 from app.agent.slots import asked_slots, extract_slots
 from app.agent.listing_context import ItemZoneRow
 from app.agent.tools import ToolExecutor
+from app.booking.base import Availability, AvailabilityStatus, BookingResult
 from app.kb.loader import load_catalog
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -174,13 +181,13 @@ CASES: tuple[Case, ...] = (
         id="everything_is_known",
         client_text="ну что, подойдёт?",
         why="Клиент назвал всё: зону, дату, время, длительность, гостей. "
-            "Любой уточняющий вопрос здесь — переспрос известного. Цифру "
-            "не ждём: без YCLIENTS календарь отвечает unknown, и агент "
-            "честно передаёт вопрос о занятости человеку",
+            "Любой уточняющий вопрос здесь — переспрос известного. Цифра "
+            "обязательна: зона и день известны",
         history=(
             {"role": "user", "content": "баня Русский стиль, 20 сентября, с 13 до 17, нас шестеро"},
             {"role": "assistant", "content": "Здравствуйте! Секунду, посмотрю."},
         ),
+        expect_money=True,
     ),
     Case(
         id="bare_price_question",
@@ -217,6 +224,30 @@ class Attempt:
     latency_ms: float = 0.0
 
 
+class _FreeCalendar:
+    """Календарь, в котором всё свободно с 13:00. Брони не ставит."""
+
+    SLOTS = ("13:00", "14:00", "15:00", "16:00", "17:00", "18:00")
+
+    async def get_services(self):
+        return []
+
+    async def check_availability(self, zone_id, date, start_time=None, hours=None):
+        return Availability(AvailabilityStatus.FREE, free_slots=self.SLOTS)
+
+    async def get_free_slots(self, zone_id, date):
+        return Availability(AvailabilityStatus.FREE, free_slots=self.SLOTS)
+
+    async def create_booking(self, request):
+        return BookingResult(success=False, error="замер: брони не ставятся")
+
+    async def cancel_booking(self, booking_id):
+        return BookingResult(success=False, error="замер")
+
+    async def create_payment_link(self, booking_id, amount):
+        return None
+
+
 class _ListingStub:
     """Объявление, с которого пришёл клиент, — без похода в базу."""
 
@@ -228,7 +259,7 @@ class _ListingStub:
 
 
 async def run_attempt(agent: AgentLoop, kb: Any, case: Case) -> Attempt:
-    executor = ToolExecutor(kb, f"probe-{case.id}")
+    executor = ToolExecutor(kb, f"probe-{case.id}", booking_provider=_FreeCalendar())
     agent.executor_factory = lambda did, state, _ex=executor: _ex
 
     listing: dict[str, Any] = {}
