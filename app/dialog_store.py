@@ -87,6 +87,7 @@ class DialogStore(Protocol):
         status: SendStatus,
         llm_meta: Optional[dict] = None,
         author: Author = Author.agent,
+        image_ids: Optional[list[str]] = None,
     ) -> None: ...
 
     async def load_history(self, chat_id: str, limit: int = HISTORY_LIMIT) -> list[dict]: ...
@@ -115,6 +116,8 @@ class DialogStore(Protocol):
     async def last_incoming_at(self, chat_id: str) -> Optional[datetime]: ...
 
     async def has_any_messages(self, chat_id: str) -> bool: ...
+
+    async def sent_image_ids(self, chat_id: str) -> set[str]: ...
 
     async def get(self, item_id: str) -> Optional[ItemZoneRow]: ...
 
@@ -211,6 +214,7 @@ class InMemoryDialogStore:
         status: SendStatus,
         llm_meta: Optional[dict] = None,
         author: Author = Author.agent,
+        image_ids: Optional[list[str]] = None,
     ) -> None:
         self.messages.setdefault(chat_id, []).append(
             {
@@ -220,6 +224,7 @@ class InMemoryDialogStore:
                 "status": status,
                 "avito_message_id": None,
                 "llm_meta": llm_meta,
+                "image_ids": list(image_ids) if image_ids else None,
             }
         )
 
@@ -294,6 +299,14 @@ class InMemoryDialogStore:
 
     async def has_any_messages(self, chat_id: str) -> bool:
         return bool(self.messages.get(chat_id))
+
+    async def sent_image_ids(self, chat_id: str) -> set[str]:
+        return {
+            image_id
+            for m in self.messages.get(chat_id, [])
+            if m["direction"] == Direction.outgoing and m["status"] == SendStatus.sent
+            for image_id in (m.get("image_ids") or [])
+        }
 
     async def last_incoming_at(self, chat_id: str) -> Optional[datetime]:
         stamps = [
@@ -419,6 +432,7 @@ class SqlAlchemyDialogStore:
         status: SendStatus,
         llm_meta: Optional[dict] = None,
         author: Author = Author.agent,
+        image_ids: Optional[list[str]] = None,
     ) -> None:
         from app.db.models import Message
 
@@ -431,6 +445,7 @@ class SqlAlchemyDialogStore:
                     text=text,
                     status=status,
                     llm_meta=llm_meta,
+                    image_ids=list(image_ids) if image_ids else None,
                 )
             )
             await session.commit()
@@ -617,6 +632,32 @@ class SqlAlchemyDialogStore:
             ).scalars().all()
 
         return any((row or "").strip() == normalized for row in rows)
+
+    async def sent_image_ids(self, chat_id: str) -> set[str]:
+        """Какие фото уже ушли клиенту в этом чате.
+
+        Из той же строки `messages`, что и текст, который их сопровождал:
+        конвейер пишет id отправленных картинок в `image_ids` своего
+        исходящего (app/pipeline.py:_send_photos). Только `sent` — картинки из
+        неотправленного (модерация, сбой) клиент не видел, и считать их
+        показанными значит больше их не показать никогда.
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Message
+
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Message.image_ids).where(
+                        Message.chat_id == chat_id,
+                        Message.direction == Direction.outgoing,
+                        Message.status == SendStatus.sent,
+                        Message.image_ids.is_not(None),
+                    )
+                )
+            ).scalars().all()
+        return {image_id for row in rows for image_id in (row or [])}
 
     async def has_any_messages(self, chat_id: str) -> bool:
         """Есть ли в этом чате хоть одно сообщение — чьё угодно.

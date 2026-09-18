@@ -704,11 +704,11 @@ async def lifespan(app: FastAPI):
         booking_provider=booking_provider,
         # Фотографии — из базы знаний, КОЛБЭКОМ: `app.state.kb` заменяется
         # целиком, когда оператор правит каталог из Telegram, и провайдер
-        # обязан это видеть. На 2026-08-30 у всех зон `photos: []` — файлы
-        # лежат в media/photos/, но scripts/import_photos.py не запускался,
-        # так что инструмент по-прежнему честно отвечает «фотографий нет».
-        # Проводка нужна, чтобы в день импорта не пришлось её вспоминать.
+        # обязан это видеть. Фото загружены 2026-09-18 (scripts/import_photos.py),
+        # кроме домика для отдыха — его фото у заказчика не было.
         photo_provider=KbPhotoProvider(lambda: app.state.kb),
+        # Что уже ушло в чат — чтобы «а ещё фото?» давало следующие кадры.
+        sent_photos_lookup=dialog_store.sent_image_ids,
         concessions_today_provider=dialog_store.count_concessions_today,
         booking_sink=SqlAlchemyBookingSink(get_sessionmaker()),
         booking_notifier=build_booking_notifier(settings, ops_bot),

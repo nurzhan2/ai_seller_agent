@@ -161,12 +161,16 @@ def real_catalog_text() -> str:
 
 def test_patch_zone_photos_updates_only_target_zone(real_catalog_text):
     patched = patch_zone_photos(real_catalog_text, "bath_russian", ["img1", "img2"])
-    assert "photos: [img1, img2]" in patched
+    assert 'photos: ["img1", "img2"]' in patched
     # Соседние зоны не тронуты.
     assert 'name: "Баня «Гараж»"' in patched
+    # Блок соседней зоны — байт в байт прежний. Раньше здесь проверялось
+    # «photos: [] у Гаража», то есть состояние живого catalog.yaml до первого
+    # импорта; после импорта 2026-09-18 такой тест падал бы навсегда.
     import re
-    garage_block = re.search(r'- id: bath_garage.*?(?=- id: )', patched, re.DOTALL).group()
-    assert "photos: []" in garage_block
+    garage = r'- id: bath_garage.*?(?=- id: )'
+    assert (re.search(garage, patched, re.DOTALL).group()
+            == re.search(garage, real_catalog_text, re.DOTALL).group())
 
 
 def test_patch_zone_photos_preserves_comments(real_catalog_text):
@@ -192,13 +196,13 @@ def test_patch_site_photos_creates_section_if_missing(real_catalog_text):
     assert "site_photos:" not in real_catalog_text
     patched = patch_site_photos(real_catalog_text, "playground", ["p1"])
     assert "site_photos:" in patched
-    assert "playground: [p1]" in patched
+    assert 'playground: ["p1"]' in patched
 
 
 def test_patch_site_photos_updates_existing_category():
     text = "site_photos:\n  playground: [p1]\n  restroom: [r1]\n"
     patched = patch_site_photos(text, "playground", ["p1", "p2"])
-    assert "playground: [p1, p2]" in patched
+    assert 'playground: ["p1", "p2"]' in patched
     assert "restroom: [r1]" in patched      # другая категория не тронута
 
 
@@ -346,7 +350,7 @@ async def test_live_run_uploads_and_updates_catalog(photo_root, sample_kb_dir):
     assert len(bath_result.image_ids) == 2
 
     text = catalog_path.read_text(encoding="utf-8")
-    assert f"photos: [{bath_result.image_ids[0]}, {bath_result.image_ids[1]}]" in text
+    assert f'photos: ["{bath_result.image_ids[0]}", "{bath_result.image_ids[1]}"]' in text
     assert "site_photos:" in text
 
 
@@ -453,3 +457,20 @@ async def test_the_manifest_survives_a_failure_mid_import(photo_root, sample_kb_
         catalog_path=sample_kb_dir / "catalog.yaml", manifest_path=manifest_path,
     )
     assert len(retry.uploaded) == 2          # из трёх файлов один уже в Авито
+
+
+def test_numeric_looking_ids_stay_strings_after_a_catalog_reload(sample_kb_dir):
+    """Ради этого id и пишутся в кавычках: без них YAML читает «2654321» как
+    число, «2654321.120» — как дробь 2654321.12, а Zone.photos: list[str] в
+    pydantic v2 на числе падает, и база знаний не загружается вовсе."""
+    from app.kb.loader import load_catalog
+
+    catalog = sample_kb_dir / "catalog.yaml"
+    catalog.write_text(
+        patch_zone_photos(catalog.read_text(encoding="utf-8"), "bath_russian",
+                          ["2654321", "2654321.120"]),
+        encoding="utf-8",
+    )
+    kb = load_catalog(sample_kb_dir)
+    zone = next(z for z in kb.catalog.zones if z.id == "bath_russian")
+    assert zone.photos == ["2654321", "2654321.120"]

@@ -406,6 +406,11 @@ def quote_to_dict(q: PriceQuote) -> dict:
 # YCLIENTS за один вызов инструмента (один запрос на день горизонта) — не
 # выстрелить сотней обращений за один ход, как просили при разборе живого
 # диалога.
+# Фото за один ход — решение заказчика 2026-09-18: не больше трёх. Лента из
+# десяти картинок подряд в чате Авито заталкивает текст ответа наверх, и
+# клиент его не видит.
+PHOTOS_PER_TURN = 3
+
 FIND_NEXT_AVAILABLE_HORIZON_DAYS = 14
 FIND_NEXT_AVAILABLE_DEFAULT_LIMIT = 3
 
@@ -474,9 +479,16 @@ class ToolExecutor:
         booking_sink: Any = None,
         booking_notifier: Any = None,
         booking_handoff_notifier: Any = None,
+        # async () -> Iterable[image_id]: что уже отправлено в этот чат. None
+        # (тесты, харнесс) — «ничего», каждый ход начинает с первых кадров.
+        sent_photos: Any = None,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
+        self.sent_photos = sent_photos
+        # Кадры, отобранные к отправке за этот ход (get_photos). Отправляет их
+        # конвейер, после текста; см. PHOTOS_PER_TURN.
+        self.photos_to_send: list[str] = []
         self.state = state or DialogConcessionState()
         self.photo_provider = photo_provider
         self.lead_sink = lead_sink
@@ -1373,7 +1385,41 @@ class ToolExecutor:
                     "предложи приехать посмотреть территорию."
                 ),
             }
-        return {"photos": photos, "count": len(photos)}
+
+        # ОТБОР, А НЕ ОТПРАВКА. Инструмент не шлёт картинки сам: отправка —
+        # дело конвейера, после текста и через тот же гейт, что и текст
+        # (app/pipeline.py:_send_photos). Здесь решается только, ЧТО уйдёт,
+        # — и модель узнаёт это честно, до того как напишет «вот фото».
+        #
+        # Уже отправленные в этом чате — пропускаем: на «а ещё фото?» клиент
+        # получает следующие кадры, а не те же три второй раз.
+        already = set(await self.sent_photos()) if self.sent_photos else set()
+        fresh = [p for p in photos if p not in already and p not in self.photos_to_send]
+        room = PHOTOS_PER_TURN - len(self.photos_to_send)
+        batch = fresh[:max(room, 0)]
+        self.photos_to_send.extend(batch)
+
+        if not batch:
+            reason = (
+                "Все фотографии этой зоны клиенту уже отправлены в этом чате. "
+                "Не обещай новых — предложи приехать посмотреть территорию."
+                if not fresh else
+                f"В одном сообщении не больше {PHOTOS_PER_TURN} фото, лимит "
+                "уже исчерпан другой зоной. Предложи прислать эти следующим "
+                "сообщением, если клиент попросит."
+            )
+            return {"photos": [], "count": 0, "sending": 0, "instruction": reason}
+
+        return {
+            "sending": len(batch),
+            "more_available": len(fresh) - len(batch),
+            "instruction": (
+                f"{len(batch)} фото этой зоны уйдут клиенту сразу после твоего "
+                "сообщения — напиши короткую подводку («Отправляю фото …»), "
+                "ссылки и id не пиши. "
+                + ("Есть ещё фото — можешь предложить прислать." if len(fresh) > len(batch) else "")
+            ).strip(),
+        }
 
     # -- лид ----------------------------------------------------------------
 

@@ -89,6 +89,7 @@ RATE_HINT = "тариф-без-итога"
 SYSTEM_MSG = "системные-сообщения"
 CLASSIFIER = "классификатор"
 WEEKDAY = "день-недели"
+PHOTOS = "фото"
 
 MUTATIONS: tuple[Mutation, ...] = (
     # -- принуждение инструмента -------------------------------------------
@@ -482,6 +483,43 @@ MUTATIONS: tuple[Mutation, ...] = (
              "        + \"\"",
              "tests/test_agent.py",
              "календарь дней недели пропал из блока «Сейчас:»"),
+
+    # -- фото клиенту ---------------------------------------------------------
+    Mutation(PHOTOS, "app/agent/tools.py",
+             "        batch = fresh[:max(room, 0)]",
+             "        batch = fresh",
+             "tests/test_agent.py",
+             "лимит трёх фото за ход снят в инструменте"),
+    Mutation(PHOTOS, "app/agent/tools.py",
+             "        fresh = [p for p in photos if p not in already and p not in self.photos_to_send]",
+             "        fresh = [p for p in photos if p not in self.photos_to_send]",
+             "tests/test_agent.py",
+             "«а ещё фото?» снова присылает те же кадры"),
+    Mutation(PHOTOS, "app/agent/loop.py",
+             "            photos=[] if hit_limit else list(getattr(executor, \"photos_to_send\", [])),",
+             "            photos=[],",
+             "tests/test_agent.py",
+             "отобранные фото не доезжают до конвейера"),
+    Mutation(PHOTOS, "app/pipeline.py",
+             "        for image_id in image_ids[:PHOTOS_PER_TURN]:",
+             "        for image_id in image_ids:",
+             "tests/test_pipeline.py",
+             "конвейер шлёт больше трёх фото за ход"),
+    Mutation(PHOTOS, "app/pipeline.py",
+             "            image_ids=sent_photos or None,",
+             "            image_ids=None,",
+             "tests/test_pipeline.py",
+             "отправленные фото не запоминаются — показ по кругу"),
+    Mutation(PHOTOS, "app/media/photo_import.py",
+             "    finally:\n        if not dry_run:\n            save_manifest(manifest, manifest_path)",
+             "    finally:\n        pass\n    if not dry_run:\n        save_manifest(manifest, manifest_path)",
+             "tests/test_photo_import.py",
+             "обрыв импорта теряет манифест — повтор зальёт дубли"),
+    Mutation(PHOTOS, "app/media/photo_import.py",
+             "    return \"[\" + \", \".join(json.dumps(str(i)) for i in image_ids) + \"]\" if image_ids else \"[]\"",
+             "    return \"[\" + \", \".join(str(i) for i in image_ids) + \"]\" if image_ids else \"[]\"",
+             "tests/test_photo_import.py",
+             "id без кавычек — числовой id роняет загрузку базы знаний"),
 
     # -- мусорный tool_use --------------------------------------------------
     Mutation(GARBAGE, "app/agent/loop.py",

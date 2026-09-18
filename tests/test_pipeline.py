@@ -2474,3 +2474,118 @@ def test_the_greeting_follows_the_same_rules_as_the_agent():
     assert not PROMISE_TO_RETURN.search(SYSTEM_MESSAGE_GREETING)
     assert not SELF_DISCLOSURE.search(SYSTEM_MESSAGE_GREETING)
     assert "Иришка" in SYSTEM_MESSAGE_GREETING
+
+
+# --------------------------------------------------------------------------
+# Фото клиенту: после текста, через гейт, не больше трёх, с учётом показанного
+# --------------------------------------------------------------------------
+
+class _PhotoAvito(_FakeAvito):
+    """Запоминает порядок отправок — текст и картинки в одной ленте."""
+
+    def __init__(self, fail_on: set[str] | None = None):
+        super().__init__()
+        self.feed: list[tuple[str, str]] = []
+        self.fail_on = fail_on or set()
+
+    async def send_message(self, chat_id: str, text: str) -> dict:
+        self.feed.append(("text", text))
+        return await super().send_message(chat_id, text)
+
+    async def send_image(self, chat_id: str, image_id: str) -> dict:
+        if image_id in self.fail_on:
+            raise RuntimeError("Avito 503")
+        self.feed.append(("image", image_id))
+        return {"ok": True}
+
+
+def _live_build(avito, photos):
+    agent = _FakeAgentLoop(TurnResult(text="Отправляю фото юрты.", photos=photos))
+    return _build(settings=_settings(dry_run=False, moderation_mode="off"),
+                  agent=agent, avito=avito)
+
+
+async def test_photos_follow_the_text():
+    avito = _PhotoAvito()
+    pipeline, store, _, _ = _live_build(avito, ["img-1", "img-2"])
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert avito.feed == [("text", "Отправляю фото юрты."),
+                          ("image", "img-1"), ("image", "img-2")]
+
+
+async def test_sent_photos_are_remembered_on_the_message():
+    """Только так «а ещё фото?» потом даст следующие кадры."""
+    avito = _PhotoAvito()
+    pipeline, store, _, _ = _live_build(avito, ["img-1", "img-2"])
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert await store.sent_image_ids("chat-1") == {"img-1", "img-2"}
+
+
+async def test_one_failed_photo_does_not_cancel_the_others_or_the_text():
+    avito = _PhotoAvito(fail_on={"img-2"})
+    pipeline, store, _, _ = _live_build(avito, ["img-1", "img-2", "img-3"])
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert ("image", "img-3") in avito.feed
+    # Не ушедшее не считается показанным — на повторную просьбу уйдёт снова.
+    assert await store.sent_image_ids("chat-1") == {"img-1", "img-3"}
+    outgoing = [m for m in store.messages["chat-1"] if m["direction"] == Direction.outgoing]
+    assert outgoing[-1]["status"] == SendStatus.sent
+
+
+async def test_never_more_than_three_photos_per_turn():
+    """Даже если ход по ошибке принёс больше — конвейер режет сам."""
+    avito = _PhotoAvito()
+    pipeline, store, _, _ = _live_build(avito, [f"img-{i}" for i in range(1, 6)])
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert [x for x in avito.feed if x[0] == "image"] == [
+        ("image", "img-1"), ("image", "img-2"), ("image", "img-3")]
+
+
+async def test_photos_go_through_the_outbound_gate():
+    """Отдельного пути наружу у фото нет: гейт (рубильник, фильтр объявлений,
+    лимиты) проверяет каждую картинку так же, как текст."""
+    from app.channels.outbound_gate import OutboundGate
+
+    inner = _PhotoAvito()
+    calls: list[str] = []
+
+    class _RecordingGate(OutboundGate):
+        async def _require_allowed(self, chat_id: str) -> None:
+            calls.append(chat_id)
+
+    gate = _RecordingGate.__new__(_RecordingGate)
+    gate._client = inner
+    pipeline, store, _, _ = _live_build(gate, ["img-1", "img-2"])
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert calls == ["chat-1"] * 3            # текст + две картинки
+    assert [x for x in inner.feed if x[0] == "image"] == [("image", "img-1"), ("image", "img-2")]
+
+
+async def test_photos_are_not_sent_from_the_moderation_queue():
+    """Известное ограничение: одобрение шлёт только текст. Картинки не уходят
+    и не считаются показанными."""
+    avito = _PhotoAvito()
+    agent = _FakeAgentLoop(TurnResult(text="Отправляю фото юрты.", photos=["img-1"]))
+    pipeline, store, _, ops_service = _build(settings=_settings(dry_run=True),
+                                             agent=agent, avito=avito)
+
+    await pipeline.handle_message(_payload(text="покажите юрту"))
+    await _settle()
+
+    assert avito.feed == []
+    assert await store.sent_image_ids("chat-1") == set()

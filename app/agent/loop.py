@@ -1030,6 +1030,11 @@ class TurnResult:
     # ценовые. Конвейер (app/pipeline.py) фильтрует их сам через
     # ConcessionEvent.needs_operator_approval, решая, нужно ли одобрение.
     concession_events: list[Any] = field(default_factory=list)
+    # image_id, которые get_photos отобрал к отправке за этот ход (не больше
+    # PHOTOS_PER_TURN). Отправляет их конвейер после текста. Заполняется
+    # ТОЛЬКО на успешном пути: если рубеж подменил ответ, подводки «вот фото»
+    # клиент не увидит, и картинки без неё были бы ни к чему.
+    photos: list[str] = field(default_factory=list)
 
 
 def _loggable(value: Any) -> Any:
@@ -1079,6 +1084,10 @@ class AgentLoop:
         classifier_model: str = CLASSIFIER_MODEL,
         booking_provider: Any = None,       # BookingProvider — YClientsProvider или None
         photo_provider: Any = None,         # .get(zone_id) -> list[image_id], см. app/media/photos.py
+        # async (chat_id) -> Iterable[image_id] — что уже отправлено в чат, чтобы
+        # «а ещё фото?» давало следующие кадры, а не те же (app/dialog_store.py:
+        # sent_image_ids).
+        sent_photos_lookup: Any = None,
         concessions_today_provider: Any = None,   # async () -> int, R10 дневной лимит
         booking_sink: Any = None,           # .save(**record) — запись брони в нашу БД
         booking_notifier: Any = None,       # async (record) -> None — уведомление оператору
@@ -1124,6 +1133,9 @@ class AgentLoop:
                 booking_sink=booking_sink,
                 booking_notifier=booking_notifier,
                 booking_handoff_notifier=booking_handoff_notifier,
+                sent_photos=(
+                    (lambda: sent_photos_lookup(dialog_id)) if sent_photos_lookup else None
+                ),
             )
         )
 
@@ -1641,6 +1653,9 @@ class AgentLoop:
             tool_call_errors=tool_call_errors,
             concession_state=getattr(executor, "state", None),
             concession_events=getattr(executor, "concession_events", []),
+            # Упор в лимит витков тоже приходит сюда, но с текстом-отбивкой
+            # вместо ответа — фото к нему не относятся.
+            photos=[] if hit_limit else list(getattr(executor, "photos_to_send", [])),
         )
 
 

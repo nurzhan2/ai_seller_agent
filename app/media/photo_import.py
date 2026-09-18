@@ -202,7 +202,13 @@ def save_manifest(data: dict[str, Any], path: Path = MANIFEST_PATH) -> None:
 # --------------------------------------------------------------------------
 
 def _format_list(image_ids: list[str]) -> str:
-    return "[" + ", ".join(image_ids) + "]" if image_ids else "[]"
+    """id В КАВЫЧКАХ, всегда. Без кавычек YAML читает «2654321» как число, а
+    «2654321.123» — как дробь (и теряет хвостовые нули), после чего
+    `Zone.photos: list[str]` в pydantic v2 не приводит число к строке, а
+    падает — то есть база знаний не загружается и приложение не стартует.
+    Найдено 2026-09-18 перед первым боевым импортом: формат id Авито
+    документацией не описан, и полагаться на то, что он буквенный, нельзя."""
+    return "[" + ", ".join(json.dumps(str(i)) for i in image_ids) + "]" if image_ids else "[]"
 
 
 def _find_zone_block(text: str, zone_id: str) -> tuple[int, int]:

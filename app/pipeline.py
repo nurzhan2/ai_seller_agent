@@ -929,6 +929,23 @@ class MessagePipeline:
     ) -> None:
         chat_id = chat.chat_id
 
+        autonomous = (
+            not self.settings.dry_run and gate is None
+            and self.settings.moderation_mode != "all"
+        )
+        if getattr(result, "photos", None) and not autonomous:
+            # ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ. Одобрение оператором отправляет только
+            # текст (app/ops/bot.py:OpsService.approve) — очередь модерации
+            # картинок не хранит. В живом режиме с concessions_only сюда
+            # попадает лишь ход, где одновременно запрошены и скидка, и фото.
+            # Молча терять их нельзя: оператор видит строку в логе, клиент
+            # может попросить ещё раз — и кадры, не отмеченные как
+            # отправленные, уйдут тогда.
+            logger.warning(
+                "pipeline: ход на модерации — %d фото клиенту не отправлены",
+                len(result.photos), extra={"chat_id": chat_id},
+            )
+
         if self.settings.dry_run:
             # Мастер-рубильник: пока он включён, ВСЁ уходит на одобрение,
             # независимо от moderation_mode — карточка только богаче для
@@ -968,8 +985,11 @@ class MessagePipeline:
             messages_total.labels(direction="outgoing", status="failed").inc()
             return
 
+        sent_photos = await self._send_photos(chat_id, getattr(result, "photos", None) or [])
+
         await self.store.save_outgoing(
-            chat_id, result.text, SendStatus.sent, llm_meta=result.llm_meta
+            chat_id, result.text, SendStatus.sent, llm_meta=result.llm_meta,
+            image_ids=sent_photos or None,
         )
         messages_total.labels(direction="outgoing", status="sent").inc()
         await self._count_agent_reply(chat_id)
@@ -979,6 +999,43 @@ class MessagePipeline:
         # render_dialog_card/dialog_keyboard уже дают ровно это при
         # dry_run=False — отдельная FYI-вёрстка не нужна.
         await self._notify_operator(chat, result, client_text)
+
+    async def _send_photos(self, chat_id: str, image_ids: list[str]) -> list[str]:
+        """Фото, отобранные ходом (get_photos), — после текста, по одному.
+
+        ЧЕРЕЗ ГЕЙТ. `self.avito_client` в проде — OutboundGate
+        (app/channels/outbound_gate.py): рубильник, суточный лимит, ручной
+        hold, перехват и фильтр объявлений проверяются для КАЖДОЙ картинки
+        так же, как для текста. Отдельного пути наружу у фото нет.
+
+        ПОСЛЕ ТЕКСТА: подводка «Отправляю фото бани» должна стоять над
+        картинками, а не под ними.
+
+        По одной и без исключений наружу: сбой третьей картинки не должен
+        ни отменять первые две, ни превращать уже ушедший текст в
+        «неотправленный». Возвращает id реально ушедших — только их конвейер
+        запишет в `image_ids`, и только их потом будет считать показанными.
+        """
+        from app.agent.tools import PHOTOS_PER_TURN
+
+        sent: list[str] = []
+        for image_id in image_ids[:PHOTOS_PER_TURN]:
+            try:
+                await self.avito_client.send_image(chat_id, image_id)
+            except Exception:
+                logger.exception(
+                    "pipeline: фото не отправлено",
+                    extra={"chat_id": chat_id, "image_id": image_id},
+                )
+                continue
+            sent.append(image_id)
+        if image_ids:
+            logger.info(
+                "pipeline: фото клиенту — отправлено %d из %d",
+                len(sent), len(image_ids[:PHOTOS_PER_TURN]),
+                extra={"chat_id": chat_id},
+            )
+        return sent
 
     async def _queue_for_moderation(self, chat: Any, result: Any, client_text: str) -> None:
         """Обычный холд — DRY_RUN без запроса на скидку, либо

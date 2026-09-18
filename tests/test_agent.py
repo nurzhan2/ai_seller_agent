@@ -1072,6 +1072,9 @@ async def test_photo_provider_sees_a_reloaded_catalog(kb):
 
     first = kb.model_copy(deep=True)
     second = kb.model_copy(deep=True)
+    # Явно пусто в первой версии: боевой каталог после импорта 2026-09-18
+    # уже с фото, и тест не должен зависеть от его содержимого.
+    next(z for z in first.catalog.zones if z.id == "bath_russian").photos = []
     next(z for z in second.catalog.zones if z.id == "bath_russian").photos = ["img-новый"]
     current = [first]
 
@@ -1082,17 +1085,101 @@ async def test_photo_provider_sees_a_reloaded_catalog(kb):
     assert await provider.get("bath_russian") == ["img-новый"]
 
 
-async def test_get_photos_returns_the_real_ids_when_they_exist(kb):
+def _kb_with_yurt_photos(kb, ids):
+    loaded = kb.model_copy(deep=True)
+    next(z for z in loaded.catalog.zones if z.id == "yurt").photos = list(ids)
+    return loaded
+
+
+async def test_get_photos_picks_at_most_three_for_this_turn(kb):
+    """Решение заказчика 2026-09-18: не больше трёх фото за ход. Инструмент
+    не шлёт сам — отбирает, а модель узнаёт, сколько уйдёт."""
+    from app.agent.tools import PHOTOS_PER_TURN
     from app.media.photos import KbPhotoProvider
 
-    loaded = kb.model_copy(deep=True)
-    next(z for z in loaded.catalog.zones if z.id == "yurt").photos = ["img-1", "img-2", "img-3"]
+    loaded = _kb_with_yurt_photos(kb, [f"img-{i}" for i in range(1, 6)])
     ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded))
 
     result = await ex.run("get_photos", {"zone_id": "yurt"})
 
-    assert result["photos"] == ["img-1", "img-2", "img-3"]
-    assert result["count"] == 3
+    assert PHOTOS_PER_TURN == 3
+    assert ex.photos_to_send == ["img-1", "img-2", "img-3"]
+    assert result["sending"] == 3
+    assert result["more_available"] == 2
+
+
+async def test_the_three_photo_limit_is_per_turn_not_per_zone(kb):
+    """Две зоны за ход — всё равно не больше трёх картинок."""
+    from app.media.photos import KbPhotoProvider
+
+    loaded = _kb_with_yurt_photos(kb, ["y-1", "y-2"])
+    next(z for z in loaded.catalog.zones if z.id == "tent").photos = ["t-1", "t-2"]
+    ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded))
+
+    await ex.run("get_photos", {"zone_id": "yurt"})
+    second = await ex.run("get_photos", {"zone_id": "tent"})
+
+    assert ex.photos_to_send == ["y-1", "y-2", "t-1"]
+    assert second["sending"] == 1
+
+
+async def test_asking_again_gives_the_next_photos_not_the_same(kb):
+    """«А ещё фото?» — следующие кадры: уже показанные пропускаются."""
+    from app.media.photos import KbPhotoProvider
+
+    loaded = _kb_with_yurt_photos(kb, [f"img-{i}" for i in range(1, 6)])
+
+    async def already_sent():
+        return {"img-1", "img-2", "img-3"}
+
+    ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded),
+                      sent_photos=already_sent)
+    result = await ex.run("get_photos", {"zone_id": "yurt"})
+
+    assert ex.photos_to_send == ["img-4", "img-5"]
+    assert result["sending"] == 2
+
+
+async def test_when_everything_was_shown_nothing_is_promised(kb):
+    from app.media.photos import KbPhotoProvider
+
+    loaded = _kb_with_yurt_photos(kb, ["img-1"])
+
+    async def already_sent():
+        return {"img-1"}
+
+    ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded),
+                      sent_photos=already_sent)
+    result = await ex.run("get_photos", {"zone_id": "yurt"})
+
+    assert ex.photos_to_send == []
+    assert result["sending"] == 0
+    assert "уже отправлены" in result["instruction"]
+
+
+async def test_photos_ride_on_the_turn_result_only_on_the_normal_path(kb):
+    """Отобранные фото уезжают конвейеру в TurnResult.photos — но не тогда,
+    когда рубеж подменил ответ: подводки «вот фото» клиент не увидит."""
+    from app.media.photos import KbPhotoProvider
+
+    loaded = _kb_with_yurt_photos(kb, ["img-1", "img-2"])
+    ex = ToolExecutor(kb, "d1", photo_provider=KbPhotoProvider(lambda: loaded))
+
+    normal, _ = loop_for(kb, [
+        FakeResponse(content=[ToolUseBlock(name="get_photos", input={"zone_id": "yurt"})]),
+        FakeResponse(content=[TextBlock("Отправляю фото юрты.")]),
+    ], executor=ex)
+    result = await normal.run_turn("chat-1", [], "покажите юрту")
+    assert result.photos == ["img-1", "img-2"]
+
+    ex2 = ToolExecutor(kb, "d2", photo_provider=KbPhotoProvider(lambda: loaded))
+    guarded, _ = loop_for(kb, [
+        FakeResponse(content=[ToolUseBlock(name="get_photos", input={"zone_id": "yurt"})]),
+        FakeResponse(content=[TextBlock("Вот фото, юрта стоит 99 999 ₽.")]),
+    ], executor=ex2)
+    blocked = await guarded.run_turn("chat-2", [], "покажите юрту")
+    assert blocked.llm_meta.get("guard_rail")
+    assert blocked.photos == []
 
 
 async def test_an_empty_photo_list_answers_exactly_like_no_provider_at_all(kb):
@@ -1102,11 +1189,12 @@ async def test_an_empty_photo_list_answers_exactly_like_no_provider_at_all(kb):
     обещает клиенту фото, которых не придёт."""
     from app.media.photos import KbPhotoProvider
 
-    without = await ToolExecutor(kb, "d1").run("get_photos", {"zone_id": "yurt"})
-    # Боевое состояние на 2026-08-30: провайдер подключён, `photos: []` у всех зон.
+    # Домик для отдыха — зона, у которой фото действительно нет: в выгрузке
+    # заказчика её папки не было (импорт 2026-09-18).
+    without = await ToolExecutor(kb, "d1").run("get_photos", {"zone_id": "house_relax"})
     with_empty = await ToolExecutor(
         kb, "d1", photo_provider=KbPhotoProvider(lambda: kb)
-    ).run("get_photos", {"zone_id": "yurt"})
+    ).run("get_photos", {"zone_id": "house_relax"})
 
     assert with_empty == without
     assert "Не обещай прислать их" in with_empty["instruction"]
@@ -1124,14 +1212,22 @@ async def test_photo_provider_reaches_the_default_executor(kb):
     assert executor.photo_provider is sentinel
 
 
-def test_the_shipped_catalog_still_has_no_photos():
-    """Напоминание, а не запрет: пока это верно, проводка провайдера ничего
-    не меняет для клиента — нужен прогон scripts/import_photos.py по
-    media/photos/. Начнут импортировать — тест упадёт и его надо удалить."""
+def test_the_shipped_catalog_has_photos_for_every_zone_but_the_relax_house():
+    """Боевой импорт 2026-09-18 (scripts/import_photos.py по media/photos,
+    67 файлов). Прежний тест на этом месте утверждал «фото нет ни у одной
+    зоны» и сам просил себя удалить с первым импортом.
+
+    Домика для отдыха в выгрузке заказчика не было вовсе — папки нет. Это
+    пробел исходных данных, а не импорта: передано заказчику. Как только
+    фото появятся, тест упадёт на второй проверке — и это повод обновить его,
+    а не глушить.
+    """
     from app.kb.loader import load_catalog
 
-    loaded = load_catalog()
-    assert all(not z.photos for z in loaded.catalog.zones)
+    zones = {z.id: z.photos for z in load_catalog().catalog.zones}
+    assert all(zones[z] for z in zones if z != "house_relax"), \
+        [z for z in zones if z != "house_relax" and not zones[z]]
+    assert zones["house_relax"] == []
 
 
 # --------------------------------------------------------------------------
