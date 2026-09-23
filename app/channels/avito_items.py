@@ -27,6 +27,18 @@ class Listing:
     status: str
     price: Optional[int]
     address: Optional[str]
+    # Категория Авито («Вакансии», «Резюме», ...). Нужна item_scope: вакансия
+    # «Администратор базы отдыха» (2026-09-17) не содержит ни одного слова из
+    # deny-списка, и агент ответил кандидату прайсом на баню.
+    category: Optional[str] = None
+
+
+def _category_name(item: dict) -> Optional[str]:
+    raw = item.get("category")
+    if isinstance(raw, dict):
+        name = raw.get("name")
+        return str(name) if name else None
+    return str(raw) if isinstance(raw, str) and raw else None
 
 
 class AvitoItemsClient:
@@ -90,6 +102,7 @@ class AvitoItemsClient:
                         status=str(item.get("status", "")),
                         price=item.get("price"),
                         address=item.get("address"),
+                        category=_category_name(item),
                     )
                 )
             if len(resources) < per_page:

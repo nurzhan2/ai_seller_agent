@@ -143,10 +143,22 @@ def test_resolved_hint_handles_dangling_zone_id_gracefully(kb):
 # site_fallback_hint — никогда не выдумывает URL
 # --------------------------------------------------------------------------
 
-def test_site_fallback_escalates_when_url_unknown(kb):
-    """14.7 не отвечен ни в одном источнике проекта — до ответа агент
-    эскалирует, а не придумывает адрес."""
+def test_site_fallback_gives_the_client_confirmed_url(kb):
+    """14.7 закрыт: заказчик прислал сайт в рабочий чат 2026-09-07 — агент
+    даёт ссылку, а не эскалирует."""
     hint = site_fallback_hint(kb)
+    assert "https://чайка.москва" in hint
+    assert "escalate_to_human" not in hint
+
+
+def test_site_fallback_escalates_when_url_unknown():
+    """Без подтверждённого адреса — эскалация, а не выдуманная ссылка.
+    Синтетический каталог: в реальном catalog.yaml адрес уже есть."""
+    kb = load_catalog()
+    patched_catalog = kb.catalog.model_copy(update={"site_url": None})
+    patched_kb = kb.model_copy(update={"catalog": patched_catalog})
+
+    hint = site_fallback_hint(patched_kb)
     assert "уточню у менеджера" in hint.lower() or "escalate_to_human" in hint
     assert "http" not in hint
 

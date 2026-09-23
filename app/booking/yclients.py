@@ -80,7 +80,86 @@ def _parse_seances(data: Any) -> Optional[tuple[str, ...]]:
     return tuple(slots)
 
 
-def _slots_to_availability(slots: tuple[str, ...]) -> Availability:
+def _parse_seance_seconds(data: Any) -> Optional[int]:
+    """seance_length из book_times — у одного сотрудника-зоны он одинаков
+    для всех сеансов. None — поля нет (другая форма ответа)."""
+    if isinstance(data, dict):
+        for key in _SEANCE_LIST_KEYS:
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        return None
+    lengths = [
+        int(item["seance_length"])
+        for item in data
+        if isinstance(item, dict) and isinstance(item.get("seance_length"), (int, float))
+    ]
+    return max(lengths) if lengths else None
+
+
+def _to_minutes(value: str) -> Optional[int]:
+    """«9:00» и «09:00» — одно и то же время. YCLIENTS отдаёт часы БЕЗ
+    ведущего нуля («9:00», живой лог 2026-09-23), а сравнение шло со
+    strftime('%H:%M') = «09:00» — любое утреннее время до 10:00 молча
+    считалось занятым."""
+    try:
+        hours, minutes = str(value).strip().split(":")[:2]
+        return int(hours) * 60 + int(minutes)
+    except (ValueError, AttributeError):
+        return None
+
+
+# Территория закрывается в 23:00 (catalog.yaml: constants.working_window).
+# Хвост брони после закрытия (баня «с 20 до 00» — в банях можно позже)
+# никто другой занять не может, и YCLIENTS сеансов после закрытия не
+# отдаёт — проверять его по free_slots значит всегда получать «занято».
+DAY_CLOSE_MINUTES = 23 * 60
+
+
+def interval_is_free(
+    free_slots: tuple[str, ...],
+    start_time: TimeType,
+    hours: Optional[int],
+    seance_seconds: Optional[int] = None,
+    close_minutes: int = DAY_CLOSE_MINUTES,
+) -> bool:
+    """Свободен ли ВЕСЬ интервал [start, start+hours), а не одно время начала.
+
+    Живой случай 2026-09-19: занятость проверялась только по времени
+    начала — бронь, начинающаяся посреди запрошенного интервала, не
+    мешала сказать клиенту «свободно».
+
+    Смысл свободного времени t в ответе book_times: [t, t+L) свободен, где
+    L — seance_length. Если L == 0 (сотрудник-зона без услуги — так у
+    бань), t значит лишь «не внутри чужой записи», и шаг проверки — шаг
+    сетки ответа (обычно 30 минут). Интервал покрывается контрольными
+    точками s, s+L, s+2L, ... и последней e-L; каждая обязана быть в
+    free_slots.
+    """
+    free = {m for m in (_to_minutes(s) for s in free_slots) if m is not None}
+    start = start_time.hour * 60 + start_time.minute
+    if start not in free:
+        return False
+    if not hours or hours <= 0:
+        return True
+
+    length = (seance_seconds or 0) // 60
+    if length <= 0:
+        ordered = sorted(free)
+        gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+        length = min(gaps) if gaps else 30
+    end = min(start + hours * 60, close_minutes)
+
+    checkpoints = set(range(start, end - length + 1, length))
+    if end - length > start:
+        checkpoints.add(end - length)
+    return all(point in free for point in checkpoints)
+
+
+def _slots_to_availability(
+    slots: tuple[str, ...], seance_seconds: Optional[int] = None
+) -> Availability:
     """Три состояния, а не два: есть сеансы -> FREE, нет -> BUSY.
 
     Раньше пустой список возвращался как FREE без слотов — то есть
@@ -90,10 +169,13 @@ def _slots_to_availability(slots: tuple[str, ...]) -> Availability:
     именно с этим агент может работать: предложить другое время или дату.
     """
     if slots:
-        return Availability(AvailabilityStatus.FREE, free_slots=slots)
+        return Availability(
+            AvailabilityStatus.FREE, free_slots=slots, seance_seconds=seance_seconds
+        )
     return Availability(
         AvailabilityStatus.BUSY,
         reason="на эту дату свободных сеансов нет",
+        seance_seconds=seance_seconds,
     )
 
 
@@ -266,12 +348,19 @@ class YClientsProvider:
             return slots
 
         wanted = start_time.strftime("%H:%M")
-        if wanted in slots.free_slots:
-            return Availability(AvailabilityStatus.FREE, free_slots=slots.free_slots)
+        if interval_is_free(slots.free_slots, start_time, hours, slots.seance_seconds):
+            return Availability(
+                AvailabilityStatus.FREE,
+                free_slots=slots.free_slots,
+                seance_seconds=slots.seance_seconds,
+            )
         return Availability(
             AvailabilityStatus.BUSY,
-            reason=f"на {wanted} занято",
+            reason=(
+                f"на {wanted} на {hours} ч занято" if hours else f"на {wanted} занято"
+            ),
             free_slots=slots.free_slots,
+            seance_seconds=slots.seance_seconds,
         )
 
     async def get_free_slots(self, zone_id: str, date: DateType) -> Availability:
@@ -289,6 +378,12 @@ class YClientsProvider:
         if cached is not None:
             # Пустой список в кеше — это «на эту дату сеансов нет», а не
             # «кеша нет»: раньше он возвращался как FREE без слотов.
+            # Формат кеша: {"slots": [...], "len": seance_seconds}; голый
+            # список — прежний формат (живёт максимум SLOTS_CACHE_TTL).
+            if isinstance(cached, dict):
+                return _slots_to_availability(
+                    tuple(cached.get("slots") or ()), cached.get("len")
+                )
             return _slots_to_availability(tuple(cached))
 
         data = await self._request(
@@ -316,8 +411,9 @@ class YClientsProvider:
             )
             return Availability(AvailabilityStatus.UNKNOWN, reason="неизвестный формат ответа")
 
-        await self._cache_set(zone_id, date, list(slots))
-        return _slots_to_availability(slots)
+        seance_seconds = _parse_seance_seconds(data)
+        await self._cache_set(zone_id, date, {"slots": list(slots), "len": seance_seconds})
+        return _slots_to_availability(slots, seance_seconds)
 
     # -- кеш ---------------------------------------------------------------
 

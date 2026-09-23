@@ -2678,9 +2678,18 @@ async def test_a_reply_with_one_question_is_not_touched(kb):
 
 async def test_what_the_client_already_said_is_handed_to_the_model(kb):
     """Слоты из всей переписки уезжают в ход подсказкой, а не надеждой на
-    память модели."""
+    память модели.
+
+    Дата — через месяц от сегодня, а не зашитое «20 сентября»: зашитая
+    дата после 20.09.2026 уезжала в следующий год, и тест краснел сам."""
+    from datetime import date as _date, timedelta as _td
+
+    months = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря")
+    target = _date.today() + _td(days=30)
+    said = f"{target.day} {months[target.month - 1]}"
     history = [
-        {"role": "user", "content": "интересует гриль-домик на 20 сентября"},
+        {"role": "user", "content": f"интересует гриль-домик на {said}"},
         {"role": "assistant", "content": "Здравствуйте! Сколько вас будет?"},
         {"role": "user", "content": "нас 6теро"},
     ]
@@ -2691,7 +2700,7 @@ async def test_what_the_client_already_said_is_handed_to_the_model(kb):
     sent = main_call["messages"][-1]["content"]
 
     assert "ИЗ ПЕРЕПИСКИ УЖЕ ИЗВЕСТНО" in sent
-    assert "20 сентября" in sent and "2026-09-20" in sent
+    assert said in sent and target.isoformat() in sent
     assert "гостей — 6" in sent
 
 

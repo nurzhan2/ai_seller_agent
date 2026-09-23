@@ -454,6 +454,9 @@ def _topic_score(query: str, topic: str) -> int:
     return len(_stems(query) & _stems(topic))
 
 
+_UNSET = object()
+
+
 class ToolExecutor:
     """Исполняет вызовы инструментов в контексте одного диалога.
 
@@ -487,6 +490,13 @@ class ToolExecutor:
         self.kb = kb
         self.dialog_id = dialog_id
         self.sent_photos = sent_photos
+        # Число гостей, которое КЛИЕНТ назвал в переписке (app/agent/slots.py),
+        # — выставляет loop.py после разбора диалога. _UNSET — executor
+        # создан вне цикла (тесты, харнесс): тогда верим аргументу модели.
+        # Живой случай 2026-09-23: клиент спросил «баня в субботу с 20 до
+        # 00», числа гостей не называл, модель сама подставила guests=10 —
+        # и свободная «Рыцарская» (до 6 чел.) выпала из альтернатив.
+        self.known_guests: Any = _UNSET
         # Кадры, отобранные к отправке за этот ход (get_photos). Отправляет их
         # конвейер, после текста; см. PHOTOS_PER_TURN.
         self.photos_to_send: list[str] = []
@@ -952,8 +962,22 @@ class ToolExecutor:
         """
         if self.booking_provider is None:
             return []
+        if self.known_guests is not _UNSET:
+            # Отбор по вместимости — только по числу, которое назвал клиент,
+            # а не модель (см. known_guests в __init__).
+            guests = self.known_guests
+        # Сначала зоны ТОЙ ЖЕ категории: клиенту, спросившему баню, первой
+        # предлагается свободная баня, а не купол (заказчик 2026-09-05 и
+        # 2026-09-23: «есть свободная баня, почему бот её не предлагает»).
+        # Порядок каталога внутри категории сохраняется — sorted стабилен.
+        busy_zone = next((z for z in self.kb.catalog.zones if z.id == busy_zone_id), None)
+        busy_category = getattr(busy_zone, "category", None)
+        zones = sorted(
+            self.kb.catalog.zones,
+            key=lambda z: 0 if busy_category and z.category == busy_category else 1,
+        )
         found: list[dict] = []
-        for zone in self.kb.catalog.zones:
+        for zone in zones:
             if len(found) >= self.MAX_ALTERNATIVES:
                 break
             if zone.id == busy_zone_id:

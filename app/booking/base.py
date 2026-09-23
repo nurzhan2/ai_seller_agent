@@ -30,6 +30,12 @@ class Availability:
     status: AvailabilityStatus
     reason: Optional[str] = None
     free_slots: tuple[str, ...] = ()
+    # Длина сеанса, под который YCLIENTS посчитал free_slots (seance_length
+    # из book_times, секунды). 0/None — у сотрудника-зоны нет привязанной
+    # услуги, и свободное время начала значит только «этот момент не внутри
+    # чужой записи». Нужна, чтобы проверить весь интервал брони, а не одно
+    # время начала — см. app/booking/yclients.py:interval_is_free.
+    seance_seconds: Optional[int] = None
 
     @property
     def is_known(self) -> bool:

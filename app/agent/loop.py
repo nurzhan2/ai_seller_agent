@@ -1303,6 +1303,10 @@ class AgentLoop:
         slots = extract_slots(
             history, user_text, listing_zone=listing_zone, today=now.date()
         )
+        # Альтернативы при «занято» отбираются по вместимости только по
+        # числу гостей, названному КЛИЕНТОМ, — не по догадке модели
+        # (живой случай 2026-09-23, см. ToolExecutor.known_guests).
+        executor.known_guests = slots.guests
         already_asked = asked_slots(history)
         context_hint = build_context_hint(slots, already_asked)
         if context_hint:

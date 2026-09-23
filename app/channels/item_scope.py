@@ -114,14 +114,32 @@ _DENY_WORDS = (
     "аренда бизнеса", "бизнес в аренду", "арендный бизнес",
     "готовый бизнес", "продажа бизнеса",
     "горничная", "уборщица", "рабочий по обслуживанию", "персонал", "требуется",
+    # 2026-09-17: «Администратор базы отдыха» — вакансия без единого слова
+    # выше; агент ответил откликнувшемуся кандидату «на какое число
+    # планируете отдых?». Главная защита — категория (_DENY_CATEGORIES),
+    # слова — запасной рубеж, если категория в ответе Авито не пришла.
+    "администратор", "зарплата", "на руки", "сотрудник", "подработка",
     "инвестиционная возможность", "инвестиции",
 )
+
+# Категории Авито, в которых у комплекса не может быть бронируемой зоны.
+# Проверяются РАНЬШЕ заголовка: новую вакансию назовут как угодно, а
+# категория у неё всегда «Вакансии». Сравнение по подстроке без регистра —
+# Авито отдаёт и «Вакансии», и более длинные имена подкатегорий.
+_DENY_CATEGORIES = ("ваканси", "резюме", "готовый бизнес", "квартиры")
+
+
+def category_is_denied(category: Optional[str]) -> bool:
+    if not category:
+        return False
+    lowered = category.lower()
+    return any(word in lowered for word in _DENY_CATEGORIES)
 
 ALLOW_TITLE_RE = re.compile("|".join(_ALLOW_WORDS), re.IGNORECASE)
 DENY_TITLE_RE = re.compile("|".join(_DENY_WORDS), re.IGNORECASE)
 
 
-def classify_title(title: Optional[str]) -> tuple[str, str]:
+def classify_title(title: Optional[str], category: Optional[str] = None) -> tuple[str, str]:
     """(decision, reason) по заголовку объявления — без учёта жёсткого deny.
 
     DENY ПРОВЕРЯЕТСЯ ПЕРВЫМ И ПОБЕЖДАЕТ: заголовок, где встречаются и
@@ -141,6 +159,8 @@ def classify_title(title: Optional[str]) -> tuple[str, str]:
     разрешение, а не запрет. Так новое объявление комплекса, чей заголовок
     ещё не придумали составители списка allow-слов, не блокируется молча.
     """
+    if category_is_denied(category):
+        return DENY, "category_deny"
     if not title:
         return ALLOW, "no_title"
     if DENY_TITLE_RE.search(title):
@@ -157,14 +177,17 @@ def hard_deny_ids_from_settings(settings: Any) -> frozenset[str]:
     return frozenset(str(i) for i in (getattr(settings, "avito_blocked_items", None) or []))
 
 
-def classify_listing(item_id: str, title: Optional[str], hard_deny_ids: frozenset[str]) -> tuple[str, str]:
+def classify_listing(
+    item_id: str, title: Optional[str], hard_deny_ids: frozenset[str],
+    category: Optional[str] = None,
+) -> tuple[str, str]:
     """classify_title плюс жёсткий deny по id — используется и живым
     резолвером (ItemScopeResolver.resolve), и часовой фоновой задачей
     (refresh_item_scope), чтобы правило не разъезжалось по двум копиям."""
     item_id = str(item_id)
     if item_id in hard_deny_ids:
         return DENY, "hard_blocklist"
-    return classify_title(title)
+    return classify_title(title, category)
 
 
 @dataclass(frozen=True)
@@ -327,6 +350,7 @@ class ItemScopeResolver:
                 return row
 
         title = known_title
+        category: Optional[str] = None
         fetch_failed = False
         if self._fetch_item is not None:
             try:
@@ -339,8 +363,9 @@ class ItemScopeResolver:
             else:
                 if listing is not None:
                     title = listing.title
+                    category = getattr(listing, "category", None)
 
-        decision, reason = classify_title(title)
+        decision, reason = classify_title(title, category)
         if fetch_failed:
             return ItemScopeRow(item_id, title, decision, f"fetch_failed:{reason}")
 
@@ -380,7 +405,10 @@ async def refresh_item_scope(listings: list[Any], store: ItemScopeStore, hard_de
     классификация и запись."""
     stats = RefreshStats()
     for listing in listings:
-        decision, reason = classify_listing(listing.item_id, listing.title, hard_deny_ids)
+        decision, reason = classify_listing(
+            listing.item_id, listing.title, hard_deny_ids,
+            getattr(listing, "category", None),
+        )
         await store.upsert(listing.item_id, title=listing.title, decision=decision, reason=reason)
         stats.record(decision)
     return stats
