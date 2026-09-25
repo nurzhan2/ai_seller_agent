@@ -497,6 +497,14 @@ class ToolExecutor:
         # 00», числа гостей не называл, модель сама подставила guests=10 —
         # и свободная «Рыцарская» (до 6 чел.) выпала из альтернатив.
         self.known_guests: Any = _UNSET
+        # Зона объявления, с которого пришёл клиент (однозначно разобранная,
+        # см. loop.py). Выставляет loop.py. Нужна как запасной zone_id:
+        # живой случай 2026-09-25 — клиент с карточки «Русская баня» спросил
+        # «есть сегодня окошко?», модель вызвала find_next_available БЕЗ
+        # zone_id, все 14 дней вернулись UNKNOWN («зона не заведена»), а
+        # инструмент выдал это за «свободных дат нет» — клиенту ушло
+        # «во всех зонах занято» при трёх свободных банях.
+        self.listing_zone_id: str = ""
         # Кадры, отобранные к отправке за этот ход (get_photos). Отправляет их
         # конвейер, после текста; см. PHOTOS_PER_TURN.
         self.photos_to_send: list[str] = []
@@ -868,6 +876,8 @@ class ToolExecutor:
         booking_date = _parse_date(args.get("date"))
         if booking_date is None:
             return {"status": "needs_input", "missing_fields": ["date"]}
+        # Пропущенный/выдуманный zone_id -> зона объявления (см. _zone_id_from).
+        args = {**args, "zone_id": self._zone_id_from(args) or args.get("zone_id", "")}
 
         # Живой баг: агент сам досчитал «29 августа» до прошлого года и
         # ушёл в YCLIENTS за 2025-08-29 — 422, UNKNOWN, эскалация. Прошлая
@@ -998,6 +1008,93 @@ class ToolExecutor:
             })
         return found
 
+    def _zone_id_from(self, args: dict) -> str:
+        """zone_id модели, если это зона каталога, иначе зона объявления.
+
+        DeepSeek пропускает обязательный zone_id (живой лог 2026-09-25:
+        find_next_available({"date": "2026-09-25"})). Пустая строка дальше
+        давала UNKNOWN на каждый день — и ложное «занято».
+        """
+        known = {z.id for z in self.kb.catalog.zones}
+        zone_id = str(args.get("zone_id") or "").strip()
+        if zone_id in known:
+            return zone_id
+        return self.listing_zone_id if self.listing_zone_id in known else ""
+
+    def _search_window(self, args: dict) -> tuple[DateType, int, Optional[int]]:
+        """(с какой даты, сколько дат, часы). «date» — синоним «from_date»:
+        модель путает имя параметра, и дата клиента молча терялась."""
+        today = self._today_fn()
+        from_date = (
+            _parse_date(args.get("from_date")) or _parse_date(args.get("date")) or today
+        )
+        from_date = max(from_date, today)
+        limit = args.get("limit") or FIND_NEXT_AVAILABLE_DEFAULT_LIMIT
+        limit = max(1, min(int(limit), FIND_NEXT_AVAILABLE_HORIZON_DAYS))
+        return from_date, limit, args.get("hours")
+
+    # Без зоны смотрим меньше дней: каждый день — запрос на каждую зону.
+    ANY_ZONE_HORIZON_DAYS = 3
+
+    async def _any_zone_next_available(self, args: dict) -> dict:
+        """Зона не названа: какие зоны свободны в ближайшие дни.
+
+        Клиент спросил «есть сегодня окошко?» без зоны — честный ответ
+        «свободны баня Русская и купол с 18:00», а не «мест нет».
+        """
+        from_date, limit, hours = self._search_window(args)
+        guests = self.known_guests if self.known_guests is not _UNSET else args.get("guests")
+
+        days: list[dict] = []
+        unknown = 0
+        current = from_date
+        for _ in range(self.ANY_ZONE_HORIZON_DAYS):
+            if len(days) >= limit:
+                break
+            zones: list[dict] = []
+            for zone in self.kb.catalog.zones:
+                if guests and zone.capacity.is_resolved() and zone.capacity.value < guests:
+                    continue
+                availability = await self._availability_for(zone.id, current, None, hours)
+                if availability is None or not availability.is_known:
+                    unknown += 1
+                    continue
+                if availability.status.value == "free" and availability.free_slots:
+                    zones.append({
+                        "zone_id": zone.id,
+                        "name": zone.name,
+                        "free_slots": list(availability.free_slots),
+                    })
+            if zones:
+                days.append({"date": current.isoformat(), "zones": zones})
+            current += timedelta(days=1)
+
+        if days:
+            return {
+                "dates": days,
+                "instruction": (
+                    "Зона не выбрана — вот свободные зоны по дням. Назови клиенту "
+                    "2-3 подходящие со временем начала и спроси, какая интересна. "
+                    "Перед ценой подтверди время через check_availability."
+                ),
+            }
+        if unknown:
+            return {
+                "status": "unknown",
+                "dates": [],
+                "instruction": (
+                    "Занятость узнать не удалось. НЕ говори клиенту, что занято. "
+                    "Скажи, что уточняешь у менеджера, и вызови escalate_to_human."
+                ),
+            }
+        return {
+            "dates": [],
+            "instruction": (
+                f"Все зоны заняты на {self.ANY_ZONE_HORIZON_DAYS} дня вперёд. "
+                "Предложи дату позже или уточнить у менеджера."
+            ),
+        }
+
     async def _tool_find_next_available(self, args: dict) -> dict:
         """Идёт по датам вперёд не дальше FIND_NEXT_AVAILABLE_HORIZON_DAYS —
         это же и потолок числа запросов к провайдеру за один вызов
@@ -1022,8 +1119,12 @@ class ToolExecutor:
                 ),
             }
 
-        zone_id = args.get("zone_id", "")
+        zone_id = self._zone_id_from(args)
         guests = args.get("guests")
+        if not zone_id:
+            # Зона неизвестна (модель не передала, объявления нет) — не
+            # «свободных дат нет», а обзор всех зон по дням.
+            return await self._any_zone_next_available(args)
         zone = next((z for z in self.kb.catalog.zones if z.id == zone_id), None)
         if zone is not None and guests:
             capacity = zone.capacity.value if zone.capacity.is_resolved() else None
@@ -1036,36 +1137,41 @@ class ToolExecutor:
                     ),
                 }
 
-        from_date = _parse_date(args.get("from_date")) or self._today_fn()
-        if from_date < self._today_fn():
-            from_date = self._today_fn()
-
-        limit = args.get("limit") or FIND_NEXT_AVAILABLE_DEFAULT_LIMIT
-        limit = max(1, min(int(limit), FIND_NEXT_AVAILABLE_HORIZON_DAYS))
-        hours = args.get("hours")
+        from_date, limit, hours = self._search_window(args)
 
         found: list[dict] = []
+        unknown_days = 0
         current = from_date
         for _ in range(FIND_NEXT_AVAILABLE_HORIZON_DAYS):
             if len(found) >= limit:
                 break
             availability = await self._availability_for(zone_id, current, None, hours)
-            if (
-                availability is not None
-                and availability.is_known
-                and availability.status.value == "free"
-                and availability.free_slots
-            ):
+            if availability is None or not availability.is_known:
+                unknown_days += 1
+            elif availability.status.value == "free" and availability.free_slots:
                 found.append({"date": current.isoformat(), "free_slots": list(availability.free_slots)})
             current += timedelta(days=1)
 
+        if not found and unknown_days:
+            # «Не смогли узнать» ≠ «занято». Раньше UNKNOWN молча считался
+            # занятым днём, и клиент слышал «мест нет».
+            return {
+                "status": "unknown",
+                "dates": [],
+                "instruction": (
+                    "Занятость узнать не удалось. НЕ говори клиенту, что занято. "
+                    "Скажи, что уточняешь у менеджера, и вызови escalate_to_human."
+                ),
+            }
         if not found:
             return {
                 "dates": [],
                 "instruction": (
-                    f"За {FIND_NEXT_AVAILABLE_HORIZON_DAYS} дней вперёд свободных дат "
-                    "не нашлось. Скажи об этом клиенту и предложи уточнить у "
-                    "менеджера или рассмотреть другую зону."
+                    f"У зоны «{zone.name if zone else zone_id}» за "
+                    f"{FIND_NEXT_AVAILABLE_HORIZON_DAYS} дней вперёд свободных дат "
+                    "не нашлось. Это ТОЛЬКО про эту зону — не говори «во всех "
+                    "зонах». Предложи другую зону той же категории или уточнить "
+                    "у менеджера."
                 ),
             }
         return {

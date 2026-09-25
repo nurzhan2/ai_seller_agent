@@ -1283,6 +1283,7 @@ class AgentLoop:
                     (z for z in self.kb.catalog.zones if z.id == resolution.zone_id), None
                 )
                 listing_zone = zone.name if zone is not None else ""
+                executor.listing_zone_id = resolution.zone_id if zone is not None else ""
             if hint:
                 turn_content = f"{user_text}\n\n{hint}"
         elif not history:

@@ -674,3 +674,62 @@ async def test_find_next_available_skips_empty_days_and_returns_ascending(kb, ma
     dates = [entry["date"] for entry in result["dates"]]
     assert dates == [(DAY + timedelta(days=1)).isoformat(), (DAY + timedelta(days=3)).isoformat()]
     assert dates == sorted(dates)
+
+
+# --- Живой случай 2026-09-25: find_next_available без zone_id -> «мест нет» ---
+
+
+@respx.mock
+async def test_find_next_available_without_zone_uses_listing_zone(kb, mapping, verified):
+    """Модель вызвала find_next_available({"date": ...}) без zone_id. Клиент
+    пришёл с объявления бани — искать надо по ней, а не отвечать «занято»."""
+    respx.get(times_url(day=DAY)).mock(
+        return_value=httpx.Response(200, json=REAL_BOOK_TIMES_RESPONSE)
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY)
+    ex.listing_zone_id = "bath_russian"
+
+    result = await ex.run("find_next_available", {"date": DAY.isoformat(), "limit": 1})
+
+    assert result["dates"] and result["dates"][0]["date"] == DAY.isoformat()
+
+
+@respx.mock
+async def test_find_next_available_without_any_zone_lists_free_zones(kb, mapping, verified):
+    """Ни zone_id, ни объявления: обзор свободных зон, а не пустой ответ."""
+    respx.get(times_url(day=DAY)).mock(
+        return_value=httpx.Response(200, json=REAL_BOOK_TIMES_RESPONSE)
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY)
+
+    result = await ex.run("find_next_available", {"date": DAY.isoformat(), "limit": 1})
+
+    zones = result["dates"][0]["zones"]
+    assert [z["zone_id"] for z in zones] == ["bath_russian"]
+
+
+async def test_find_next_available_unknown_is_not_busy(kb, verified):
+    """Все дни UNKNOWN (зона без маппинга) — это «не знаю», не «занято»."""
+    provider = YClientsProvider(mapping=InMemoryZoneMapping(), company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY)
+
+    result = await ex.run("find_next_available", {"zone_id": "bath_russian"})
+
+    assert result["status"] == "unknown"
+    assert "escalate_to_human" in result["instruction"]
+
+
+@respx.mock
+async def test_check_availability_without_zone_uses_listing_zone(kb, mapping, verified):
+    respx.get(times_url(day=DAY)).mock(
+        return_value=httpx.Response(200, json=REAL_BOOK_TIMES_RESPONSE)
+    )
+    provider = YClientsProvider(mapping=mapping, company_id="1")
+    ex = ToolExecutor(kb, "d1", booking_provider=provider, today_fn=lambda: DAY)
+    ex.listing_zone_id = "bath_russian"
+
+    result = await ex.run("check_availability", {"date": DAY.isoformat()})
+
+    assert result["status"] == "free"
