@@ -66,6 +66,24 @@ def test_booking_in_the_middle_of_the_interval_blocks_it():
     assert not interval_is_free(free, time(14, 0), 6, 0)
 
 
+# Живой ответ book_times 2026-10-01: гриль-домик, сб 03.10, L = 3 ч, запись
+# 18:00-20:30. Старты отдаются до самого закрытия — значит, свободное t
+# означает лишь «не внутри записи», а не «[t, t+3ч) свободно».
+GRILL_0310 = ("9:00", "9:30", "10:00", "10:30", "11:00", "11:30", "12:00",
+              "12:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30",
+              "16:00", "16:30", "17:00", "17:30", "20:30", "21:00", "21:30",
+              "22:00", "22:30", "23:00")
+
+
+def test_live_case_0310_grill_start_before_booking_is_busy():
+    """Жалоба 19.09 / проверка 01.10: 16:00 и 17:30 на 3 часа наезжают на
+    запись 18:00-20:30 — бот не должен их предлагать."""
+    assert not interval_is_free(GRILL_0310, time(16, 0), 3, 10800)
+    assert not interval_is_free(GRILL_0310, time(17, 30), 3, 10800)
+    assert interval_is_free(GRILL_0310, time(15, 0), 3, 10800)
+    assert interval_is_free(GRILL_0310, time(20, 30), 2, 10800)
+
+
 def test_seance_length_is_read_from_book_times():
     data = [{"time": "9:00", "seance_length": 10800}, {"time": "9:30", "seance_length": 10800}]
     assert _parse_seance_seconds(data) == 10800

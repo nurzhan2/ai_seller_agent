@@ -145,10 +145,24 @@ def interval_is_free(
         return True
 
     length = (seance_seconds or 0) // 60
+    ordered = sorted(free)
+    gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
+    grid = min(gaps) if gaps else 30
+    # У book_times два разных смысла свободного t, и они зависят от
+    # настройки сотрудника-зоны в YCLIENTS:
+    #  а) «[t, t+L) свободен» — тогда старты, не влезающие до закрытия, не
+    #     отдаются (купола: последний старт 20:00 при L = 3 ч);
+    #  б) «t не внутри чужой записи» — старты идут до самого закрытия.
+    #     Живой ответ 2026-10-01, гриль-домик, сб 03.10, запись 18:00-20:30,
+    #     L = 3 ч: свободны 16:00, 17:30 и старты вплоть до 23:00. Шаг L
+    #     пропускал запись посреди интервала — бот предлагал занятое время
+    #     (жалоба заказчика 2026-09-19).
+    # Признак (б) — хоть один старт, чей сеанс вылезает за закрытие. Тогда
+    # сеансу верить нельзя: проверяем каждую точку сетки.
+    if length > 0 and any(t + length > close_minutes for t in free):
+        length = grid
     if length <= 0:
-        ordered = sorted(free)
-        gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b > a]
-        length = min(gaps) if gaps else 30
+        length = grid
     end = min(start + hours * 60, close_minutes)
 
     checkpoints = set(range(start, end - length + 1, length))
