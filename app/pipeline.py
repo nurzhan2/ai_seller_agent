@@ -1017,11 +1017,18 @@ class MessagePipeline:
         запишет в `image_ids`, и только их потом будет считать показанными.
         """
         from app.agent.tools import PHOTOS_PER_TURN
+        from app.media.bundled import bundled_photo_path
 
         sent: list[str] = []
         for image_id in image_ids[:PHOTOS_PER_TURN]:
             try:
-                await self.avito_client.send_image(chat_id, image_id)
+                bundled = bundled_photo_path(image_id)
+                if bundled is not None:
+                    await self.avito_client.upload_and_send_image(
+                        chat_id, bundled.read_bytes(), filename=bundled.name
+                    )
+                else:
+                    await self.avito_client.send_image(chat_id, image_id)
             except Exception:
                 logger.exception(
                     "pipeline: фото не отправлено",
