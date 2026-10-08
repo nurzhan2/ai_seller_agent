@@ -26,6 +26,10 @@ from app.kb.loader import KnowledgeBase
 class ItemZoneRow:
     zone_id: Optional[str] = None
     category: Optional[str] = None
+    # Объявление подарочного сертификата (2026-10: «Сертификат Баня на
+    # юбилей», «…на День рождения»). Условия сертификатов в каталоге не
+    # заведены — агент их не продаёт, а передаёт менеджеру.
+    certificate: bool = False
 
 
 class ItemZoneLookup(Protocol):
@@ -38,6 +42,7 @@ class ListingResolution:
     zone_id: Optional[str] = None
     candidate_zone_ids: tuple[str, ...] = ()
     category: Optional[str] = None
+    certificate: bool = False
 
 
 async def resolve_listing(
@@ -51,6 +56,8 @@ async def resolve_listing(
     row = await lookup.get(item_id)
     if row is None:
         return ListingResolution(status="unknown")
+    if getattr(row, "certificate", False):
+        return ListingResolution(status="certificate", certificate=True)
 
     if row.zone_id:
         return ListingResolution(status="resolved", zone_id=row.zone_id)
@@ -69,6 +76,25 @@ async def resolve_listing(
     return ListingResolution(status="unknown")
 
 
+def _plain(value):
+    """Цифра без служебных полей (resolved_from, provisional…) — для сравнения."""
+    if isinstance(value, dict):
+        return _plain(value.get("value"))
+    if isinstance(value, list):
+        return tuple(_plain(v) for v in value)
+    return value
+
+
+def _price_signature(zone) -> tuple:
+    pricing = zone.pricing or {}
+    package = zone.day_package or {}
+    return (
+        tuple(sorted((k, repr(_plain(v))) for k, v in pricing.items())),
+        repr(_plain(package.get("price"))),
+        repr(_plain(package.get("days"))),
+    )
+
+
 def build_listing_hint(resolution: ListingResolution, kb: KnowledgeBase) -> Optional[str]:
     """Служебная подсказка для модели — НЕ текст клиенту. Вызывающий код
     (AgentLoop.run_turn) добавляет её к содержимому хода, а не к системному
@@ -85,13 +111,29 @@ def build_listing_hint(resolution: ListingResolution, kb: KnowledgeBase) -> Opti
             "сам не уточнит другое.]"
         )
 
+    if resolution.status == "certificate":
+        return (
+            "[Служебно: клиент пришёл с объявления ПОДАРОЧНОГО СЕРТИФИКАТА на баню. "
+            "Номиналы, срок действия и оформление сертификатов в базе НЕ заведены — "
+            "не называй их и не считай цену бани вместо сертификата. Узнай одним "
+            "вопросом, на какую сумму или сколько часов нужен сертификат, затем "
+            "вызови escalate_to_human: оформит менеджер.]"
+        )
+
     if resolution.status == "ambiguous":
-        names = [z.name for z in kb.catalog.zones if z.id in resolution.candidate_zone_ids]
-        listed = ", ".join(f"«{n}»" for n in names)
+        zones = [z for z in kb.catalog.zones if z.id in resolution.candidate_zone_ids]
+        listed = ", ".join(f"«{z.name}»" for z in zones)
+        same_price = len({_price_signature(z) for z in zones}) == 1
+        price_note = (
+            " Цены у всех этих зон ОДИНАКОВЫЕ: если клиент спрашивает стоимость, "
+            "сразу посчитай её (calculate_price по любой из них), а уточняющий "
+            "вопрос задай тем же сообщением — не заставляй клиента сначала выбирать."
+            if same_price and len(zones) > 1 else ""
+        )
         return (
             "[Служебно: объявление, с которого пришёл клиент, общее на несколько "
             f"зон. Кандидаты: {listed}. Задай ОДИН уточняющий вопрос с этими "
-            "вариантами — не описывай весь каталог и не гадай.]"
+            f"вариантами — не описывай весь каталог и не гадай.{price_note}]"
         )
 
     return None   # unknown — агенту нечего подсказать, работает по тексту клиента

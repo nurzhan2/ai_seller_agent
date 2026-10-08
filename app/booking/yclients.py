@@ -338,10 +338,47 @@ class YClientsProvider:
 
     # -- занятость ---------------------------------------------------------
 
+    # Зоны без своего ресурса в YCLIENTS, которые физически — одна из других.
+    # Заказчик (сентябрь 2026): «домик для отдыха» — это баня «Гараж» или
+    # «Русская» без парилки, отдельной зоны в YCLIENTS у него нет. Свободен
+    # домик, если свободна хотя бы одна из этих бань; по умолчанию — на весь
+    # день (пакет 10:00–22:00), потому что домик сдаётся посуточно.
+    COMPOSITE_ZONES: dict[str, tuple[str, ...]] = {
+        "house_relax": ("bath_garage", "bath_russian"),
+    }
+    COMPOSITE_DAY = (TimeType(10, 0), 12)
+
+    async def _composite_availability(
+        self, zone_id: str, date: DateType, start_time: Optional[TimeType],
+        hours: Optional[int],
+    ) -> Availability:
+        start, length = (
+            (start_time, hours) if start_time is not None else self.COMPOSITE_DAY
+        )
+        unknown: Optional[Availability] = None
+        for part in self.COMPOSITE_ZONES[zone_id]:
+            got = await self.check_availability(part, date, start, length)
+            if got.status == AvailabilityStatus.FREE:
+                return Availability(
+                    AvailabilityStatus.FREE, free_slots=got.free_slots,
+                    seance_seconds=got.seance_seconds,
+                    reason=f"свободна {part} — домик ставится на неё",
+                )
+            if not got.is_known:
+                unknown = got
+        if unknown is not None:
+            return unknown
+        return Availability(
+            AvailabilityStatus.BUSY,
+            reason="заняты обе бани, на базе которых сдаётся домик",
+        )
+
     async def check_availability(
         self, zone_id: str, date: DateType, start_time: Optional[TimeType] = None,
         hours: Optional[int] = None,
     ) -> Availability:
+        if zone_id in self.COMPOSITE_ZONES:
+            return await self._composite_availability(zone_id, date, start_time, hours)
         row = self.mapping.get(zone_id)
         if row is None:
             # Каталог услуг у заказчика неполный — это ожидаемое состояние,
@@ -378,6 +415,8 @@ class YClientsProvider:
         )
 
     async def get_free_slots(self, zone_id: str, date: DateType) -> Availability:
+        if zone_id in self.COMPOSITE_ZONES:
+            return await self._composite_availability(zone_id, date, None, None)
         row = self.mapping.get(zone_id)
         if row is None:
             return Availability(

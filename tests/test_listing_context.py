@@ -177,3 +177,37 @@ def test_site_fallback_uses_url_once_confirmed():
 
     hint = site_fallback_hint(patched_kb)
     assert "https://parmangal.example" in hint
+
+
+# ------------------------------------------------- октябрь 2026: купола, сертификаты
+
+async def test_domes_have_same_price_so_hint_says_name_it_at_once(kb):
+    # Живой прогон 09.10: на «сколько стоит беседку» бот сначала спрашивал,
+    # какой из трёх куполов, хотя цены у них одинаковые.
+    lookup = FakeLookup({"d": ItemZoneRow(category="dome")})
+    hint = build_listing_hint(await resolve_listing("d", lookup, kb), kb)
+    assert "ОДИНАКОВЫЕ" in hint
+
+
+async def test_baths_with_same_price_also_get_the_note_and_unequal_would_not(kb):
+    lookup = FakeLookup({"b": ItemZoneRow(category="bath")})
+    resolution = await resolve_listing("b", lookup, kb)
+    # Три бани по 2500/3500 — тоже одинаковые.
+    assert "ОДИНАКОВЫЕ" in build_listing_hint(resolution, kb)
+
+
+def test_different_prices_get_no_note(kb):
+    from app.agent.listing_context import ListingResolution as R
+
+    hint = build_listing_hint(
+        R(status="ambiguous", candidate_zone_ids=("dome_bags", "grill_house")), kb,
+    )
+    assert "ОДИНАКОВЫЕ" not in hint
+
+
+async def test_certificate_listing_goes_to_manager(kb):
+    lookup = FakeLookup({"c": ItemZoneRow(category="bath", certificate=True)})
+    resolution = await resolve_listing("c", lookup, kb)
+    assert resolution.status == "certificate"
+    hint = build_listing_hint(resolution, kb)
+    assert "СЕРТИФИКАТ" in hint and "escalate_to_human" in hint

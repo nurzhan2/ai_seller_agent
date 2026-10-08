@@ -27,6 +27,7 @@ logger = logging.getLogger("parmangal.selfcheck")
 
 MSK = timezone(timedelta(hours=3))
 OVERRIDE_WARN_DAYS = 7
+RAILWAY_CAC_WARN_FROM = date(2026, 11, 10)
 SILENT_AFTER_MINUTES = 15
 
 
@@ -208,6 +209,16 @@ def check_runtime(facts: Facts, report: Report) -> None:
         report.warnings.append(f"Не отправлено сообщений за сутки: {failed}.")
     for err in facts.errors:
         report.problems.append(f"Проверка не выполнилась: {err}")
+    if facts.now.date() >= RAILWAY_CAC_WARN_FROM:
+        # Railway отключает railway.toml 01.12.2026 (предупреждение в CLI).
+        # Миграция не сделана сразу: генератор теряет restartPolicy, а
+        # проверить новый формат на живом деплое ночью без людей нельзя.
+        # После миграции — удалить этот блок.
+        report.warnings.append(
+            "Railway отключает railway.toml 01.12.2026 — нужно перевести деплой на "
+            "новый формат (railway config migrate --service ai_seller_agent), "
+            "иначе выкладка обновлений остановится. Напомните разработчику."
+        )
 
 
 def analyze(facts: Facts, kb: Any) -> Report:

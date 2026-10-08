@@ -336,6 +336,10 @@ class InMemoryDialogStore:
 # Реализация для прода
 # --------------------------------------------------------------------------
 
+def _is_certificate(title: Optional[str]) -> bool:
+    return "сертификат" in (title or "").lower()
+
+
 class SqlAlchemyDialogStore:
     """Одна сессия на вызов — так же, как `SqlAlchemyTouchStore` и
     `SqlAlchemyZoneMapping`: сессии не живут между шагами конвейера, потому
@@ -756,8 +760,13 @@ class SqlAlchemyDialogStore:
             zone_id, category = zone_from_title(title)
             if zone_id is None and category is None:
                 return None
-            return ItemZoneRow(zone_id=zone_id, category=category)
-        return ItemZoneRow(zone_id=row.zone_id, category=row.category)
+            return ItemZoneRow(
+                zone_id=zone_id, category=category, certificate=_is_certificate(title),
+            )
+        return ItemZoneRow(
+            zone_id=row.zone_id, category=row.category,
+            certificate=_is_certificate(row.title),
+        )
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None:
         """Пишет только то, что дошло до фильтра

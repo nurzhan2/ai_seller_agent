@@ -112,3 +112,9 @@ def test_scheduler_survives_a_failed_run():
     except asyncio.CancelledError:
         pass
     assert sent[0].startswith("🔴") and sent[1] == "ok"
+
+
+def test_railway_config_deadline_reminder_only_from_november():
+    assert analyze(Facts(now=NOW), KB).ok
+    later = analyze(Facts(now=datetime(2026, 11, 20, tzinfo=timezone.utc)), KB)
+    assert any("railway.toml" in w for w in later.warnings)
