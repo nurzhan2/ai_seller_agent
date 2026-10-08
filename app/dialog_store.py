@@ -741,7 +741,7 @@ class SqlAlchemyDialogStore:
                 )
             ).scalar_one_or_none()
 
-        if row is None:
+        if row is None or (not row.zone_id and not row.category):
             # Новое объявление, которое ещё не сопоставили руками, — зона
             # по заголовку из item_scope (app/kb/title_zone.py).
             from app.db.models import ItemScope

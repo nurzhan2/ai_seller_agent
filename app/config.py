@@ -331,6 +331,12 @@ class Settings(BaseSettings):
     # а не константой, чтобы менять без выкатки — как и кулдаун выше.
     takeover_auto_return_hours: int = 72
 
+    # --- Самопроверка (app/ops/selfcheck.py) ----------------------------
+    # Ежедневная сводка оператору: объявления без зоны / сменившие объект,
+    # ресурсы YCLIENTS, долгоживущие правки цен, фото, молчащие чаты.
+    selfcheck_enabled: bool = True
+    selfcheck_hour_msk: int = 9
+
     # --- Telegram --------------------------------------------------------
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_ops_chat_id: str = ""

@@ -26,7 +26,9 @@ def parse_callback(data: str) -> tuple[str, str]:
     return action, chat_id
 
 
-def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None) -> Dispatcher:
+def build_dispatcher(
+    service: OpsService, stats_provider=None, menu_service=None, selfcheck=None,
+) -> Dispatcher:
     dp = Dispatcher()
 
     async def _send(event, reply) -> None:
@@ -91,6 +93,20 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
             return
         data = await stats_provider()
         await message.answer(render_stats(**data))
+
+    @dp.message(Command("selfcheck"))
+    async def on_selfcheck(message: Message) -> None:
+        if not await _guard(message, message.from_user.id):
+            return
+        if selfcheck is None:
+            await message.answer("Самопроверка недоступна.")
+            return
+        await message.answer("Проверяю… это займёт до минуты.")
+        try:
+            await message.answer(await selfcheck())
+        except Exception:
+            logger.exception("selfcheck command failed")
+            await message.answer("🔴 Самопроверка упала — смотрите логи.")
 
     @dp.message(Command("pause"))
     async def on_pause(message: Message) -> None:
@@ -351,6 +367,7 @@ def build_dispatcher(service: OpsService, stats_provider=None, menu_service=None
 BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("menu", "Управление ассистентом"),
     ("stats", "Статистика"),
+    ("selfcheck", "Самопроверка: объявления, YCLIENTS, цены, фото"),
     ("moderation", "Режим модерации"),
     ("dryrun", "DRY_RUN вкл/выкл"),
     ("pause", "Поставить агента на паузу"),

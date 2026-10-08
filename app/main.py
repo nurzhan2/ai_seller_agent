@@ -949,12 +949,41 @@ async def lifespan(app: FastAPI):
     # напрямую, ему незачем тянуть весь Telegram-слой ради этого.
     app.state.catalog_editor = catalog_editor
 
+    # Ежедневная самопроверка (app/ops/selfcheck.py) — и по расписанию, и
+    # по /selfcheck из Telegram.
+    from app.ops import selfcheck as selfcheck_mod
+
+    async def run_selfcheck() -> str:
+        facts = await selfcheck_mod.collect_facts(
+            session_factory=get_sessionmaker(), items_client=avito_items_client,
+            avito_client=avito_client, booking_provider=booking_provider,
+            zone_mapping=zone_mapping, settings=settings,
+        )
+        return selfcheck_mod.analyze(facts, app.state.kb).render()[:4000]
+
+    app.state.run_selfcheck = run_selfcheck
+    selfcheck_task: asyncio.Task | None = None
+    if (
+        ops_bot is not None and settings.telegram_ops_chat_id
+        and settings.selfcheck_enabled
+    ):
+        async def send_selfcheck(text_: str) -> None:
+            await ops_bot.send_message(chat_id=settings.telegram_ops_chat_id, text=text_)
+
+        selfcheck_task = asyncio.create_task(
+            selfcheck_mod.supervised_selfcheck(
+                run_selfcheck, send_selfcheck, hour_msk=settings.selfcheck_hour_msk,
+            )
+        )
+        logger.info("selfcheck: ежедневно в %02d:00 МСК", settings.selfcheck_hour_msk)
+
     bot_task: asyncio.Task | None = None
     if ops_bot is not None:
         dispatcher = build_dispatcher(
             ops_service,
             stats_provider=lambda: admin_queries.stats(ops_service.store),
             menu_service=menu_service,
+            selfcheck=run_selfcheck,
         )
         bot_task = asyncio.create_task(supervised_bot_polling(dispatcher, ops_bot))
         # Список команд в интерфейсе Telegram — появляется сам, без ручной
@@ -966,7 +995,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    for task in (poller_task, resubscribe_task):
+    for task in (poller_task, resubscribe_task, selfcheck_task):
         if task is not None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
