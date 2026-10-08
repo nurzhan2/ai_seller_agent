@@ -58,6 +58,16 @@ SCENARIOS = [
     ("шатёр", "7980683885", [
         f"Шатёр на 25 человек {SAT} с 14 до 20, сколько?",
     ]),
+    ("домик весь день", "8043927867", [
+        f"Здравствуйте, домик на весь день {WED} свободен? Сколько стоит?",
+    ]),
+    ("сертификат", "8512379829", [
+        "Здравствуйте, хочу сертификат в баню на юбилей мужу",
+        "На 10 тысяч",
+    ]),
+    ("купол цена сразу", "7916557086", [
+        f"Сколько стоит беседка {SAT} с 15 до 19?",
+    ]),
 ]
 
 
@@ -81,7 +91,7 @@ async def main() -> None:
     )
     only = sys.argv[1:] or None
     for name, item_id, turns in SCENARIOS:
-        if only and not any(o in name for o in only):
+        if only and not any(o in name or o == item_id for o in only):
             continue
         print(f"\n=== {name} (item {item_id})", flush=True)
         history: list[dict] = []

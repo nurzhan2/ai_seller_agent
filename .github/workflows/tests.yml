@@ -9,11 +9,13 @@ on:
 
 jobs:
   pytest:
-    runs-on: ubuntu-latest
+    # Конкретная версия, не ubuntu-latest: latest переезжает на Ubuntu 26
+    # с 19.10.2026 — без нашего решения окружение тестов не меняется.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
