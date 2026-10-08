@@ -742,7 +742,21 @@ class SqlAlchemyDialogStore:
             ).scalar_one_or_none()
 
         if row is None:
-            return None
+            # Новое объявление, которое ещё не сопоставили руками, — зона
+            # по заголовку из item_scope (app/kb/title_zone.py).
+            from app.db.models import ItemScope
+            from app.kb.title_zone import zone_from_title
+
+            async with self._session_factory() as session:
+                title = (
+                    await session.execute(
+                        select(ItemScope.title).where(ItemScope.item_id == item_id)
+                    )
+                ).scalar_one_or_none()
+            zone_id, category = zone_from_title(title)
+            if zone_id is None and category is None:
+                return None
+            return ItemZoneRow(zone_id=zone_id, category=category)
         return ItemZoneRow(zone_id=row.zone_id, category=row.category)
 
     async def log_concession(self, chat_id: str, event: ConcessionEvent) -> None:
