@@ -86,10 +86,12 @@ def dome_quote(kb):
 
 
 @pytest.fixture(scope="module")
-def dome_monday_7h(kb):
+def dome_monday_9h(kb):
     """A booking where a non-price tier genuinely applies: 7 hours bills as
     6 (5+1) = 6000, which the 5000 weekday package beats."""
-    return quote(PriceRequest("dome_bags", MON, time(10, 0), 7, 6), kb)
+    # Будни куполов с 15.10.2026 — 800 ₽/ч: 7 часов (4800) уже дешевле пакета
+    # 5000, поэтому берём 9 часов — они дороже пакета.
+    return quote(PriceRequest("dome_bags", MON, time(10, 0), 9, 6), kb)
 
 
 def req(quote_obj, **kwargs):
@@ -204,11 +206,11 @@ def test_r4_two_attempts_open_price_tiers(kb, bath_quote):
     assert 3 in d.skipped_tiers and 4 in d.skipped_tiers
 
 
-def test_r4_first_applicable_tier_is_non_price(kb, dome_monday_7h):
+def test_r4_first_applicable_tier_is_non_price(kb, dome_monday_9h):
     """A dome on Monday for 7 hours: shifting to a weekday is pointless (it
     already is one) and there is no cheaper zone, but the day package (5000)
     genuinely beats the hourly total (6000) — so tier 3 is offered first."""
-    d = decide(req(dome_monday_7h, booking_date=MON), kb)
+    d = decide(req(dome_monday_9h, booking_date=MON), kb)
     assert d.allowed
     assert d.kind == "non_price"
     assert d.tier == 3
@@ -838,11 +840,11 @@ def test_applicability_day_package_requires_a_package(kb, bath_quote):
     assert not is_applicable(tier, req(bath_quote), kb)
 
 
-def test_applicability_day_package_true_when_cheaper(kb, dome_monday_7h):
+def test_applicability_day_package_true_when_cheaper(kb, dome_monday_9h):
     """7 hours bills as 6 (5+1 promo) = 6000, so the 5000 package wins."""
-    assert dome_monday_7h.total == money(6000)
+    assert dome_monday_9h.total > money(5000)
     tier = next(t for t in kb.concessions.policy.ladder if t.id == "day_package")
-    assert is_applicable(tier, req(dome_monday_7h, booking_date=MON), kb)
+    assert is_applicable(tier, req(dome_monday_9h, booking_date=MON), kb)
 
 
 def test_applicability_day_package_false_when_hourly_is_cheaper(kb):

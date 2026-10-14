@@ -35,9 +35,10 @@ def test_all_good_is_one_line_ok():
 
 
 def test_listing_that_switched_to_dome_prices_is_flagged():
-    # 08.10: «Теплые беседки с мангалом» за 1000 ₽ висели на гриль-домике.
+    # 08.10: беседки по цене купола висели на гриль-домике. С 15.10 будни
+    # гриль-домика 999 ₽, поэтому пример — объявление заметно дешевле.
     report = analyze(Facts(now=NOW, listings=[
-        L("7948042872", "Теплые беседки с мангалом в Ватутинках", 1000, "grill_house"),
+        L("7948042872", "Теплые беседки с мангалом в Ватутинках", 500, "grill_house"),
     ]), KB)
     assert any("ниже минимальной" in w for w in report.warnings)
 

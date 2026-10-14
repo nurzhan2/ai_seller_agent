@@ -83,7 +83,8 @@ def test_dome_weekday_and_weekend(kb, zone_id):
     # 6 гостей влезают в любой купол: у мешков 10 мест, у кресел и стульев по 7.
     weekday = q(kb, zone_id=zone_id, date=THU, start_time=NOON, hours=3, guests=6)
     weekend = q(kb, zone_id=zone_id, date=SAT, start_time=NOON, hours=3, guests=6)
-    assert weekday.total == money(3000)
+    # Будни с 15.10.2026: 800 ₽/ч (заказчик).
+    assert weekday.total == money(2400)
     assert weekend.total == money(4500)
 
 
@@ -97,7 +98,8 @@ def test_dome_sunday_uses_weekend_rate(kb):
 def test_grill_house_weekday_and_weekend(kb):
     weekday = q(kb, zone_id="grill_house", date=THU, start_time=NOON, hours=3, guests=8)
     weekend = q(kb, zone_id="grill_house", date=SAT, start_time=NOON, hours=3, guests=8)
-    assert weekday.total == money(4500)
+    # Будни с 15.10.2026: 999 ₽/ч (заказчик).
+    assert weekday.total == money(2997)
     assert weekend.total == money(6000)
 
 

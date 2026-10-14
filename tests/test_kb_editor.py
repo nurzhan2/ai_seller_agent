@@ -203,7 +203,7 @@ async def test_revert_only_undoes_the_most_recent_edit(editor):
     we = await editor.current_value(field_by_key("we_hour"), "dome_bags")
     wd = await editor.current_value(field_by_key("wd_hour"), "dome_bags")
     assert we["value"] == 1800
-    assert wd["value"] == 1000        # вернулось к исходному (dome_bags.weekday_per_hour)
+    assert wd["value"] == 800        # вернулось к исходному (dome_bags.weekday_per_hour)
 
 
 async def test_reverted_row_is_not_reverted_again(editor):

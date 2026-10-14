@@ -212,7 +212,7 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: hourly
-      weekday_per_hour: {value: 1000}
+      weekday_per_hour: {value: 800, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       # Вопрос 3.1 (граница выходного тарифа) помечен заказчиком как блокирующий,
       # но фактического расхождения в ЦИФРЕ нет: шаблон менеджера в d05 пропускает
       # воскресенье в формулировке («Пт-Сб»), однако названная на воскресенье цена
@@ -241,7 +241,7 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: hourly
-      weekday_per_hour: {value: 1000}
+      weekday_per_hour: {value: 800, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       weekend_per_hour: {value: 1500}
       min_hours: {value: 3}
     day_package:
@@ -264,7 +264,7 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: hourly
-      weekday_per_hour: {value: 1000}
+      weekday_per_hour: {value: 800, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       weekend_per_hour: {value: 1500}
       min_hours: {value: 3}
     day_package:
@@ -291,7 +291,7 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: hourly
-      weekday_per_hour: {value: 1500}
+      weekday_per_hour: {value: 999, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       weekend_per_hour: {value: 2000}
       # 4.2: базовый минимум 3 часа; 2 часа возможны только через ступень
       # уступки при низкой загрузке (concessions.yaml, reduce_min_hours).
