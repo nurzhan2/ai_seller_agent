@@ -13,6 +13,22 @@ jobs:
     # с 19.10.2026 — без нашего решения окружение тестов не меняется.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # Настоящий Postgres: без него 88 тестов хранилищ (JSONB/ARRAY/ENUM,
+    # миграции) молча пропускаются, а это ровно тот слой, где хранится
+    # всё, что видит клиент.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: parmangal_test
+          POSTGRES_PASSWORD: parmangal_test
+          POSTGRES_DB: parmangal_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U parmangal_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://parmangal_test:parmangal_test@127.0.0.1:5432/parmangal_test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -24,4 +40,5 @@ jobs:
             requirements-dev.txt
             constraints.txt
       - run: pip install -r requirements-dev.txt -c constraints.txt
-      - run: python -m pytest -q -p no:cacheprovider --timeout=120
+      # -rs: причины пропусков в логе — пропущенный тест не должен быть невидимым.
+      - run: python -m pytest -q -p no:cacheprovider --timeout=120 -rs

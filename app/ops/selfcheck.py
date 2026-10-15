@@ -27,6 +27,7 @@ logger = logging.getLogger("parmangal.selfcheck")
 
 MSK = timezone(timedelta(hours=3))
 OVERRIDE_WARN_DAYS = 7
+GUARD_WARN_PER_DAY = 5
 RAILWAY_CAC_WARN_FROM = date(2026, 11, 10)
 SILENT_AFTER_MINUTES = 15
 
@@ -60,6 +61,10 @@ class Facts:
     photo_ok: Optional[bool] = None
     stats: dict[str, int] = field(default_factory=dict)
     silent_chats: list[str] = field(default_factory=list)
+    # Сколько раз за сутки сработали рубежи (выдуманная цена, занятость без
+    # проверки, «бронь на словах»…): рост — первый признак, что модель стала
+    # ошибаться чаще, раньше, чем это заметит заказчик.
+    guard_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)            # упавшие проверки
 
 
@@ -204,6 +209,14 @@ def check_runtime(facts: Facts, report: Report) -> None:
             f"Бот не ответил клиенту ({len(facts.silent_chats)}): "
             + ", ".join(facts.silent_chats[:5])
         )
+    guards = sum(facts.guard_counts.values())
+    if guards >= GUARD_WARN_PER_DAY:
+        top = ", ".join(f"{k} — {v}" for k, v in sorted(
+            facts.guard_counts.items(), key=lambda kv: -kv[1])[:3])
+        report.warnings.append(
+            f"Защита поправила ответы бота {guards} раз за сутки ({top}) — "
+            "модель стала ошибаться чаще обычного, стоит посмотреть диалоги."
+        )
     failed = facts.stats.get("failed", 0)
     if failed >= 3:
         report.warnings.append(f"Не отправлено сообщений за сутки: {failed}.")
@@ -230,7 +243,8 @@ def analyze(facts: Facts, kb: Any) -> Report:
     s = facts.stats
     report.stats_line = (
         f"За сутки: входящих {s.get('incoming', 0)}, ответов бота {s.get('sent', 0)}, "
-        f"не отправлено {s.get('failed', 0)}, новых чатов {s.get('new_chats', 0)}."
+        f"не отправлено {s.get('failed', 0)}, новых чатов {s.get('new_chats', 0)}, "
+        f"поправок защиты {sum(facts.guard_counts.values())}."
     )
     return report
 
@@ -339,9 +353,37 @@ async def _stats(session_factory, now: datetime) -> tuple[dict[str, int], list[s
         silent = [r[0] for r in (await session.execute(
             text(_SILENT_SQL), {"since": since, "quiet": quiet}
         )).all()]
+        metas = [r[0] for r in (await session.execute(
+            text("select llm_meta from messages where direction = 'outgoing' "
+                 "and created_at > :since and llm_meta is not null"),
+            {"since": since},
+        )).all()]
     stats = {k: int(v or 0) for k, v in dict(row).items()}
     stats["new_chats"] = int(new_chats or 0)
-    return stats, silent
+    return stats, silent, count_guards(metas)
+
+
+def count_guards(metas) -> dict[str, int]:
+    """Рубежи из llm_meta исходящих: guard_rail, «бронь на словах», лишние вопросы."""
+    import json
+
+    counts: dict[str, int] = {}
+    for meta in metas:
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except ValueError:
+                continue
+        if not isinstance(meta, dict):
+            continue
+        names = []
+        if meta.get("guard_rail"):
+            names.append(str(meta["guard_rail"]).split(":")[0].split(" (")[0][:60])
+        if meta.get("false_hold_guard"):
+            names.append("бронь на словах")
+        for name in names:
+            counts[name] = counts.get(name, 0) + 1
+    return counts
 
 
 async def collect_facts(
@@ -385,7 +427,7 @@ async def collect_facts(
 
     got = await _guard(facts, "статистика", _stats(session_factory, facts.now))
     if got is not None:
-        facts.stats, facts.silent_chats = got
+        facts.stats, facts.silent_chats, facts.guard_counts = got
     return facts
 
 

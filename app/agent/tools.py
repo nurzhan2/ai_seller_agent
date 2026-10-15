@@ -486,10 +486,14 @@ class ToolExecutor:
         # async () -> Iterable[image_id]: что уже отправлено в этот чат. None
         # (тесты, харнесс) — «ничего», каждый ход начинает с первых кадров.
         sent_photos: Any = None,
+        # Предварительные брони внутри бота (app/booking/holds.py). None —
+        # тесты и харнесс: без них занятость только из YCLIENTS, как раньше.
+        hold_store: Any = None,
     ):
         self.kb = kb
         self.dialog_id = dialog_id
         self.sent_photos = sent_photos
+        self.hold_store = hold_store
         # Число гостей, которое КЛИЕНТ назвал в переписке (app/agent/slots.py),
         # — выставляет loop.py после разбора диалога. _UNSET — executor
         # создан вне цикла (тесты, харнесс): тогда верим аргументу модели.
@@ -676,7 +680,31 @@ class ToolExecutor:
             )
             if warning:
                 result.update(warning)
+            else:
+                await self._hold_slot(
+                    final.zone_id or request.zone_id, date_value,
+                    request.start_time, request.hours, ttl_kind="quote",
+                )
         return result
+
+    async def _hold_slot(
+        self, zone_id: str, date_value: DateType, start_time: Optional[TimeType],
+        hours: Optional[int], *, ttl_kind: str,
+    ) -> None:
+        """Предварительная бронь за этим чатом (app/booking/holds.py)."""
+        if self.hold_store is None or start_time is None or not hours:
+            return
+        if date_value < self._today_fn():
+            return
+        from app.booking.holds import HANDOFF_TTL, QUOTE_TTL
+
+        try:
+            await self.hold_store.add(
+                zone_id, date_value, start_time, int(hours), self.dialog_id,
+                ttl=HANDOFF_TTL if ttl_kind == "handoff" else QUOTE_TTL,
+            )
+        except Exception:
+            logger.exception("hold was not saved", extra={"chat_id": self.dialog_id})
 
     async def _busy_slot_warning(
         self, zone_id: str, date_value: DateType,
@@ -850,6 +878,26 @@ class ToolExecutor:
                 status=AvailabilityStatus.UNKNOWN, reason="провайдер недоступен"
             )
 
+        if (
+            self.hold_store is not None and start_time is not None
+            and availability.status == AvailabilityStatus.FREE
+        ):
+            taken = await self.hold_store.conflicts(
+                zone_id, date_value, start_time, hours, self.dialog_id,
+            )
+            if taken:
+                logger.warning(
+                    "slot is free in YCLIENTS but promised to another chat",
+                    extra={"zone_id": zone_id, "date": str(date_value),
+                           "holds": [h.owner for h in taken]},
+                )
+                availability = Availability(
+                    status=AvailabilityStatus.BUSY,
+                    reason="время уже обещано другому клиенту, ждём его оплату",
+                    free_slots=availability.free_slots,
+                    seance_seconds=availability.seance_seconds,
+                )
+
         self._availability_cache[key] = availability
         return availability
 
@@ -981,12 +1029,12 @@ class ToolExecutor:
                 )
             return payload
         if _parse_time(args.get("start_time")) is None:
-            day_view = self._day_view(availability, booking_date, args.get("zone_id", ""))
+            day_view = await self._day_view(availability, booking_date, args.get("zone_id", ""))
             if day_view is not None:
                 return day_view
         return {"status": "free", "free_slots": list(availability.free_slots)}
 
-    def _day_view(
+    async def _day_view(
         self, availability, booking_date: DateType, zone_id: str,
     ) -> Optional[dict]:
         """Ответ на вопрос «свободно ли на дату» без времени.
@@ -1007,6 +1055,9 @@ class ToolExecutor:
             tuple(availability.free_slots), availability.seance_seconds,
             include_morning=booking_date > self._today_fn(),
         )
+        if self.hold_store is not None:
+            for hold in await self.hold_store.others(zone_id, booking_date, self.dialog_id):
+                windows.append(f"{hold.label()} (обещано другому клиенту, ждём оплату)")
         if not windows:
             return None
         return {
@@ -1539,6 +1590,9 @@ class ToolExecutor:
             "slot_confirmed_free": slot_is_known,
         }
         self.booking_handoff = card
+        await self._hold_slot(
+            zone_id, booking_date, start_time, occupied_hours, ttl_kind="handoff",
+        )
         # Эскалация ставится ДО отправки карточки: недоступный Telegram не
         # должен превращать передачу в обычный ход агента.
         self.escalated = True

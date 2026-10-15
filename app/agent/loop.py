@@ -1147,6 +1147,8 @@ class AgentLoop:
         # рубежа. Иначе рубеж сравнивал бы ответ с датой, которой модель не
         # видела, — и на стыке суток ловил бы несуществующее расхождение.
         now_fn: Any = None,
+        # Предварительные брони внутри бота (app/booking/holds.py).
+        hold_store: Any = None,
     ):
         # `client` принимает три формы ради обратной совместимости с уже
         # написанными тестами и харнессом: готовый LLMProvider, «сырой»
@@ -1177,6 +1179,7 @@ class AgentLoop:
                 sent_photos=(
                     (lambda: sent_photos_lookup(dialog_id)) if sent_photos_lookup else None
                 ),
+                hold_store=hold_store,
             )
         )
 
@@ -1673,6 +1676,23 @@ class AgentLoop:
         # не отличить «модель написала два вопроса, мы обрезали» от
         # «модель написала один» — а это и есть измеряемая величина в
         # замере (scripts/probe_questions.py).
+        # РУБЕЖ «НЕ БРОНИРУЕМ НА СЛОВАХ» (app/agent/hold_phrases.py). Пока
+        # бронь не передана менеджеру этим же ходом, «придержу», «оформляю
+        # бронь», «жду вас к 12:00» — ложь клиенту: в YCLIENTS ничего нет, и
+        # время продадут другому (накладки октября 2026).
+        if getattr(executor, "booking_handoff", None) is None:
+            from app.agent.hold_phrases import strip_false_holds
+
+            cleaned, stripped = strip_false_holds(final_text)
+            if stripped:
+                guard_rails_total.labels(rule="false_hold").inc()
+                logger.error(
+                    "guard rail: false_hold — бот обещал бронь словами",
+                    extra={"dialog_id": dialog_id, "withheld_text": final_text[:TOOL_TRACE_LIMIT]},
+                )
+                llm_meta = {**llm_meta, "false_hold_guard": True, "unstripped_text": final_text}
+                final_text = cleaned
+
         if count_questions(final_text) > 1:
             trimmed = trim_to_one_question(final_text)
             guard_rails_total.labels(rule=QUESTION_GUARD_VIOLATION).inc()

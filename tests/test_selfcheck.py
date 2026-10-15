@@ -119,3 +119,19 @@ def test_railway_config_deadline_reminder_only_from_november():
     assert analyze(Facts(now=NOW), KB).ok
     later = analyze(Facts(now=datetime(2026, 11, 20, tzinfo=timezone.utc)), KB)
     assert any("railway.toml" in w for w in later.warnings)
+
+
+def test_guard_counts_are_read_from_llm_meta_and_warn_when_frequent():
+    from app.ops.selfcheck import count_guards
+
+    metas = [
+        {"guard_rail": "занятость без вызова check_availability (последний рубеж)"},
+        '{"false_hold_guard": true}',
+        {"guard_rail": "amount_mismatch"}, None, "not json", {"cost_rub": "0.4"},
+    ]
+    counts = count_guards(metas)
+    assert counts == {"занятость без вызова check_availability": 1,
+                      "бронь на словах": 1, "amount_mismatch": 1}
+    assert analyze(Facts(now=NOW, guard_counts=counts), KB).ok
+    many = analyze(Facts(now=NOW, guard_counts={"бронь на словах": 6}), KB)
+    assert any("Защита поправила" in w for w in many.warnings)
