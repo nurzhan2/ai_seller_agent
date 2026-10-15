@@ -732,4 +732,7 @@ async def test_check_availability_without_zone_uses_listing_zone(kb, mapping, ve
 
     result = await ex.run("check_availability", {"date": DAY.isoformat()})
 
-    assert result["status"] == "free"
+    # Зона взята из объявления, провайдер ответил. С 15.10.2026 день без
+    # времени с занятыми окнами — «partially_busy», а не «free».
+    assert result["status"] in ("free", "partially_busy")
+    assert result["free_slots"]

@@ -80,7 +80,10 @@ def test_live_case_0310_grill_start_before_booking_is_busy():
     запись 18:00-20:30 — бот не должен их предлагать."""
     assert not interval_is_free(GRILL_0310, time(16, 0), 3, 10800)
     assert not interval_is_free(GRILL_0310, time(17, 30), 3, 10800)
-    assert interval_is_free(GRILL_0310, time(15, 0), 3, 10800)
+    # 15:00–18:00 задевает запись, которая начинается в 17:30 (старт записи
+    # book_times отдаёт как свободный, см. test_double_booking_1015).
+    assert not interval_is_free(GRILL_0310, time(15, 0), 3, 10800)
+    assert interval_is_free(GRILL_0310, time(14, 30), 3, 10800)
     assert interval_is_free(GRILL_0310, time(20, 30), 2, 10800)
 
 

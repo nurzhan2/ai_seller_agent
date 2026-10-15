@@ -668,7 +668,44 @@ class ToolExecutor:
                 floor_reached=self.state.floor_reached,
                 touch_count=new_touch_count,
             )
-        return quote_to_dict(final)
+        result = quote_to_dict(final)
+        if final.status == "ok":
+            warning = await self._busy_slot_warning(
+                final.zone_id or request.zone_id, date_value,
+                request.start_time, request.hours,
+            )
+            if warning:
+                result.update(warning)
+        return result
+
+    async def _busy_slot_warning(
+        self, zone_id: str, date_value: DateType,
+        start_time: Optional[TimeType], hours: Optional[int],
+    ) -> Optional[dict]:
+        """Страховка от накладок: цена посчитана на ЗАНЯТОЕ время.
+
+        Живой случай 2026-10-15: бот проверил занятость один раз без
+        времени, потом клиент назвал «к 12:00 на весь день», бот посчитал
+        цену и написал «Оформляю бронь» — на время, где уже стояла запись
+        15:30–21:00. Цену считают почти всегда, когда время уже известно,
+        поэтому сверка с YCLIENTS здесь ловит то, что пропустила модель.
+        """
+        if start_time is None or not hours or self.booking_provider is None:
+            return None
+        if date_value < self._today_fn():
+            return None
+        availability = await self._availability_for(zone_id, date_value, start_time, hours)
+        if availability is None or availability.status.value != "busy":
+            return None
+        return {
+            "slot_busy": True,
+            "instruction": (
+                f"ВНИМАНИЕ: {date_value:%d.%m} с {start_time:%H:%M} на {hours} ч это время "
+                "УЖЕ ЗАНЯТО в журнале. Не подтверждай бронь, не пиши «оформляю», "
+                "«жду вас», «придержу». Вызови check_availability на эту дату без "
+                "времени и предложи клиенту свободное время или другую зону."
+            ),
+        }
 
     # -- уступка ------------------------------------------------------------
 
@@ -943,7 +980,47 @@ class ToolExecutor:
                     "свободные даты — не заканчивай разговор отказом."
                 )
             return payload
+        if _parse_time(args.get("start_time")) is None:
+            day_view = self._day_view(availability, booking_date, args.get("zone_id", ""))
+            if day_view is not None:
+                return day_view
         return {"status": "free", "free_slots": list(availability.free_slots)}
+
+    def _day_view(
+        self, availability, booking_date: DateType, zone_id: str,
+    ) -> Optional[dict]:
+        """Ответ на вопрос «свободно ли на дату» без времени.
+
+        Живой случай 2026-10-15 (гриль-домик, 24.10, «на весь день»): FREE
+        без времени значит лишь «есть хоть один свободный старт», а бот
+        прочитал это как «весь день свободен» и пообещал день при записи
+        15:30–21:00 — накладка. Если в дне есть занятые окна, статус не
+        «free», а «partially_busy» с окнами.
+        """
+        from app.booking.yclients import YClientsProvider, busy_windows
+
+        if not availability.free_slots or zone_id in YClientsProvider.COMPOSITE_ZONES:
+            # Без сетки слотов окна не посчитать; домик (составная зона)
+            # уже проверен на весь день 10:00–22:00 провайдером.
+            return None
+        windows = busy_windows(
+            tuple(availability.free_slots), availability.seance_seconds,
+            include_morning=booking_date > self._today_fn(),
+        )
+        if not windows:
+            return None
+        return {
+            "status": "partially_busy",
+            "busy": windows,
+            "free_slots": list(availability.free_slots),
+            "instruction": (
+                f"День свободен НЕ целиком — занято: {', '.join(windows)}. "
+                "НЕ говори «свободно», «можете приезжать» и не обещай весь день. "
+                "Назови клиенту свободное время и спроси, во сколько и на сколько "
+                "часов он хочет. Когда назовёт — снова вызови check_availability "
+                "с start_time и hours и только по её ответу подтверждай время."
+            ),
+        }
 
     # Сколько соседних зон опрашиваем при занятости. Каждая — обращение к
     # YCLIENTS, и на десяти зонах один ход клиента превратился бы в десять

@@ -159,16 +159,78 @@ def interval_is_free(
     #     (жалоба заказчика 2026-09-19).
     # Признак (б) — хоть один старт, чей сеанс вылезает за закрытие. Тогда
     # сеансу верить нельзя: проверяем каждую точку сетки.
-    if length > 0 and any(t + length > close_minutes for t in free):
-        length = grid
-    if length <= 0:
+    starts_to_close = length <= 0 or any(t + length > close_minutes for t in free)
+    if starts_to_close:
         length = grid
     end = min(start + hours * 60, close_minutes)
 
     checkpoints = set(range(start, end - length + 1, length))
     if end - length > start:
         checkpoints.add(end - length)
+    # В режиме (б) YCLIENTS отдаёт СВОБОДНЫМ и сам старт чужой записи: бронь
+    # Наталии 17.10 «с 15 до 18» в book_times выглядит как «15:00 свободно,
+    # 15:30–17:30 нет, 18:00 свободно». Значит, последний свободный старт
+    # перед дырой — это начало записи, и интервал, кончающийся внутри дыры,
+    # с ней пересекается. Поэтому конец интервала тоже обязан быть свободным
+    # (накладки 15.10). Цена ошибки — в худшем случае 30 минут запаса между
+    # гостями, а не двойная бронь.
+    if starts_to_close and end < close_minutes:
+        checkpoints.add(end)
     return all(point in free for point in checkpoints)
+
+
+DAY_OPEN_MINUTES = 9 * 60
+
+
+def _hhmm(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def busy_windows(
+    free_slots: tuple[str, ...],
+    seance_seconds: Optional[int] = None,
+    *,
+    include_morning: bool = True,
+    open_minutes: int = DAY_OPEN_MINUTES,
+    close_minutes: int = DAY_CLOSE_MINUTES,
+) -> list[str]:
+    """Занятые окна дня по ответу book_times — «15:30–21:00».
+
+    Живой случай 2026-10-15: клиент спросил гриль-домик на 24.10 «на весь
+    день», check_availability без времени вернул FREE (свободные старты
+    есть), и бот ответил «свободен, можете приезжать» — при записи
+    15:30–21:00. Клиенту поставили накладку. Без времени нельзя говорить
+    «свободно», пока день не свободен целиком — для этого и нужны окна.
+
+    Смысл свободного старта — тот же, что в interval_is_free: (а) «[t, t+L)
+    свободен» или (б) «t не внутри записи». Между соседними свободными
+    стартами a < b занято [a + L, b) для (а) и [a, b) для (б) — в (б) YCLIENTS
+    отдаёт старт чужой записи как свободный (см. interval_is_free).
+    `include_morning=False` — для сегодняшней даты: прошедшие утренние часы
+    YCLIENTS не отдаёт, и это не запись.
+    """
+    free = sorted({m for m in (_to_minutes(s) for s in free_slots) if m is not None})
+    if not free:
+        return [f"{_hhmm(open_minutes)}–{_hhmm(close_minutes)}"]
+    gaps = [b - a for a, b in zip(free, free[1:]) if b > a]
+    grid = min(gaps) if gaps else 30
+    length = (seance_seconds or 0) // 60
+    starts_to_close = length <= 0 or any(t + length > close_minutes for t in free)
+    # (б): свободный старт перед дырой — это начало чужой записи (см.
+    # interval_is_free), поэтому окно начинается с него. (а): [a, a+L)
+    # свободен, запись начинается через L после последнего свободного старта.
+    step = 0 if starts_to_close else length
+
+    windows: list[tuple[int, int]] = []
+    if include_morning and free[0] > open_minutes:
+        windows.append((open_minutes, free[0]))
+    for a, b in zip(free, free[1:]):
+        if b - a > grid:
+            windows.append((a + step, b))
+    last_possible = close_minutes if starts_to_close else close_minutes - length
+    if free[-1] < last_possible:
+        windows.append((free[-1] + step, close_minutes))
+    return [f"{_hhmm(s)}–{_hhmm(e)}" for s, e in windows if e > s]
 
 
 def _slots_to_availability(
