@@ -679,7 +679,13 @@ class MessagePipeline:
             return
 
         try:
-            ours = await self.store.was_sent_by_us(chat_id, text)
+            from app.channels import echo_registry
+
+            # Сначала - «вот-вот отправленное»: в базу ответ ложится после
+            # отправки (и после фото), а эхо приходит раньше (аудит 30.10).
+            ours = echo_registry.is_expected(chat_id, text) or await self.store.was_sent_by_us(
+                chat_id, text,
+            )
         except Exception:
             # Сбой проверки — считаем сообщение своим и молчим про перехват.
             # Ошибка в другую сторону («это менеджер») заставила бы агента

@@ -427,6 +427,13 @@ class OutboundGate:
 
     async def send_message(self, chat_id: str, text: str) -> dict:
         await self._require_allowed(chat_id)
+        # До отправки, а не после: эхо приходит быстрее, чем ответ ляжет в
+        # базу (app/channels/echo_registry.py, аудит 30.10).
+        from app.channels import echo_registry
+        from app.channels.avito import truncate_for_avito
+
+        echo_registry.expect(chat_id, text)
+        echo_registry.expect(chat_id, truncate_for_avito(text))
         return await self._client.send_message(chat_id, text)
 
     async def send_image(self, chat_id: str, image_id: str) -> dict:
