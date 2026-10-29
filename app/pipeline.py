@@ -108,6 +108,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -181,6 +182,24 @@ SYSTEM_MESSAGE_GREETING = (
 async def _no_delay() -> None:
     """Заглушка для тестов и DRY_RUN — см. `delay_fn` в конструкторе."""
     return None
+
+
+# «Да»/«нет» сюда НЕ входят: это ответ на вопрос менеджера, его надо вести.
+_ACK = re.compile(
+    r"^(ок|окей|ok|хорошо|спасибо|спс|благодарю|понял[а]?|ясно|договорились|отлично|"
+    r"супер|класс|ага|пока стоп|стоп|👍|🙏|👌)([\s,.!)👍🙏👌]|спасибо|большое|вам)*$",
+    re.IGNORECASE,
+)
+
+
+def _is_just_acknowledgement(text: str) -> bool:
+    """Клиент ничего не спросил: «ок», «спасибо», «подумаю, напишу позже»."""
+    from app.agent.closing import CLIENT_PAUSE
+
+    body = (text or "").strip()
+    if not body or "?" in body:
+        return not body
+    return bool(_ACK.match(body)) or bool(CLIENT_PAUSE.search(body))
 
 
 class MessagePipeline:
@@ -700,6 +719,17 @@ class MessagePipeline:
             "pipeline: в чате написал живой менеджер — перехват",
             extra={"chat_id": chat_id},
         )
+        if text:
+            # Текст менеджера - в историю: вернувшись в чат, агент должен
+            # знать, что уже сказано (цены, адрес, «забронировали»).
+            saver = getattr(self.store, "save_operator_message", None)
+            if saver is not None:
+                try:
+                    await saver(chat_id, text, extract_message_id(payload))
+                except Exception:
+                    logger.exception(
+                        "pipeline: текст менеджера не сохранён", extra={"chat_id": chat_id},
+                    )
         try:
             await self.ops_service.note_operator_message(chat_id)
         except Exception:
@@ -1255,6 +1285,97 @@ class MessagePipeline:
             )
             handled.append(pending.chat_id)
         return handled
+
+    # -- клиент ждёт в чате «у менеджера» -----------------------------------
+
+    async def rescue_waiting_clients(self) -> list[str]:
+        """Один проход: клиенту в перехваченном чате никто не ответил.
+
+        Аудит 30.10: TAKEOVER_MODE=permanent держит агента молча до 72 ч
+        после ЛЮБОГО сообщения менеджера. Менеджер отвечал раз-другой и
+        пропадал - за 10 дней 22 клиента остались без ответа, в том числе
+        «Вы можете ответить?» и «Как закрепить бронь?». Теперь, если клиент
+        ждёт `takeover_client_wait_minutes` после последнего слова менеджера,
+        чат возвращается агенту: он подтягивает из Авито, что писал
+        менеджер, отвечает сам и сообщает оператору в Telegram.
+        """
+        minutes = int(getattr(self.settings, "takeover_client_wait_minutes", 0) or 0)
+        if minutes <= 0 or self.settings.dry_run:
+            return []
+        finder = getattr(self.store, "clients_waiting_in_takeover", None)
+        if finder is None:
+            return []
+        now = self.now_fn()
+        max_hours = int(getattr(self.settings, "takeover_client_wait_max_hours", 24) or 24)
+        rescued: list[str] = []
+        for chat_id, client_text in await finder(
+            older_than=now - timedelta(minutes=minutes),
+            not_before=now - timedelta(hours=max_hours),
+        ):
+            if not await self._client_wrote_after_threshold(chat_id):
+                continue
+            if _is_just_acknowledgement(client_text):
+                continue   # «спасибо», «ок», «подумаю» - отвечать через полчаса нечего
+            try:
+                await self._backfill_operator_messages(chat_id)
+                if not await self._still_waiting(chat_id, finder, now, minutes, max_hours):
+                    continue   # подтянули ответ менеджера, которого не было в базе
+                await self._return_chat_to_agent(chat_id, minutes)
+                await self._run_turn(chat_id, client_text)
+                rescued.append(chat_id)
+            except Exception:
+                logger.exception("pipeline: ждущий клиент не обработан", extra={"chat_id": chat_id})
+        return rescued
+
+    async def _still_waiting(self, chat_id, finder, now, minutes, max_hours) -> bool:
+        again = await finder(
+            older_than=now - timedelta(minutes=minutes),
+            not_before=now - timedelta(hours=max_hours),
+        )
+        return any(cid == chat_id for cid, _ in again)
+
+    async def _backfill_operator_messages(self, chat_id: str) -> int:
+        """Сообщения менеджера из Авито, которых нет в базе (до 30.10 они не
+        сохранялись), - в историю, с их настоящим временем."""
+        saver = getattr(self.store, "save_operator_message", None)
+        our_id = str(getattr(self.settings, "avito_user_id", "") or "")
+        if saver is None or self.avito_client is None or not our_id:
+            return 0
+        data = await self.avito_client.get_messages(chat_id, limit=30)
+        items = data.get("messages", []) if isinstance(data, dict) else (data or [])
+        saved = 0
+        for m in sorted(items, key=lambda m: m.get("created", 0)):
+            if str(m.get("author_id")) != our_id:
+                continue
+            text = ((m.get("content") or {}).get("text") or "").strip()
+            if not text or await self.store.was_sent_by_us(chat_id, text):
+                continue
+            created = datetime.fromtimestamp(int(m.get("created") or 0), timezone.utc)
+            if await saver(chat_id, text, str(m.get("id") or "") or None, created):
+                saved += 1
+        return saved
+
+    async def _return_chat_to_agent(self, chat_id: str, minutes: int) -> None:
+        store = self.ops_service.store
+        flags = await store.get_flags(chat_id)
+        flags.is_human_takeover = False
+        flags.takeover_at = None
+        await store.set_flags(chat_id, flags)
+        await store.log_action(chat_id, 0, "auto_return", {"reason": f"клиент ждёт {minutes}+ мин"})
+        logger.warning("pipeline: клиент ждал менеджера - отвечает агент", extra={"chat_id": chat_id})
+        if self.ops_bot is None or not getattr(self.settings, "telegram_ops_chat_id", ""):
+            return
+        try:
+            await self.ops_bot.send_message(
+                chat_id=self.settings.telegram_ops_chat_id,
+                text=(
+                    f"⏰ Клиент ждал ответа {minutes}+ мин после менеджера - чат {chat_id} "
+                    "вернулся боту, бот отвечает сам. Чтобы вести чат дальше руками, "
+                    "просто напишите клиенту в Авито."
+                ),
+            )
+        except Exception:
+            logger.exception("pipeline: уведомление о возврате чата не ушло", extra={"chat_id": chat_id})
 
     async def _count_agent_reply(self, chat_id: str) -> None:
         """Счётчик ответов агента растёт В ДВУХ местах, и это не дублирование.

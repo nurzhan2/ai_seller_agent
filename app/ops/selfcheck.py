@@ -206,7 +206,7 @@ def check_runtime(facts: Facts, report: Report) -> None:
         )
     if facts.silent_chats:
         report.warnings.append(
-            f"Бот не ответил клиенту ({len(facts.silent_chats)}): "
+            f"Клиенту никто не ответил - ни бот, ни менеджер ({len(facts.silent_chats)}): "
             + ", ".join(facts.silent_chats[:5])
         )
     guards = sum(facts.guard_counts.values())
@@ -243,6 +243,7 @@ def analyze(facts: Facts, kb: Any) -> Report:
     s = facts.stats
     report.stats_line = (
         f"За сутки: входящих {s.get('incoming', 0)}, ответов бота {s.get('sent', 0)}, "
+        f"сообщений менеджера {s.get('manager', 0)}, "
         f"не отправлено {s.get('failed', 0)}, новых чатов {s.get('new_chats', 0)}, "
         f"поправок защиты {sum(facts.guard_counts.values())}."
     )
@@ -254,15 +255,20 @@ def analyze(facts: Facts, kb: Any) -> Report:
 _STATS_SQL = """
 select
   count(*) filter (where direction = 'incoming')                     as incoming,
-  count(*) filter (where direction = 'outgoing' and status = 'sent')  as sent,
-  count(*) filter (where direction = 'outgoing' and status = 'failed') as failed
+  count(*) filter (where direction = 'outgoing' and author = 'agent' and status = 'sent')  as sent,
+  count(*) filter (where direction = 'outgoing' and author = 'agent' and status = 'failed') as failed,
+  count(*) filter (where direction = 'outgoing' and author = 'operator') as manager
 from messages where created_at > :since
 """
 
+# Аудит 30.10: здесь стояло `not c.is_human_takeover` - чаты «у менеджера»
+# не проверялись вовсе, и 22 клиента, которым менеджер так и не ответил,
+# ни разу не попали в сводку. Теперь без ответа - значит без ответа, кто бы
+# ни должен был отвечать (с 30.10 тексты менеджера тоже лежат в messages).
 _SILENT_SQL = """
 select c.chat_id
 from chats c
-where c.ai_enabled and not c.is_human_takeover and not coalesce(c.manual_hold, false)
+where c.ai_enabled and not coalesce(c.manual_hold, false)
   and (c.item_id is null or c.item_id not in
        (select item_id from item_scope where decision = 'deny'))
   and exists (

@@ -297,6 +297,50 @@ class InMemoryDialogStore:
         ][-ECHO_LOOKBACK:]
         return any((m["text"] or "").strip() == normalized for m in recent)
 
+    async def save_operator_message(
+        self, chat_id: str, text: str, avito_message_id: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> bool:
+        if avito_message_id is not None:
+            if avito_message_id in self.seen_message_ids:
+                return False
+            self.seen_message_ids.add(avito_message_id)
+        self.messages.setdefault(chat_id, []).append({
+            "direction": Direction.outgoing,
+            "author": Author.operator,
+            "text": text,
+            "status": SendStatus.sent,
+            "avito_message_id": avito_message_id,
+            "llm_meta": None,
+            "image_ids": None,
+            "created_at": created_at or datetime.now(timezone.utc),
+        })
+        return True
+
+    async def clients_waiting_in_takeover(
+        self, older_than: datetime, not_before: datetime,
+    ) -> list[tuple[str, str]]:
+        waiting = []
+        for chat_id, chat in self.chats.items():
+            if not chat.is_human_takeover or chat.manual_hold or not chat.ai_enabled:
+                continue
+            tail = []
+            # как в SQL: по времени, а не по порядку вставки (задним числом
+            # подтянутый текст менеджера встаёт на своё место)
+            far = datetime.max.replace(tzinfo=timezone.utc)
+            ordered = sorted(self.messages.get(chat_id, []), key=lambda m: m.get("created_at") or far)
+            for m in reversed(ordered):
+                if m["direction"] != Direction.incoming:
+                    break
+                tail.append(m)
+            if not tail:
+                continue
+            first = tail[-1].get("created_at")
+            if first is None or not (not_before <= first <= older_than):
+                continue
+            waiting.append((chat_id, "\n".join((m["text"] or "") for m in reversed(tail)).strip()))
+        return waiting
+
     async def has_any_messages(self, chat_id: str) -> bool:
         return bool(self.messages.get(chat_id))
 
@@ -659,6 +703,99 @@ class SqlAlchemyDialogStore:
             ).scalars().all()
 
         return any((row or "").strip() == normalized for row in rows)
+
+    async def save_operator_message(
+        self, chat_id: str, text: str, avito_message_id: Optional[str] = None,
+        created_at: Optional[datetime] = None,
+    ) -> bool:
+        """Текст живого менеджера - в историю диалога (аудит 30.10).
+
+        Раньше сообщения менеджера не сохранялись вовсе: агент, вернувшись в
+        чат, не знал, что менеджер уже назвал цену, адрес или «мы
+        забронировали». Автор `operator`, поэтому `was_sent_by_us` (смотрит
+        только `agent`) их не путает со своим эхом. `created_at` - время из
+        Авито, когда сообщение подтягивается задним числом, иначе история
+        встанет не в том порядке. False - уже сохранено (уникальный id).
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        from app.db.models import Message
+
+        row = Message(
+            chat_id=chat_id,
+            direction=Direction.outgoing,
+            author=Author.operator,
+            text=text,
+            avito_message_id=avito_message_id,
+            status=SendStatus.sent,
+        )
+        if created_at is not None:
+            row.created_at = created_at
+        async with self._session_factory() as session:
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return False
+        return True
+
+    async def clients_waiting_in_takeover(
+        self, older_than: datetime, not_before: datetime,
+    ) -> list[tuple[str, str]]:
+        """Чаты «у менеджера», где клиент написал и ему никто не ответил.
+
+        Аудит 30.10: за 10 дней 22 чата так и остались без ответа - менеджер
+        ответил раз-другой, чат ушёл в перехват (агент молчит до 72 ч), а
+        дальше клиента никто не довёл («Вы можете ответить?»).
+
+        Хвост диалога - только входящие клиента, самый ранний из них
+        написан в окне [not_before, older_than] и ПОЗЖЕ последнего сообщения
+        менеджера (`takeover_at` двигается каждым его сообщением - так
+        ловятся и старые чаты, где текст менеджера в базе не сохранён).
+        Возвращает (chat_id, склеенный текст клиента).
+        """
+        from sqlalchemy import select
+
+        from app.db.models import Chat, Message
+
+        async with self._session_factory() as session:
+            chats = (
+                await session.execute(
+                    select(Chat.chat_id, Chat.takeover_at).where(
+                        Chat.is_human_takeover.is_(True),
+                        Chat.manual_hold.is_not(True),
+                        Chat.ai_enabled.is_not(False),
+                        Chat.last_msg_at >= not_before,
+                    )
+                )
+            ).all()
+            waiting: list[tuple[str, str]] = []
+            for chat_id, takeover_at in chats:
+                rows = (
+                    await session.execute(
+                        select(Message.direction, Message.text, Message.created_at)
+                        .where(Message.chat_id == chat_id)
+                        .order_by(Message.created_at.desc(), Message.id.desc())
+                        .limit(15)
+                    )
+                ).all()
+                tail = []
+                for direction, text, created in rows:
+                    if direction != Direction.incoming:
+                        break
+                    tail.append((text, created))
+                if not tail:
+                    continue
+                first_at = tail[-1][1]
+                if first_at is None or not (not_before <= first_at <= older_than):
+                    continue
+                if takeover_at is not None and first_at <= takeover_at:
+                    continue
+                text = "\n".join((t or "") for t, _ in reversed(tail)).strip()
+                if text:
+                    waiting.append((chat_id, text))
+        return waiting
 
     async def sent_image_ids(self, chat_id: str) -> set[str]:
         """Какие фото уже ушли клиенту в этом чате.

@@ -331,6 +331,14 @@ async def supervised_concession_timeout_scheduler(
             raise
         except Exception:
             logger.exception("concession timeout scheduler: pass failed")
+        # Тот же минутный ритм: клиент, которому менеджер не ответил
+        # (app/pipeline.py:rescue_waiting_clients, аудит 30.10).
+        try:
+            await pipeline.rescue_waiting_clients()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("waiting clients: pass failed")
         await asyncio.sleep(interval_seconds)
 
 

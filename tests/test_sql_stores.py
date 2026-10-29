@@ -1297,3 +1297,55 @@ async def test_manual_hold_survives_everything_that_clears_a_takeover(session_fa
     await ops.set_flags("c-1", ChatFlags(is_human_takeover=False, takeover_at=None))
 
     assert await store.get_chat_manual_hold("c-1") is True
+
+
+# ==========================================================================
+# Аудит 30.10: клиент ждёт в чате «у менеджера», текст менеджера в истории
+# ==========================================================================
+
+async def test_operator_text_is_saved_once_and_shows_in_history(session_factory):
+    store = SqlAlchemyDialogStore(session_factory)
+    await store.get_or_create_chat("c-op")
+    await store.save_incoming("c-op", "Есть время сегодня?", "in-op-1")
+
+    assert await store.save_operator_message("c-op", "Есть с 17:00", "op-1") is True
+    assert await store.save_operator_message("c-op", "Есть с 17:00", "op-1") is False   # дубль
+
+    history = await store.load_history("c-op")
+    assert history[-1] == {"role": "assistant", "content": "Есть с 17:00"}
+    assert await store.was_sent_by_us("c-op", "Есть с 17:00") is False
+
+
+async def test_clients_waiting_in_takeover_finds_only_unanswered_clients(session_factory):
+    base = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        for cid, takeover_at in (("w-wait", base - timedelta(hours=2)),
+                                 ("w-answered", base - timedelta(hours=2)),
+                                 ("w-legacy", base - timedelta(minutes=5)),
+                                 ("w-fresh", base - timedelta(hours=2))):
+            session.add(Chat(chat_id=cid, is_human_takeover=True, takeover_at=takeover_at,
+                             last_msg_at=base))
+        session.add(Chat(chat_id="w-free", is_human_takeover=False, last_msg_at=base))
+        await session.commit()
+
+        def msg(cid, direction, author, txt, minutes_ago, mid):
+            session.add(Message(chat_id=cid, direction=direction, author=author, text=txt,
+                                status=SendStatus.sent, avito_message_id=mid,
+                                created_at=base - timedelta(minutes=minutes_ago)))
+
+        msg("w-wait", Direction.incoming, Author.client, "Как закрепить бронь?", 40, "a1")
+        msg("w-wait", Direction.incoming, Author.client, "Вы можете ответить?", 35, "a2")
+        msg("w-answered", Direction.incoming, Author.client, "Есть время?", 40, "b1")
+        msg("w-answered", Direction.outgoing, Author.operator, "Есть с 17", 20, "b2")
+        # текст менеджера не сохранён, но takeover_at позже вопроса клиента
+        msg("w-legacy", Direction.incoming, Author.client, "Сколько стоит?", 40, "c1")
+        msg("w-fresh", Direction.incoming, Author.client, "Ау", 10, "d1")
+        msg("w-free", Direction.incoming, Author.client, "Привет", 40, "e1")
+        await session.commit()
+
+    store = SqlAlchemyDialogStore(session_factory)
+    waiting = await store.clients_waiting_in_takeover(
+        older_than=base - timedelta(minutes=30), not_before=base - timedelta(hours=24),
+    )
+
+    assert waiting == [("w-wait", "Как закрепить бронь?\nВы можете ответить?")]

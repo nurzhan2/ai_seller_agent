@@ -234,6 +234,17 @@ def is_provisional_holiday(kb: KnowledgeBase, d: DateType) -> bool:
     return kb.catalog.constants.holidays.contains(d)
 
 
+def is_new_year_period(d: DateType) -> bool:
+    """30.12-10.01: свои цены, которых в базе нет (аудит 30.10).
+
+    Менеджер в чате 20.10: «31 декабря 10000 ₽ час, с 1-10 7000 ₽, 30 декабря
+    5000 ₽» - а бот считал эти даты обычным выходным (3500 ₽/ч). Заказчик
+    29.10: «праздники - как в YCLIENTS». Пока полного праздничного прайса по
+    всем зонам нет, бот на эти даты цену НЕ называет - решает менеджер.
+    """
+    return (d.month == 12 and d.day >= 30) or (d.month == 1 and d.day <= 10)
+
+
 def rate_hint_for(
     kb: KnowledgeBase, zone: Zone, when: DateType, guests: Optional[int] = None
 ) -> Optional[RateHint]:
@@ -252,6 +263,8 @@ def rate_hint_for(
     цифру». Поэтому здесь нет ни слова о том, сколько полей осталось
     незаполненными: хватает зоны и даты.
     """
+    if when is not None and is_new_year_period(when):
+        return None   # особые новогодние цены - называет менеджер
     day_type = resolve_day_type(kb, zone, when)
     if isinstance(day_type, _Missing):
         return None
@@ -405,6 +418,17 @@ def quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
     ответе — ровно то, что запрещено промтом и правилом харнесса
     `amount_after_blocked`. Молчание про деньги здесь и есть верный ответ.
     """
+    if req.date is not None and is_new_year_period(req.date):
+        ctx = _Ctx(blocking=[], advisory=[], warnings=[], lines=[])
+        return _blocked(
+            ctx,
+            "Новогодние даты (30.12-10.01): особые цены, называет менеджер",
+            zone_id=req.zone_id,
+            human_readable=(
+                "На новогодние даты действуют особые цены - их подтвердит менеджер."
+            ),
+        )
+
     result = _compute_quote(req, kb)
 
     if result.status in ("needs_input", "invalid") and result.rate_hint is None:

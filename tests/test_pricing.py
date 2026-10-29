@@ -24,8 +24,9 @@ THU = date(2026, 7, 16)
 FRI = date(2026, 7, 17)
 SAT = date(2026, 7, 18)
 SUN = date(2026, 7, 19)
-HOLIDAY = date(2026, 1, 5)
-AFTER_HOLIDAY = date(2026, 1, 9)
+# 23.02 - праздник вне новогоднего периода (30.12-10.01 цену называет менеджер)
+HOLIDAY = date(2026, 2, 23)
+AFTER_HOLIDAY = date(2026, 2, 24)
 NOON = time(12, 0)
 
 
@@ -407,7 +408,7 @@ def test_capacity_exactly_at_limit_is_ok(kb):
 
 def test_holiday_is_priced_as_weekend(kb):
     """7.2: праздники считаются по тарифу ВЫХОДНОГО дня, а не блокируются.
-    5 января 2026 — понедельник по календарю, но это праздник."""
+    23 февраля 2026 — понедельник по календарю, но это праздник."""
     assert HOLIDAY.weekday() == 0
     r = q(kb, zone_id="bath_russian", date=HOLIDAY, start_time=NOON, hours=3, guests=6)
     assert r.status == "ok"
@@ -421,12 +422,13 @@ def test_day_after_holiday_prices_normally(kb):
     assert r.total is not None
 
 
-def test_new_year_dates_are_no_longer_blocked(kb):
-    """Самые дорогие даты в году снова продаются."""
-    for zone_id, guests in (("dome_bags", 5), ("grill_house", 5), ("tent", 5), ("yurt", 2)):
-        r = q(kb, zone_id=zone_id, date=HOLIDAY, start_time=NOON, hours=3, guests=guests)
-        assert r.status == "ok", zone_id
-        assert r.day_type == "weekend"
+def test_new_year_dates_price_goes_to_the_manager_in_every_zone(kb):
+    """30.12-10.01: свои цены (менеджер: 31.12 - 10000 ₽/ч, 1-10.01 - 7000),
+    в базе их нет. Бот не называет цену, а не отказывает в брони."""
+    for zone_id, guests in (("dome_bags", 5), ("grill_house", 5), ("tent", 5), ("bath_knight", 4)):
+        r = q(kb, zone_id=zone_id, date=date(2026, 1, 5), start_time=NOON, hours=3, guests=guests)
+        assert r.status == "blocked", zone_id
+        assert "менеджер" in r.human_readable
 
 
 # ==========================================================================
@@ -852,3 +854,17 @@ def test_the_question_asks_for_one_thing_only(kb):
     # детали», на которое клиенту нечего ответить.
     assert set(result.missing_fields) == {"guests", "start_time"}
     assert "со скольки" in result.human_readable.lower()
+
+
+@pytest.mark.parametrize('d', [date(2026, 12, 30), date(2026, 12, 31), date(2027, 1, 1), date(2027, 1, 10)])
+def test_new_year_dates_are_left_to_the_manager(kb, d):
+    """Аудит 30.10: менеджер называет на НГ 5000-10000 ₽/ч, бот считал 3500."""
+    r = q(kb, zone_id='bath_russian', date=d, start_time=NOON, hours=3, guests=4)
+    assert r.status == 'blocked'
+    assert r.total is None and r.rate_hint is None
+
+
+def test_ordinary_january_days_are_priced_again(kb):
+    r = q(kb, zone_id='bath_russian', date=date(2027, 1, 13), start_time=NOON, hours=3, guests=4)
+    assert r.status == 'ok'
+
