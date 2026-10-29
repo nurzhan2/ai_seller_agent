@@ -24,13 +24,12 @@ _RULES: list[tuple[str, Optional[str], Optional[str]]] = [
     (r"сертификат", None, "bath"),
     (r"рыцар|средневеков|замок", "bath_knight", None),
     (r"гараж", "bath_garage", None),
-    (r"русск\w* бан", "bath_russian", None),
+    (r"русск\w* (бан|парн)", "bath_russian", None),
     (r"купол|полусфер", None, "dome"),
     (r"гриль", "grill_house", None),
     (r"шат[её]р|шатр", "tent", None),
-    (r"юрт|кемпинг", "yurt", None),
     (r"беседк", None, "dome"),
-    (r"бан[яиюе]\b|бань", None, "bath"),
+    (r"бан[яиюе]\b|бань|парн[аяо]|саун", None, "bath"),
 ]
 
 

@@ -353,7 +353,7 @@ async def test_a_broken_guard_does_not_break_the_dialogue(kb):
 
     result = await loop.run_turn("d1", [], "привет")
 
-    assert result.text == "Здравствуйте!"
+    assert result.text.startswith("Здравствуйте!")
 
 
 # --------------------------------------------------------------------------

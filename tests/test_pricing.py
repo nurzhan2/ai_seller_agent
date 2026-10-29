@@ -69,13 +69,13 @@ def test_bath_knight_weekday_under_special_threshold_prices_normally(kb):
     """4 hours < the 5-hour special threshold, so the plain rate applies."""
     r = q(kb, zone_id="bath_knight", date=THU, start_time=NOON, hours=4, guests=4)
     assert r.status == "ok"
-    assert r.total == money(10000)
+    assert r.total == money(8000)   # 2000 ₽/ч в будни (заказчик 29.10)
 
 
 def test_bath_knight_weekend_ignores_weekday_special(kb):
     r = q(kb, zone_id="bath_knight", date=SAT, start_time=NOON, hours=5, guests=4)
     assert r.status == "ok"
-    assert r.total == money(17500)
+    assert r.total == money(15000)   # 3000 ₽/ч в выходные (заказчик 29.10)
 
 
 @pytest.mark.parametrize("zone_id", ["dome_bags", "dome_blue_chairs", "dome_chairs"])
@@ -106,7 +106,7 @@ def test_grill_house_weekday_and_weekend(kb):
 def test_house_relax_weekday_daily(kb):
     r = q(kb, zone_id="house_relax", date=THU, hours=None, guests=8)
     assert r.status == "ok"
-    assert r.total == money(7000)
+    assert r.total == money(15000)   # «домик с удобствами весь день 15000» (29.10)
 
 
 def test_yurt_daily_ignores_hours(kb):
@@ -136,7 +136,7 @@ def test_house_relax_weekend_now_prices_at_the_provisional_anchor(kb):
     r = q(kb, zone_id="house_relax", date=SAT, hours=None, guests=8)
     assert r.status == "ok"
     assert r.total == money(15000)
-    assert r.prepayment == money(3000)      # 14.4: фикс для суточных зон
+    assert r.prepayment == money(7500)      # предоплата 50% (заказчик 29.10)
 
 
 def test_house_relax_friday_is_weekend_like_every_zone(kb):
@@ -153,7 +153,7 @@ def test_house_relax_bath_heating_is_priced(kb):
     r = q(kb, zone_id="house_relax", date=THU, hours=None, guests=8,
           extras=(("bath_heating", 3),))
     assert r.status == "ok"
-    assert r.total == money(7000 + 4500)
+    assert r.total == money(15000 + 4500)
 
 
 def test_bath_knight_five_weekday_hours_price_normally(kb):
@@ -161,7 +161,7 @@ def test_bath_knight_five_weekday_hours_price_normally(kb):
     считаются по обычному тарифу, самый сложный краевой случай снят."""
     r = q(kb, zone_id="bath_knight", date=THU, start_time=time(10, 0), hours=5, guests=4)
     assert r.status == "ok"
-    assert r.total == money(12500)
+    assert r.total == money(10000)
     assert r.blocking_question_ids == ()
 
 
@@ -179,8 +179,8 @@ def test_grill_house_min_hours_is_advisory_not_blocking(kb):
     r = q(kb, zone_id="grill_house", date=SAT, start_time=NOON, hours=2, guests=6)
     assert r.status == "ok"
     assert r.total == money(4000)
-    # 4.2 закрыт: базовый минимум 3 часа, две часа — только через уступку.
-    assert r.requires_concession_tier == 5
+    # 29.10 заказчик: «минимум 3 часа, но на 2 часа можно» - без уступки.
+    assert r.requires_concession_tier is None
     assert r.blocking_question_ids == ()
 
 
@@ -530,7 +530,7 @@ def test_day_package_on_friday_is_invalid(kb):
 def test_day_package_weekday_ok(kb):
     r = q(kb, zone_id="dome_bags", date=MON, hours=None, guests=8)
     assert r.status == "ok"
-    assert r.total == money(5000)
+    assert r.total == money(4999)
 
 
 def test_tent_day_package_weekday(kb):
@@ -664,10 +664,10 @@ def test_human_readable_has_no_greeting(kb):
         assert greeting not in text
 
 
-def test_prepayment_equals_first_hour(kb):
-    """9.1: предоплата = стоимость первого часа."""
+def test_prepayment_is_half_of_the_total(kb):
+    """Заказчик 29.10: «Предоплата 50%» (раньше - первый час)."""
     r = q(kb, zone_id="bath_russian", date=SAT, start_time=NOON, hours=3, guests=6)
-    assert r.prepayment == money(3500)
+    assert r.prepayment == money(5250)
 
 
 def test_prepayment_fixed_for_daily_zones(kb):
@@ -675,14 +675,14 @@ def test_prepayment_fixed_for_daily_zones(kb):
     суточных зон, где стоимости первого часа не существует."""
     r = q(kb, zone_id="yurt", date=SAT, hours=None, guests=2)
     assert r.status == "ok"
-    assert r.prepayment == money(3000)
+    assert r.prepayment == money(2000)   # 50% от 4000
     assert "14.4" not in r.advisory_question_ids
 
 
 def test_prepayment_fixed_for_day_packages(kb):
     r = q(kb, zone_id="dome_bags", date=MON, hours=None, guests=6)
     assert r.status == "ok"
-    assert r.prepayment == money(3000)
+    assert r.prepayment == money(2500)   # 50% от 4999, вверх до рубля
 
 
 def test_every_line_carries_provenance(kb):
@@ -763,7 +763,7 @@ def test_needs_input_carries_the_hourly_rate_and_the_minimum(kb):
     assert result.missing_fields == ("hours",)
     assert result.rate_hint is not None
     assert result.rate_hint.per_hour == money(3500)     # выходной тариф бани
-    assert result.rate_hint.min_hours == 3
+    assert result.rate_hint.min_hours == 2
     assert result.rate_hint.day_type == "weekend"
 
 
@@ -785,7 +785,7 @@ def test_an_invalid_quote_still_names_the_rate(kb):
     assert result.status == "invalid"
     assert result.rate_hint is not None
     assert result.rate_hint.per_hour == money(2000)
-    assert result.rate_hint.min_hours == 3
+    assert result.rate_hint.min_hours == 2
 
 
 def test_a_blocked_quote_never_carries_a_rate(kb):

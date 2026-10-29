@@ -1069,19 +1069,21 @@ class MessagePipeline:
         гейт блокировал 2-е и 3-е фото, и агент замолкал. За 3 недели — 10
         отправок фото из 10.
         """
-        if self._redis is None:
+        redis = getattr(self, "_redis", None)
+        if redis is None:
             return
         try:
-            await self._redis.set(
+            await redis.set(
                 self.OWN_IMAGES_KEY.format(chat_id=chat_id), "1", ex=self.OWN_IMAGES_TTL,
             )
         except Exception:
             logger.exception("pipeline: метка своих фото не записана", extra={"chat_id": chat_id})
 
     async def _own_images_recently(self, chat_id: str) -> bool:
-        if self._redis is not None:
+        redis = getattr(self, "_redis", None)
+        if redis is not None:
             try:
-                if await self._redis.get(self.OWN_IMAGES_KEY.format(chat_id=chat_id)):
+                if await redis.get(self.OWN_IMAGES_KEY.format(chat_id=chat_id)):
                     return True
             except Exception:
                 logger.exception("pipeline: метка своих фото не прочитана", extra={"chat_id": chat_id})

@@ -189,6 +189,11 @@ class Zone(BaseModel):
     # диалог администратору (ответы 6.2-6.5). Это правила, а не прайс.
     escalation_topics: list[dict[str, Any]] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # False — зона в каталоге остаётся (история, цены для старых диалогов),
+    # но агент её не предлагает: ни в справочнике, ни в альтернативах, ни в
+    # уступке «зона подешевле». Случай 2026-10-16: юрту убрали из YCLIENTS,
+    # а агент предлагал её гостю, спросившему баню.
+    on_sale: bool = True
 
     model_config = ConfigDict(extra="forbid")
 

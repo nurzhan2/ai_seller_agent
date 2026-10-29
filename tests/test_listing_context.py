@@ -192,8 +192,11 @@ async def test_domes_have_same_price_so_hint_says_name_it_at_once(kb):
 async def test_baths_with_same_price_also_get_the_note_and_unequal_would_not(kb):
     lookup = FakeLookup({"b": ItemZoneRow(category="bath")})
     resolution = await resolve_listing("b", lookup, kb)
-    # Три бани по 2500/3500 — тоже одинаковые.
-    assert "ОДИНАКОВЫЕ" in build_listing_hint(resolution, kb)
+    # С 29.10 «Рыцарская» дешевле (2000/3000) - цены бань РАЗНЫЕ, и бот
+    # обязан назвать каждую, а не выбрать одну (жалоба «от 1500 - а 2500»).
+    hint = build_listing_hint(resolution, kb)
+    assert "ОДИНАКОВЫЕ" not in hint
+    assert "РАЗНЫЕ" in hint
 
 
 def test_different_prices_get_no_note(kb):

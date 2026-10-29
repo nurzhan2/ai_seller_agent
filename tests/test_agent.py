@@ -650,6 +650,35 @@ async def test_get_photos_without_provider_does_not_promise_photos(kb):
     assert "Не обещай" in result["instruction"]
 
 
+class _PhotosByZone:
+    async def get(self, zone_id):
+        return [f"{zone_id}-{i}" for i in range(3)]
+
+
+async def test_photos_follow_the_bath_that_was_just_priced(kb):
+    """Жалоба 29.10: «считает одну баню, а фото отправляет другой»."""
+    ex = ToolExecutor(kb, "d1", photo_provider=_PhotosByZone())
+    priced = await ex.run("calculate_price", {
+        "zone_id": "bath_russian", "date": "2026-11-05", "start_time": "14:00",
+        "hours": 3, "guests": 4,
+    })
+    assert priced["status"] == "ok"
+
+    await ex.run("get_photos", {"zone_id": "bath_garage"})
+
+    assert ex.photos_to_send and all(p.startswith("bath_russian") for p in ex.photos_to_send)
+
+
+async def test_photos_of_another_category_are_sent_as_asked(kb):
+    ex = ToolExecutor(kb, "d1", photo_provider=_PhotosByZone())
+    await ex.run("calculate_price", {
+        "zone_id": "bath_russian", "date": "2026-11-05", "start_time": "14:00",
+        "hours": 3, "guests": 4,
+    })
+    await ex.run("get_photos", {"zone_id": "grill_house"})
+    assert all(p.startswith("grill_house") for p in ex.photos_to_send)
+
+
 async def test_answer_from_kb_unknown_topic_escalates(kb):
     ex = ToolExecutor(kb, "d1")
     result = await ex.run("answer_from_kb", {"topic": "квадроциклы вертолёт полёты"})
@@ -1864,7 +1893,8 @@ async def test_a_correct_tomorrow_date_passes_without_any_tool_call(kb):
     agent = loop_at(kb, [FakeResponse(content=[TextBlock("Завтра будет 2 сентября, среда.")])])
     result = await agent.run_turn("chat-1", [], "а завтра какое число?")
 
-    assert result.text == "Завтра будет 2 сентября, среда."
+    # + шаг к брони (closing.py): дату клиент не назвал - спрашиваем её
+    assert result.text.startswith("Завтра будет 2 сентября, среда.")
     assert result.llm_meta.get("guard_rail") is None
 
 
@@ -2036,7 +2066,8 @@ async def test_the_amounts_are_exposed_on_the_path_where_the_text_reaches_the_cl
     agent = loop_at(kb, script)
     result = await agent.run_turn("chat-1", [], "шампура есть?")
 
-    assert result.text == "Шампуры есть — набор за 500 ₽."
+    assert result.text.startswith("Шампуры есть — набор за 500 ₽.")
+    assert result.llm_meta.get("next_step_added") is True   # closing.py
     assert "500" in result.tool_amounts, result.tool_amounts
 
 

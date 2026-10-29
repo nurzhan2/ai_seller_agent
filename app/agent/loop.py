@@ -1693,6 +1693,18 @@ class AgentLoop:
                 llm_meta = {**llm_meta, "false_hold_guard": True, "unstripped_text": final_text}
                 final_text = cleaned
 
+        # РУБЕЖ «ОТВЕТ НЕ ОБРЫВАЕТСЯ» (app/agent/closing.py, заказчик 29.10):
+        # без вопроса — дописываем следующий шаг к брони.
+        if not executor.escalated and getattr(executor, "booking_handoff", None) is None:
+            from app.agent.closing import ensure_next_step
+
+            final_text, added = ensure_next_step(
+                final_text, user_text, slots, priced="ok" in quote_statuses,
+            )
+            if added:
+                guard_rails_total.labels(rule="next_step").inc()
+                llm_meta = {**llm_meta, "next_step_added": True}
+
         if count_questions(final_text) > 1:
             trimmed = trim_to_one_question(final_text)
             guard_rails_total.labels(rule=QUESTION_GUARD_VIOLATION).inc()

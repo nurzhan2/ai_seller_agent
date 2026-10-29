@@ -305,7 +305,7 @@ def _check_cheaper_zone_exists(req: ConcessionRequest, kb: KnowledgeBase) -> boo
         return False
     guests = req.quote.guests
     for zone in kb.catalog.zones:
-        if zone.id == req.quote.zone_id:
+        if zone.id == req.quote.zone_id or not zone.on_sale:
             continue
         if not zone.capacity.is_resolved():
             continue

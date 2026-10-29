@@ -601,6 +601,8 @@ class ToolExecutor:
 
         result = []
         for zone in self.kb.catalog.zones:
+            if not zone.on_sale:
+                continue
             if category and zone.category.value != category:
                 continue
             capacity = zone.capacity.value if zone.capacity.is_resolved() else None
@@ -1118,7 +1120,7 @@ class ToolExecutor:
         for zone in zones:
             if len(found) >= self.MAX_ALTERNATIVES:
                 break
-            if zone.id == busy_zone_id:
+            if zone.id == busy_zone_id or not zone.on_sale:
                 continue
             if guests and zone.capacity.is_resolved() and zone.capacity.value < guests:
                 continue
@@ -1181,6 +1183,8 @@ class ToolExecutor:
                 break
             zones: list[dict] = []
             for zone in self.kb.catalog.zones:
+                if not zone.on_sale:
+                    continue
                 if guests and zone.capacity.is_resolved() and zone.capacity.value < guests:
                     continue
                 availability = await self._availability_for(zone.id, current, None, hours)
@@ -1644,6 +1648,32 @@ class ToolExecutor:
 
     # -- фото ---------------------------------------------------------------
 
+    def _photo_zone(self, requested: str) -> str:
+        """Фото той зоны, которую только что считали (жалоба 29.10).
+
+        «Считает одну баню, а фото отправляет другой»: модель в одном ходе
+        звала calculate_price по «Русской», а get_photos - по «Гаражу».
+        Если в этом ходе уже есть посчитанная зона ТОЙ ЖЕ категории, а фото
+        просят другой - шлём фото посчитанной. Пустой zone_id - тоже она,
+        а без расчёта - зона объявления.
+        """
+        quoted = ""
+        if self.last_quote is not None and self.last_quote.status == "ok":
+            quoted = self.last_quote.zone_id or ""
+        if not requested:
+            return quoted or self.listing_zone_id
+        if not quoted or requested == quoted:
+            return requested
+        zones = {z.id: z for z in self.kb.catalog.zones}
+        a, b = zones.get(requested), zones.get(quoted)
+        if a is not None and b is not None and a.category == b.category:
+            logger.warning(
+                "get_photos: просили %s, а посчитана %s - шлём фото посчитанной",
+                requested, quoted,
+            )
+            return quoted
+        return requested
+
     async def _tool_get_photos(self, args: dict) -> dict:
         """Фотографии зоны — или честное «их нет».
 
@@ -1655,7 +1685,7 @@ class ToolExecutor:
         и пообещает клиенту фото, которых не придёт. В разобранных
         переписках именно необещанное-и-неприсланное фото обрывало диалоги.
         """
-        zone_id = args.get("zone_id", "")
+        zone_id = self._photo_zone(args.get("zone_id", ""))
         photos = await self.photo_provider.get(zone_id) if self.photo_provider else []
         if not photos:
             return {

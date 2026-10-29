@@ -786,23 +786,8 @@ def test_r13_missing_condition_does_not_gate_anything(kb, bath_quote):
 # revenue_delta accounting
 # ==========================================================================
 
-def test_min_hours_concession_has_non_zero_revenue_delta(kb):
-    """Dropping 3 hours to 2 costs one hour at the going rate. Recording
-    zero would understate the loss and the concession-rate alert would never
-    fire on this tier."""
-    short = quote(PriceRequest("bath_russian", SAT, NOON, 2, 6), kb)
-    assert short.requires_concession_tier == 5
-    d = decide(req(short, already_used_tiers=ALL_NON_PRICE), kb)
-    assert d.allowed
-    assert d.tier == 5
-    assert d.revenue_delta == money(-3500)      # 1 hour × 3500
-    assert d.revenue_delta_basis == "policy_minimum"
 
 
-def test_min_hours_offer_names_both_numbers(kb):
-    short = quote(PriceRequest("bath_russian", SAT, NOON, 2, 6), kb)
-    d = decide(req(short, already_used_tiers=ALL_NON_PRICE), kb)
-    assert "3" in d.offer_template and "2" in d.offer_template
 
 
 def test_non_price_tier_has_zero_revenue_delta_and_no_basis(kb, bath_quote):
@@ -923,16 +908,16 @@ def house_weekday_quote(kb):
     return quote(PriceRequest("house_relax", THU, None, None, 8), kb)
 
 
-def test_house_daily_concession_drops_to_the_floor(kb_generous, house_weekday_quote):
-    """2.1: пол 9500. Здесь база 7000 и уже ниже пола, значит уступать
-    нечего — движок обязан отказать, а не «поднять» цену до 9500."""
+def test_house_daily_concession_never_goes_below_the_floor(kb_generous, house_weekday_quote):
+    """2.1: пол 9500. С 29.10 будни домика тоже 15000 - уступка возможна,
+    но не ниже пола."""
     d = decide(
         req(house_weekday_quote, booking_date=THU,
             already_used_tiers=(1, 2, 3, 4, 5, 6), occupancy_ratio=0.2),
         kb_generous,
     )
-    assert not d.allowed
-    assert "уступать нечего" in d.denial_reason
+    assert d.allowed
+    assert d.new_quote.total >= money(9500)
 
 
 def test_house_daily_tier_is_reachable_and_logs_the_delta(kb_generous, kb):
@@ -978,21 +963,14 @@ def test_daily_tier_not_applicable_to_hourly_zone(kb, bath_quote):
     assert not is_applicable(tier, req(bath_quote), kb)
 
 
-def test_grill_house_min_hours_floor_is_confirmed(kb):
-    """4.2: гриль-домик тоже может уйти на 2 часа при низкой загрузке."""
-    short = quote(PriceRequest("grill_house", SAT, NOON, 2, 6), kb)
-    assert short.requires_concession_tier == 5
-    d = decide(req(short, already_used_tiers=ALL_NON_PRICE, occupancy_ratio=0.2), kb)
-    assert d.allowed
-    assert d.tier == 5
 
 
-def test_bath_weekday_min_hours_floor_now_confirmed(kb):
-    """1.3: заказчик не ограничивал день недели, значит будни тоже."""
-    short = quote(PriceRequest("bath_russian", THU, NOON, 2, 6), kb)
-    d = decide(
-        req(short, booking_date=THU, already_used_tiers=ALL_NON_PRICE, occupancy_ratio=0.2),
-        kb,
-    )
-    assert d.allowed
-    assert d.tier == 5
+
+
+def test_two_hours_are_sold_without_a_concession(kb):
+    """Заказчик 29.10: «Минимум 3 часа, но на 2 часа можно» - 2 часа это
+    обычная продажа, а не ступень уступки (раньше ступень 5)."""
+    for zone in ("bath_russian", "bath_garage", "bath_knight", "grill_house", "dome_bags"):
+        short = quote(PriceRequest(zone, SAT, NOON, 2, 4), kb)
+        assert short.status == "ok", zone
+        assert short.requires_concession_tier is None, zone

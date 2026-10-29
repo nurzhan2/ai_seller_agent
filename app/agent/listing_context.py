@@ -64,7 +64,8 @@ async def resolve_listing(
 
     if row.category:
         candidates = tuple(
-            z.id for z in kb.catalog.zones if z.category.value == row.category
+            z.id for z in kb.catalog.zones
+            if z.category.value == row.category and z.on_sale
         )
         if len(candidates) == 1:
             return ListingResolution(status="resolved", zone_id=candidates[0])
@@ -130,6 +131,16 @@ def build_listing_hint(resolution: ListingResolution, kb: KnowledgeBase) -> Opti
             "вопрос задай тем же сообщением — не заставляй клиента сначала выбирать."
             if same_price and len(zones) > 1 else ""
         )
+        if not same_price and len(zones) > 1:
+            # Жалоба 29.10: клиент с объявления «от 1500» получил 2500 - бот
+            # молча выбрал одну из зон. При разных ценах называем цену КАЖДОЙ
+            # (из справочника зон), а не одну.
+            price_note = (
+                " Цены у этих зон РАЗНЫЕ: если клиент спрашивает стоимость, "
+                "назови цену каждой из них по справочнику зон (будни и выходные), "
+                "начиная с самой доступной, и спроси, какая ближе - не выбирай "
+                "за клиента одну зону и не называй одну цену как общую."
+            )
         return (
             "[Служебно: объявление, с которого пришёл клиент, общее на несколько "
             f"зон. Кандидаты: {listed}. Задай ОДИН уточняющий вопрос с этими "

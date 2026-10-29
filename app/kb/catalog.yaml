@@ -95,7 +95,7 @@ zones:
       mode: hourly
       weekday_per_hour: {value: 2500}
       weekend_per_hour: {value: 3500}
-      min_hours: {value: 3}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package: null
     promos_applicable: [sixth_hour_free, birthday_discount_10]   # answers 1.1, 1.2
     notes:
@@ -118,7 +118,7 @@ zones:
       mode: hourly
       weekday_per_hour: {value: 2500}
       weekend_per_hour: {value: 3500}
-      min_hours: {value: 3}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package: null
     promos_applicable: [sixth_hour_free, birthday_discount_10]   # answers 1.1, 1.2
     notes:
@@ -144,9 +144,9 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: hourly
-      weekday_per_hour: {value: 2500}
-      weekend_per_hour: {value: 3500}
-      min_hours: {value: 3}
+      weekday_per_hour: {value: 2000, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
+      weekend_per_hour: {value: 3000, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
       # Спеццена 1500₽/час ОТМЕНЕНА заказчиком (ответы 1.4, 1.5).
       # Вместе с ней снят самый сложный краевой случай проекта —
       # неоднозначный calculation_mode.
@@ -171,7 +171,7 @@ zones:
     booking_window: {from: "09:00", to: "23:00"}   # ответ 8.1
     pricing:
       mode: daily
-      weekday_per_day: {value: 7000}
+      weekday_per_day: {value: 15000, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
       # 2.1 — механика дожима: анкор 15000, пол 9500, скидка при низкой
       # загрузке. Механика заведена в concessions.yaml (ступень reduce_daily_rate).
       # Сама базовая цифра расходилась (прайс 14500, Максим — 15000 в живом
@@ -218,9 +218,9 @@ zones:
       # воскресенье в формулировке («Пт-Сб»), однако названная на воскресенье цена
       # (1500₽) совпадает с официальным Пт-Вс. Разрешено нами в пользу прайса.
       weekend_per_hour: {value: 1500, resolved_from: "official_pricing"}
-      min_hours: {value: 3}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package:
-      price: {value: 5000}
+      price: {value: 4999, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
       window: {from: "10:00", to: "22:00"}
       days: [mon, tue, wed, thu]
       usable_in_parts: {value: false, resolved_from: "client_answers (3.2)"}
@@ -243,9 +243,9 @@ zones:
       mode: hourly
       weekday_per_hour: {value: 800, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       weekend_per_hour: {value: 1500}
-      min_hours: {value: 3}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package:
-      price: {value: 5000}
+      price: {value: 4999, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
       window: {from: "10:00", to: "22:00"}
       days: [mon, tue, wed, thu]
       usable_in_parts: {value: false, resolved_from: "client_answers (3.2)"}
@@ -266,9 +266,9 @@ zones:
       mode: hourly
       weekday_per_hour: {value: 800, resolved_from: "заказчик 2026-10-15 (Валерия, чат «Ии для переписки»)"}
       weekend_per_hour: {value: 1500}
-      min_hours: {value: 3}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package:
-      price: {value: 5000}
+      price: {value: 4999, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
       window: {from: "10:00", to: "22:00"}
       days: [mon, tue, wed, thu]
       usable_in_parts: {value: false, resolved_from: "client_answers (3.2)"}
@@ -295,7 +295,7 @@ zones:
       weekend_per_hour: {value: 2000}
       # 4.2: базовый минимум 3 часа; 2 часа возможны только через ступень
       # уступки при низкой загрузке (concessions.yaml, reduce_min_hours).
-      min_hours: {value: 3, resolved_from: "client_answers (4.2)"}
+      min_hours: {value: 2, resolved_from: "заказчик 2026-10-29 (Максим Отт, прайс в чате «Ии для переписки»)"}
     day_package:
       price: {value: 7000}
       window: {from: "10:00", to: "22:00"}
@@ -347,6 +347,9 @@ zones:
   - id: yurt
     venue: chaika
     name: "Юрта"
+    # 2026-10-29: ресурс удалён из YCLIENTS, объявление в архиве, заказчик
+    # жаловался, что гостям бани предлагают юрту. Не предлагать.
+    on_sale: false
     category: yurt
     capacity:
       value: 2

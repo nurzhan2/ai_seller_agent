@@ -604,6 +604,8 @@ def _compute_quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
     if not prepay_rule.is_resolved():
         ctx.advise(prepay_rule.disputed.question_id)
         ctx.warn("Единая формула предоплаты не утверждена — сумму предоплаты не называть.")
+    elif prepay_rule.value == "half_of_total":
+        pass   # считается ниже, когда известна итоговая сумма
     elif prepay_rule.value == "first_hour_price":
         if base_rate is not None:
             prepayment = money(base_rate)
@@ -640,6 +642,10 @@ def _compute_quote(req: PriceRequest, kb: KnowledgeBase) -> PriceQuote:
             ctx.warn(f"Часов меньше минимума зоны ({occupied} < {min_hours}).")
 
     assert subtotal > 0, "total must be positive for status='ok'"
+
+    if prepay_rule.is_resolved() and prepay_rule.value == "half_of_total":
+        # 50% от итога, вверх до рубля: клиенту называем целую сумму.
+        prepayment = money((subtotal / 2).to_integral_value(rounding="ROUND_CEILING"))
 
     return PriceQuote(
         status="ok",
@@ -957,7 +963,8 @@ def _alternatives_for(kb: KnowledgeBase, guests: int, exclude: str) -> tuple[str
     whose capacity is itself an open question."""
     return tuple(
         z.id for z in kb.catalog.zones
-        if z.id != exclude and z.capacity.is_resolved() and z.capacity.value >= guests
+        if z.id != exclude and z.on_sale
+        and z.capacity.is_resolved() and z.capacity.value >= guests
     )
 
 
