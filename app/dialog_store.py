@@ -592,6 +592,29 @@ class SqlAlchemyDialogStore:
             await session.commit()
         return value
 
+    async def sent_images_recently(self, chat_id: str, minutes: int = 60) -> bool:
+        """Отправляли ли мы картинки в этот чат за последние `minutes`
+        (запасной путь к метке в Redis, см. MessagePipeline._mark_own_images)."""
+        from datetime import timedelta
+
+        from sqlalchemy import func, select
+
+        from app.db.models import Message
+
+        since = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        async with self._session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count(Message.id)).where(
+                        Message.chat_id == chat_id,
+                        Message.direction == Direction.outgoing,
+                        Message.image_ids.isnot(None),
+                        Message.created_at >= since,
+                    )
+                )
+            ).scalar_one()
+        return bool(count)
+
     async def was_sent_by_us(self, chat_id: str, text: str) -> bool:
         """Это эхо НАШЕГО ЖЕ сообщения, а не текст живого менеджера?
 

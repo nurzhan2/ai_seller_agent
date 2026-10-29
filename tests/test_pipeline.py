@@ -2014,8 +2014,8 @@ async def test_a_manager_writing_in_a_foreign_listing_chat_is_not_a_takeover():
 
 
 async def test_a_photo_from_the_manager_counts_as_a_takeover():
-    """Картинка без текста: сравнивать нечего, но агент картинок не шлёт —
-    значит писал человек."""
+    """Картинка без текста, а сами мы в этот чат фото не слали — значит
+    писал человек."""
     pipeline, store, agent, ops = _build()
     await store.get_or_create_chat("chat-1")
 
@@ -2024,6 +2024,46 @@ async def test_a_photo_from_the_manager_counts_as_a_takeover():
 
     flags = await ops.store.get_flags("chat-1")
     assert flags.is_human_takeover is True
+
+
+async def test_the_echo_of_our_own_photo_is_not_a_takeover():
+    """Инцидент 2026-10-29: каждое наше фото возвращалось эхом без текста,
+    записывалось как сообщение менеджера, и агент замолкал (10 из 10)."""
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    class Redis:
+        def __init__(self):
+            self.data = {}
+
+        async def set(self, key, value, ex=None):
+            self.data[key] = value
+
+        async def get(self, key):
+            return self.data.get(key)
+
+    pipeline._redis = Redis()
+    await pipeline._mark_own_images("chat-1")
+    await pipeline.handle_message(_payload(author_id=OUR_USER_ID, text=""))
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False
+
+
+async def test_recent_photo_in_the_database_also_counts_as_ours():
+    pipeline, store, agent, ops = _build()
+    await store.get_or_create_chat("chat-1")
+
+    async def recent(chat_id, minutes=60):
+        return True
+
+    store.sent_images_recently = recent
+    await pipeline.handle_message(_payload(author_id=OUR_USER_ID, text=""))
+    await _settle()
+
+    flags = await ops.store.get_flags("chat-1")
+    assert flags.is_human_takeover is False
 
 
 async def test_a_broken_echo_check_keeps_the_agent_working():

@@ -125,6 +125,7 @@ from app.channels.avito_payloads import (
     extract_message_id,
     extract_text,
     is_image_message,
+    extract_message_type,
     is_outgoing_echo,
     is_system_message,
 )
@@ -670,6 +671,14 @@ class MessagePipeline:
             )
             ours = True
 
+        if not ours and not text:
+            # Без текста: картинка (наша или менеджера) либо файл. Своё фото
+            # узнаём по метке отправки; файл (так менеджер шлёт фото с
+            # телефона, IMG_6800) — всегда менеджер.
+            kind = (extract_message_type(payload) or "").lower()
+            if kind != "file" and await self._own_images_recently(chat_id):
+                ours = True
+
         if ours:
             logger.info(
                 "pipeline: отброшено эхо нашего же сообщения (author_id == AVITO_USER_ID)",
@@ -1020,6 +1029,10 @@ class MessagePipeline:
         from app.media.bundled import bundled_photo_path
 
         sent: list[str] = []
+        if image_ids:
+            # ДО отправки: эхо картинки приходит быстрее, чем мы допишем
+            # строку в `messages`, и без метки его примут за менеджера.
+            await self._mark_own_images(chat_id)
         for image_id in image_ids[:PHOTOS_PER_TURN]:
             try:
                 bundled = bundled_photo_path(image_id)
@@ -1043,6 +1056,43 @@ class MessagePipeline:
                 extra={"chat_id": chat_id},
             )
         return sent
+
+    OWN_IMAGES_KEY = "own_images:{chat_id}"
+    OWN_IMAGES_TTL = 3600
+
+    async def _mark_own_images(self, chat_id: str) -> None:
+        """Метка «мы только что слали картинки в этот чат».
+
+        Инцидент 2026-10-29: эхо НАШЕГО фото приходит без текста, автор —
+        наш аккаунт, и `was_sent_by_us` («текста нет — значит не мы»)
+        записывал его как сообщение живого менеджера. Чат уходил менеджеру,
+        гейт блокировал 2-е и 3-е фото, и агент замолкал. За 3 недели — 10
+        отправок фото из 10.
+        """
+        if self._redis is None:
+            return
+        try:
+            await self._redis.set(
+                self.OWN_IMAGES_KEY.format(chat_id=chat_id), "1", ex=self.OWN_IMAGES_TTL,
+            )
+        except Exception:
+            logger.exception("pipeline: метка своих фото не записана", extra={"chat_id": chat_id})
+
+    async def _own_images_recently(self, chat_id: str) -> bool:
+        if self._redis is not None:
+            try:
+                if await self._redis.get(self.OWN_IMAGES_KEY.format(chat_id=chat_id)):
+                    return True
+            except Exception:
+                logger.exception("pipeline: метка своих фото не прочитана", extra={"chat_id": chat_id})
+        recent = getattr(self.store, "sent_images_recently", None)
+        if recent is None:
+            return False
+        try:
+            return bool(await recent(chat_id, minutes=self.OWN_IMAGES_TTL // 60))
+        except Exception:
+            logger.exception("pipeline: не удалось проверить свои фото", extra={"chat_id": chat_id})
+            return True   # см. was_sent_by_us: ошибиться в сторону «это мы» безопаснее
 
     async def _queue_for_moderation(self, chat: Any, result: Any, client_text: str) -> None:
         """Обычный холд — DRY_RUN без запроса на скидку, либо
