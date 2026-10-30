@@ -442,7 +442,9 @@ def test_booking_past_closing_hour_escalates_without_a_question_id(kb):
     r = q(kb, zone_id="dome_bags", date=SAT, start_time=time(21, 0), hours=4, guests=6)
     assert r.status == "blocked"
     assert r.blocking_question_ids == ()
-    assert "продлить" in r.human_readable
+    # 30.10: работаем круглосуточно по предварительной брони - не отказ,
+    # а подтверждение менеджером
+    assert "круглосуточно" in r.human_readable and "менеджер" in r.human_readable
 
 
 def test_arrival_before_opening_hour_escalates_too(kb):
@@ -453,7 +455,7 @@ def test_arrival_before_opening_hour_escalates_too(kb):
 
     assert r.status == "blocked"
     assert r.blocking_question_ids == ()          # решённое правило, не дыра в базе
-    assert "09:00" in r.human_readable
+    assert "круглосуточно" in r.human_readable and "менеджер" in r.human_readable
     assert r.total is None                        # цену клиенту не называем
 
 
@@ -474,7 +476,7 @@ def test_a_zone_without_its_own_window_falls_back_to_the_complex_hours(kb):
     early = q(kb, zone_id="yurt", date=SAT, start_time=time(7, 0), guests=2)
 
     assert early.status == "blocked"
-    assert "09:00" in early.human_readable
+    assert "менеджер" in early.human_readable
 
 
 def test_the_complex_hours_are_the_ones_from_the_knowledge_base(kb):
